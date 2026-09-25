@@ -1,0 +1,16 @@
+# Editors and OS
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Build output, in case an ISO or test image lands here by accident
+*.iso
+*.qcow2
+*.img
+release/
+
+# Secrets that install.toml examples may reference
+*.pass
+*.key
