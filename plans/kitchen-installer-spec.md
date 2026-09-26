@@ -1,8 +1,8 @@
 # Omarchy "The Kitchen Is Open": Installer Spec
 
-**Status:** Draft v2 · 2026-09-25. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred.
+**Status:** Draft v2 · 2026-09-25. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred. Phase 0 is in progress; §2.3, §3 and §7 were updated to match what was built.
 **Base:** `omacom/omarchy` (formerly `basecamp/omarchy`) 4.0.0.alpha and `omarchy-iso` (both at HEAD on 2026-09-25)
-**Scope:** Design only. No code yet.
+**Scope:** Design, with Phase 0 under way on the forks' `wipe-summary` and `visible-encryption` branches.
 
 > **Naming placeholder.** The installer CLI is `kitchen`. Commands on the installed system keep Omarchy's `omarchy <noun> <verb>` convention, which comes from the `omarchy-*` scripts in `bin/`. That way the fork stays easy to rebase on upstream.
 
@@ -132,7 +132,7 @@ This ships first. It has no dependencies and gives the most value per line of co
 
 - Exclude every disk labelled `cidata`/`CIDATA`.
 - Exclude `mmcblk*boot*` and `mmcblk*rpmb`.
-- Add serial and a short "what's on it" to each picker line, so identical drives never render identically anywhere.
+- Add serial and a short "what's on it" to each picker line, so identical drives never render identically anywhere. Order the line from most to least telling (path, size, what's on it, serial, model), so an 80-column console truncates the model name, which is the one thing two identical drives share.
 - Refuse full-disk installs below ESP + 32 GiB. This matches the existing free-space minimum at `configurator:595`.
 
 ---
@@ -141,24 +141,32 @@ This ships first. It has no dependencies and gives the most value per line of co
 
 ### 3.1 UX
 
-Remove the Ctrl+C toggle. The Omakase summary, shown before the wipe screen, gets one editable row:
+Remove the Ctrl+C toggle. Encryption gets its own screen, after the install mode and right before the wipe summary, on every path: full disk, free space and deferred provisioning. (The account summary comes before disk selection in the wizard, so it can't carry this row.)
 
 ```
+  Encrypted: you type your password at boot, and the disk is protected if the machine is lost.
+  Not encrypted: for servers, VMs, or machines whose data lives elsewhere.
+
   Disk encryption
-  > Encrypted (recommended)    you type your password at boot; protects the disk if the machine is lost
-    Not encrypted              for servers, VMs, or machines whose data lives elsewhere
+  > Encrypted (recommended)
+    Not encrypted
 ```
+
+The wipe summary that follows shows the result under "What gets created" (`LUKS2 → btrfs` or `btrfs`).
 
 - **Default.** Encrypted, always.
-- **Laptop hint.** If `/sys/class/dmi/id/chassis_type` is a portable type (8, 9, 10, 14, 30, 31, 32) and the user picks "Not encrypted", one line appears: *"This looks like a laptop. If it's lost or stolen, anyone can read the disk."* There is no second confirmation.
+- **Laptop hint.** If `/sys/class/dmi/id/chassis_type` is a portable type (8, 9, 10, 14, 30, 31, 32) and the user picks "Not encrypted", one line appears on the wipe summary: *"This looks like a laptop. If it's lost or stolen, anyone can read the disk."* There is no second confirmation.
 - **Separate passphrase.** Out of scope for the wizard. It is available in TOML (§4.2).
 
 ### 3.2 Plumbing
 
-- The configurator no longer writes `user_encrypt_installation.txt`. Whether to encrypt comes from the plan (§4), so the flag and the actual encryption can no longer disagree.
+- The configurator no longer writes `user_encrypt_installation.txt`. Whether the install is encrypted comes from the configuration itself, so the flag and the actual encryption can no longer disagree:
+  - full disk: the `disk_encryption` block archinstall acts on
+  - pre-mounted (free space): `omarchy_install.storage.luks_uuid`, which the configurator always writes (`null` when unencrypted)
+  - From Phase 1 the plan (§4) produces that configuration, so the rule doesn't change.
 - `configure_login`'s autologin rule stays as it is: encrypted means autologin (the LUKS prompt is the auth boundary), unencrypted means an SDDM login. That rule remains correct because v2 has no silent TPM unlock. **If TPM unlock is ever added, this rule must change** (see §6).
 - `validate_boot` asserts `cryptdevice=` when the plan says encrypted, and asserts it is **absent** when the plan says unencrypted. Today only the first half is checked.
-- Legacy cidata installs still accept the flag file.
+- Legacy cidata installs still accept the flag file. It only decides for a pre-mounted config with no `luks_uuid` key. When it disagrees with the configuration, the install log says so and the configuration wins.
 
 ---
 
@@ -338,7 +346,7 @@ omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn
 
 | File | Change |
 |---|---|
-| `omarchy/manual/02-getting-started.md:7` | Replace with: "Secure Boot: if it's on, switch it off or put it in **Setup Mode** to boot the installer. After installing, run `omarchy secureboot enable` to turn it back on with keys owned by your machine. Leave the TPM alone; nothing needs it disabled." |
+| `omarchy/manual/02-getting-started.md:7` | Ships with Phase 2, when the command it names exists. Replace with: "Secure Boot: if it's on, switch it off or put it in **Setup Mode** to boot the installer. After installing, run `omarchy secureboot enable` to turn it back on with keys owned by your machine. Leave the TPM alone; nothing needs it disabled." |
 | `omarchy/manual/44-mac-support.md:19–28` | Keep. T2 Macs use Apple's own Secure Boot with no user key enrollment. Add one sentence saying why. |
 | New manual page: "Secure Boot" | The `enable` flow, recovery (turning SB off in firmware always gets you back in), and firmware-update notes |
 
@@ -361,9 +369,9 @@ omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn
 
 | Phase | Contents | Exit criteria |
 |---|---|---|
-| **0** | §2 wipe summary and picker fixes. §3 visible encryption choice. §5.4 docs line 7. | Rows A–D |
+| **0** | §2 wipe summary and picker fixes. §3 visible encryption choice. | Rows A–D |
 | **1** | §4 TOML: validate, plan, install. Compiler shim. cidata TOML. Wizard writes TOML. `/home` disk and swap branches. | Rows E–J, plus every existing `omarchy-iso-test` scenario passing from TOML |
-| **2** | §5 `omarchy secureboot`, which runs on installed systems and is independent of the ISO | Rows K–N, plus hardware |
+| **2** | §5 `omarchy secureboot`, which runs on installed systems and is independent of the ISO. §5.4 docs, including line 7. | Rows K–N, plus hardware |
 
 The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars without enrolled keys start in Setup Mode.
 

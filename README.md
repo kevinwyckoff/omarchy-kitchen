@@ -2,7 +2,7 @@
 
 A fork of [Omarchy](https://omarchy.org) that reworks the installer so it's more open: you can see what it's about to erase, choose whether to encrypt, describe an install in a text file, and keep Secure Boot on with keys your machine owns.
 
-**Status:** design only. No code yet. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
+**Status:** Phase 0 (wipe summary, visible encryption choice) is being built on the `omarchy-iso` fork's `wipe-summary` and `visible-encryption` branches. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
 
 ## Repositories
 

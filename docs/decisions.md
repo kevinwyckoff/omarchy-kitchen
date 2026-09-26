@@ -2,6 +2,32 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-25: Phase 0 shape
+
+**Decision.**
+- **Encryption gets its own screen**, after the install mode and right before the wipe summary, on every path (full disk, free space, deferred provisioning). The spec's "row on the Omakase summary" doesn't fit: the account summary comes before disk selection, and the other two paths never show it. The spec (§3.1) now says this.
+- **The §5.4 manual change moves to Phase 2.** Its text names `omarchy secureboot enable`, which won't exist until then. Phase 0 is `omarchy-iso` only.
+- **Two topic branches, both from `quattro`:** `wipe-summary` (§2, §2.3) and `visible-encryption` (§3), stacked on it. They're smaller to review and to rebase against the open upstream PRs that also touch the configurator (for example #122, #140 and #155).
+- **"Is this install encrypted?" comes from the install JSON**, not `user_encrypt_installation.txt`: `disk_encryption` for full disk, `storage.luks_uuid` for pre-mounted. The flag only decides for a pre-mounted config with no `luks_uuid`, and a disagreement is logged. The spec (§3.2) now says this.
+- **Testing on WSL:** fixture-driven unit tests, a root-only probe test on loop devices, and QEMU runs driven by keystrokes and screenshots sent through QEMU's control socket (QMP), instead of `omarchy-iso-test` (which needs an Omarchy host).
+
+**What would change it.** An upstream design for the same screens: we'd rebase onto theirs rather than carry ours.
+
+## Findings, 2026-09-25: Phase 0 on a test ISO
+
+- **Rows A–D pass** on an ISO built from `visible-encryption` plus the #196 build fix, with two identical `Samsung SSD 980 PRO` drives (one Windows-like, one blank) and an invalid cidata drive attached:
+  - **A:** the picker tells the drives apart by serial and contents. The summary lists the four Windows partitions with live probe results ("EFI boot files · Windows Boot Manager", "Windows · ~1.5 GiB used"). Erasing needs the name typed; a wrong name is refused, and Esc goes back.
+  - **B:** the blank drive gets a plain Yes/No.
+  - **C:** the cidata drive is never offered, and it is listed as "cidata drive" under "Not touched".
+  - **D:** an unencrypted install passes `validate_boot`, boots with no LUKS prompt to the SDDM login screen, has btrfs directly on the partition, no `cryptdevice=` and no `autologin.conf`.
+- **Busy partitions** work end to end: a partition mounted from tty2 shows in red, "Release them" unmounts it through `omarchy-iso-cleanup-disk`, and the summary re-probes.
+- **Probes are read-only.** The loop-device test hashes every partition before and after probing.
+- **Free-space path** works on the ISO. On an 80 GiB drive with the Windows layout and 40 GiB unallocated, the summary says "Nothing is erased", lists the four Windows partitions as kept, and confirms with a plain Yes/No. The encrypted install passes `validate_boot`. `qemu-img map` on the overlay shows that the install wrote only to the primary GPT header, the free region and the backup GPT: nothing inside the Windows partitions.
+- **Not covered on the ISO:** the laptop hint, because QEMU reports a desktop chassis.
+- **Upstream quirk:** with an invalid `CIDATA` drive attached, the live ISO's cloud-init prints its logs over the wizard on tty1. That isn't Phase 0's doing, but it makes row C's screen messy.
+- **gum 2.0.2** returns 1 for Esc and 130 for Ctrl+C in `input`, `confirm` and `choose`. `gum input` panics in a 0×0 pty, which only matters for test harnesses.
+- **Hyprland 0.56 uses a Lua config**, so `hyprctl keyword` is gone. Use `hyprctl eval 'hl.monitor({ … })'`.
+
 ## 2026-09-25: Follow arch-mact2's T2 firmware rename, and accept its missing-firmware gap for now
 
 **Decision.** `omarchy` carries commit `b0b3561` ("Install the renamed T2 Broadcom firmware fetcher") on `kitchen`, from the topic branch `t2-bcm-firmware-fetcher`, which starts at `quattro` so it can go upstream as-is. It renames `apple-bcm-firmware` to `apple-bcm-firmware-fetcher` in `install/hardware/apple/fix-t2.sh` and `install/omarchy-other.packages`, and adds a regression check to `test/shell.d/t2-hardware-test.sh`. No migration: existing installs keep the old package and its firmware files. Local ISO builds use upstream's open fix omacom/omarchy-iso#196, cherry-picked onto the local-only branch `build/pr-196` in `omarchy-iso`.
