@@ -2,6 +2,51 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-26: Phase 2 shape
+
+**Decision.**
+- **OmaSecBoot's design replaces the original §5.3.** It appends your keys to KEK and db, and the user deletes only the PK. It never fails an update: it repairs, or warns. It seals `limine.conf` into the loader instead of using path hashes, and never touches snapshot images or the fallback loader. §5.3 is rewritten to match.
+- **Commands are `omarchy secureboot enable|disable|status|sign|windows …`.** Each is a thin `bin/omarchy-secureboot-*` wrapper that runs the engine with `sudo`.
+- **Vendoring is a scripted transform.** `bin/omarchy-dev-vendor-secureboot <commit>` copies OmaSecBoot at a pin and applies ordered sed renames, recorded in `install/secureboot/VENDORED`. Nothing vendored is edited by hand; a fix is a new rule or a pin bump.
+  - The engine ships in `install/secureboot/`, because the omarchy package ships `install/` wholesale.
+  - Its 161 hermetic cases run from `test/shell.d/secureboot-test.sh`.
+  - Its design documents are verbatim in `docs/secureboot/`.
+- **The hook and units are written into `/etc` at `enable` time** by `omarchy-secureboot-integrate`, since omarchy-pkgs is read-only here. They run as root and call the engine by absolute path, so integration refuses an engine that anyone but root can change (a dev checkout in `$HOME`).
+- **`omarchy update` gets a Secure Boot step** (`omarchy-update-secureboot`) after the log analysis. It refreshes the hook and units, then runs `status --quiet`. On failure it prints a red line and never fails the update.
+- **`sbctl` and `efibootmgr` join `install/omarchy-other.packages`**, so `enable` works from the offline mirror.
+- **Menu rows:**
+  - Setup > Security > Secure Boot: UEFI only, hidden on Apple hardware.
+  - Remove > Security > Secure Boot: shown when enabled.
+  - System > Reboot to Windows: shown when the Windows entry is enabled and the firmware has one clear target.
+
+**What would change it.** Upstream shipping its own Secure Boot route (a Microsoft-signed shim, per `omarchy-iso/plans/consumer-secure-boot.md`), or OmaSecBoot changing its layout enough that the transform stops being mechanical.
+
+## Findings, 2026-09-26: Phase 2 in QEMU
+
+The VM is the Row E install under OVMF with Microsoft's keys and Secure Boot off. Firmware-menu steps were done offline with `virt-fw-vars`. That means deleting the PK and setting `SecureBootEnable`.
+
+- **Row K passes.**
+  - Run 1 creates keys, seals and signs the loader and UKI, backs up the firmware keys, installs the hook and watchers, and asks to delete only the PK.
+  - Run 2, in Setup Mode, appends db, KEK, then PK, keeping 7 vendor entries.
+  - Run 3 asks to turn Secure Boot on. The machine then boots enforcing, and `status` reports nothing to do. `sbctl verify` flags only `EFI/BOOT/BOOTX64.EFI`, the raw fallback loader, by design.
+- **Row L passes.** One flipped byte in the UKI: the firmware refuses it (`LoadImage failure`, access denied). With Secure Boot turned off, the same disk boots, and `status` names the file and exits 1.
+- **Row M passes, in two halves.**
+  - An edit to `limine.conf` that bypasses the running watchers (an offline edit) stops the loader with `CHECKSUM MISMATCH FOR CONFIG FILE`.
+  - A hand edit on the running system is re-sealed by the watcher within seconds and boots.
+- **Row N passes.** A real `pacman -S linux-omarchy`:
+  - The new UKI is signed by sbctl's initcpio hook.
+  - The loader is re-sealed by Limine's hook and ours.
+  - A new snapper snapshot's history UKI is a signed copy, and its entry boots with Secure Boot on.
+- **The update step works:**
+  - silent when healthy
+  - puts a deleted hook back
+  - prints its red line when the watchers are down; `sign` then brings them back
+- **`disable` works.** It refuses with Secure Boot on. With it off, it returns the boot files and `/etc/default/limine` to stock and removes the hook and units. The keys and the firmware backup stay.
+- **Environment note.** KVM can't run OVMF's SMM build under WSL2's nested virtualization (`KVM: entry failed`). The rows ran on Ubuntu's non-SMM `OVMF_CODE_4M.fd`, which still enforces Secure Boot. SMM only protects the variable store from the OS, which these rows don't test.
+- **Not run:** the hardware rows (discrete GPU option ROM, Windows with BitLocker and BootNext), and `windows setup`/`bootnext` (no Windows in the VM).
+- **Upstream caution.** OmaSecBoot 0.1.0 has one machine with a full hardware record; the manual page says so.
+- **ISO follow-up.** OmaSecBoot asks installers to drop `99-omarchy-limine.hook`, which copies a raw loader over the sealed one after Limine upgrades. It lives in our `omarchy-iso` orchestrator (`phases_impl.py`). The watcher repairs it either way; dropping it, or running `limine-install` in its place, is a small Phase 2 ISO change not yet made.
+
 ## 2026-09-26: Phase 1 shape
 
 **Decision.**

@@ -318,45 +318,31 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 
 ### 5.2 Command
 
-This follows Omarchy's convention: `bin/omarchy-secureboot-*` with `omarchy:summary` headers, exposed as `omarchy secureboot <verb>`.
+This follows Omarchy's convention: `bin/omarchy-secureboot-*` with `omarchy:summary` headers, exposed as `omarchy secureboot <verb>`. Each is a thin wrapper that runs the vendored engine (§5.3) with `sudo`.
 
 ```
-omarchy secureboot status     # SB on/off, Setup Mode, our keys enrolled?, `sbctl verify` summary
-omarchy secureboot enable     # guided: keys → sign → (reboot to Setup Mode if needed) → enroll → verify
-omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn SB off in firmware
+omarchy secureboot enable     # guided, one firmware step per run: keys → seal and sign → delete PK → append-enroll → turn SB on
+omarchy secureboot status     # firmware, keys, settings, loader seal and signatures, hook and watchers; ends with the fix (--quiet: exit status)
+omarchy secureboot sign       # the converge-and-verify pass the hook and watchers run; safe at any time
+omarchy secureboot disable    # back to stock (SB must be off first); keys stay
+omarchy secureboot windows preflight|setup|remove|status|bootnext
 ```
 
-### 5.3 `enable` flow
+### 5.3 Engine and `enable` flow
 
-1. **Check prerequisites.**
-   - The machine must boot UEFI with Limine and a UKI. That's true of every Omarchy install; BIOS installs are refused with an explanation.
-   - Install `sbctl` if missing.
-2. **Create keys.** Run `sbctl create-keys`. Keys land in `/var/lib/sbctl` on the (normally encrypted) root and never on the ESP.
-3. **Harden Limine.**
-   - Enroll the `limine.conf` checksum into `limine_x64.efi` using limine-entry-tool's config-enrollment setting in `/etc/default/limine`.
-   - Set `hash_mismatch_panic: yes`, overriding the Omarchy template's `no`.
-   - Turn off the config editor.
+The engine is [OmaSecBoot](https://github.com/peregrinus879/omasecboot) (MIT), vendored by `bin/omarchy-dev-vendor-secureboot <commit>`: a scripted copy plus ordered renames, never hand-edited, so an upstream fix is a pin bump. It lands in `install/secureboot/` (ships in the omarchy package at `/usr/share/omarchy/install/secureboot`), its hermetic suites in `test/secureboot/` (run by `test/shell.d/secureboot-test.sh`), and its design documents verbatim in `docs/secureboot/`. `install/secureboot/VENDORED` records the pin and the rules.
 
-   With a checksum enrolled, Limine refuses a modified `limine.conf`. The UKI entries are EFI loads, so the firmware checks their signatures.
-4. **Sign the boot chain.** Sign `limine_x64.efi`, every UKI in `EFI/Linux/` and the fallback UKI with `sbctl sign -s`, so sbctl tracks them for re-signing.
-5. **Install the hooks.**
-   - `zz-omarchy-secureboot.hook` is a pacman hook ordered after sbctl's own `zz-sbctl.hook`.
-   - A Limine post-hook runs after `limine-update` and `limine-snapper-sync`. It re-enrolls the config checksum, re-signs `limine_x64.efi`, and signs new snapshot UKIs (`*.efi_sha256_*`, `*.efi_b3_*`).
-   - **Failure policy:** never leave an unsigned boot artifact in place of a signed one. The hook fails the transaction loudly instead.
-6. **Check Setup Mode.** If the firmware isn't in Setup Mode:
-   - Explain the one menu item needed ("Reset to Setup Mode" or "Clear Secure Boot keys").
-   - Show per-vendor hints from `secureboot-vendors.toml`, keyed on `/sys/class/dmi/id/sys_vendor`.
-   - Offer `systemctl reboot --firmware-setup`.
-   - Leave a one-shot marker, so the next login's `omarchy secureboot status` resumes at step 7.
-7. **Enroll the keys.** Run `sbctl enroll-keys --microsoft`.
-   - Microsoft's keys are **on by default** and are *required* with a discrete GPU. Its option ROM is Microsoft-signed, and without it the firmware can skip it and leave you with no display.
-   - `--firmware-builtin` is offered on laptops as an extra safety net.
-8. **Turn Secure Boot on and verify.**
-   - The user enables Secure Boot in firmware and reboots.
-   - `omarchy secureboot status` must show SB enabled, user mode, and `sbctl verify` clean.
-9. **Dual boot.** If a Windows boot entry exists, register Windows as a **firmware BootNext** entry rather than a Limine chainload. Otherwise every re-signed `limine_x64.efi` changes Windows' TPM measurements and triggers BitLocker recovery. This is the approach proven in `peregrinus879/omarchy-secureboot`.
+**Design (supersedes the original §5.3, decided 2026-09-26).**
 
-**Prior art.** `peregrinus879/omarchy-secureboot` already implements most of this on Omarchy. Evaluate vendoring it, with attribution and licence permitting, before writing from scratch.
+1. **Prerequisites.** x86_64, UEFI, Limine, UKIs, a vfat ESP; `sbctl` and `efibootmgr` are installed by `enable` (both are in the ISO's offline list).
+2. **Keys.** `sbctl create-keys`; keys stay in `/var/lib/sbctl` on the encrypted root.
+3. **Seal, don't hash.** `ENABLE_ENROLL_LIMINE_CONFIG=yes` (only honoured in `/etc/default/limine`) and `ENABLE_VERIFICATION=no` in `/etc/default/limine`, originals recorded for `disable`. Limine seals the loader over `limine.conf`; UKIs are EFI loads the firmware checks by signature, so path hashes are not needed and would go stale when a file is signed.
+4. **Sign.** The loader and every UKI, and anything else on the ESP that arrives unsigned. **Never** snapshot images (limine-snapper-sync stores their hashes; signing would break them for good; snapshots taken after setup copy signed UKIs) and never the fallback loader (it stays raw as the rescue path with SB off).
+5. **Hook and watchers, never failing an update.** A Limine post-hook `90-omarchy-secureboot-sign` runs `sign --quiet || :` at the end of every Limine operation. Two instances of `omarchy-secureboot-watch@.path` re-seal on edits to `limine.conf` and when the loader is replaced (Omarchy's `99-omarchy-limine.hook` copies a raw loader after Limine upgrades). Failures are repaired or reported, never fatal to pacman. `omarchy-secureboot-integrate` writes the hook and units into `/etc` with the engine's absolute path, and refuses when the engine isn't root-only (a dev checkout in `$HOME`), because they run as root.
+6. **Firmware, one step per run.** Back up PK/KEK/db/dbx to `/var/lib/omarchy-secureboot/firmware-backup/`, then ask the user to delete **only the PK** and save with SB disabled. Next run, in Setup Mode: **append** your certificates to KEK and db (`sbctl enroll-keys --append --partial`, db, KEK, then PK), each read back. Microsoft's and the vendor's certificates stay, which covers discrete-GPU option ROMs without `--microsoft`. dbx is never written. Firmware that clears every key is detected and offered a rebuild from yours, Microsoft's and the built-in defaults; a partial clear is refused.
+7. **Turn SB on.** The next run tells the user to; `status` proves the result.
+8. **Dual boot.** `windows setup` adds a Limine entry using the `efi_boot_entry` protocol (restart into the firmware's Windows Boot Manager, not a chainload), and `windows bootnext` sets BootNext once, both keeping Limine out of BitLocker's measurements. `windows preflight` finds BitLocker volumes first. Menu: System > Reboot to Windows.
+9. **Updates.** `omarchy update` runs `omarchy-update-secureboot`: refresh the hook and units, run `status --quiet`, and print a red line on failure. It never fails the update.
 
 ### 5.4 Docs
 
@@ -405,21 +391,21 @@ The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars witho
 | H | `home.location = "disk"`, encrypted | One prompt at boot. `/home` on disk 2. Snapshot of `/` still works. |
 | I | `swap.strategy = "zram"` | No swapfile, no `resume=` |
 | J | Unknown key or plaintext secret in TOML | `chefs-kitchen validate` fails with the key name |
-| K | Installed VM, `omarchy secureboot enable` in Setup Mode | Enrolled. Boots with SB enforcing. `sbctl verify` clean. |
+| K | Installed VM with vendor keys, `omarchy secureboot enable` run by run (delete PK, enroll, turn SB on) | Enrolled, vendor keys kept. Boots with SB enforcing. `status` clean; `sbctl verify` clean except the raw fallback loader, by design. |
 | L | Flip a byte in the UKI on the ESP | Firmware refuses it |
-| M | Edit `limine.conf` by hand | Limine refuses (hash mismatch) |
-| N | Kernel update plus new snapper snapshot | New UKI and snapshot UKIs signed. Config re-enrolled. Reboots cleanly. |
+| M | Edit `limine.conf` on the ESP from outside the running system (offline image) | Limine refuses (checksum mismatch). A hand edit on the running system is re-sealed by the watcher instead. |
+| N | Kernel update plus new snapper snapshot | New UKI signed, loader re-sealed, and the new snapshot boots with SB on. Snapshots from before `enable` stay unsigned and are refused. Reboots cleanly. |
 
 **Hardware for Phase 2:**
-- one desktop with a discrete GPU, to prove `--microsoft` is needed for the option ROM
+- one desktop with a discrete GPU, to prove that the appended enrollment keeps its option ROM starting
 - one laptop with Windows and BitLocker, to test the BootNext path
 
 ---
 
 ## 8. Open questions
 
-1. **Limine config-enrollment key.** Confirm the exact key name in the shipped `limine-mkinitcpio-hook`, and whether `limine-snapper-sync` re-enrolls on its own.
-2. **Microsoft 2023 CAs.** Microsoft's 2011 Secure Boot CAs expire during 2026. Confirm that the shipped sbctl's `--microsoft` bundle includes the 2023 UEFI CA and KEK.
+1. ~~**Limine config-enrollment key.**~~ Answered 2026-09-26: `ENABLE_ENROLL_LIMINE_CONFIG=yes`, honoured only in `/etc/default/limine`. `limine-snapper-sync` goes through the same post-hooks, so the hook re-seals after every snapshot sync. See `omarchy/docs/secureboot/upstream-contracts.md` C2 and C3.
+2. ~~**Microsoft 2023 CAs.**~~ Answered 2026-09-26: sbctl 0.18 ships all seven 2011 and 2023 certificates. The append path writes none of them and keeps what the firmware holds. `enable` warns before the PK is deleted when KEK lacks the 2023 KEK CA, because afterwards only the new PK owner can add it; `status` names any 2023 certificate missing. See C9.
 3. ~~**Vendor vs. write.**~~ Decided 2026-09-25: vendor OmaSecBoot (MIT) into the `omarchy` fork at a pinned commit, with attribution. Keep its enrolment, BootNext and firmware workarounds close to upstream so fixes cherry-pick cleanly, and reshape the command layer into `omarchy secureboot`. See `docs/decisions.md`.
 4. ~~**Upstreaming.**~~ Decided 2026-09-25: upstream PRs wait until all phases are done. Upstreamable work stays on topic branches from `quattro` until then.
 5. ~~**Name.**~~ Decided 2026-09-25: Chefs Kitchen, CLI `chefs-kitchen`.
