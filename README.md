@@ -43,6 +43,8 @@ cd ~/src/kitchen/omarchy-iso
 ./bin/omarchy-iso-make --local-source ../omarchy ../omarchy-pkgs
 ```
 
+Test in QEMU with the helpers in [scripts/qemu/](scripts/qemu/README.md), which cover keystrokes, screenshots, Secure Boot firmware setup and driving machines over SSH.
+
 Keep up with upstream:
 
 ```bash
