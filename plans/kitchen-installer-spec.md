@@ -4,7 +4,7 @@
 **Base:** `omacom/omarchy` (formerly `basecamp/omarchy`) 4.0.0.alpha and `omarchy-iso` (both at HEAD on 2026-09-25)
 **Scope:** Design, with Phase 0 under way on the forks' `wipe-summary` and `visible-encryption` branches.
 
-> **Naming placeholder.** The installer CLI is `kitchen`. Commands on the installed system keep Omarchy's `omarchy <noun> <verb>` convention, which comes from the `omarchy-*` scripts in `bin/`. That way the fork stays easy to rebase on upstream.
+> **Naming.** The installer is called Chefs Kitchen, and its CLI is `chefs-kitchen` (decided 2026-09-25, §8 question 5). Commands on the installed system keep Omarchy's `omarchy <noun> <verb>` convention, which comes from the `omarchy-*` scripts in `bin/`. That way the fork stays easy to rebase on upstream.
 
 ---
 
@@ -14,7 +14,7 @@
 |---|--------|------|----------|
 | 4 | Last-chance wipe summary and disk-picker fixes | S | Phase 0 |
 | 5 | Encryption as a visible choice (still the default) | S | Phase 0 |
-| 3 | `kitchen install --config install.toml`, trimmed to the essentials | M | Phase 1 |
+| 3 | `chefs-kitchen install --config install.toml`, trimmed to the essentials | M | Phase 1 |
 | 1 | Signed boot as a post-install command (`omarchy secureboot enable`) plus a docs fix | S–M | Phase 2 |
 
 **Cut or deferred** (see §6 for the reasoning and what would bring each back):
@@ -25,7 +25,7 @@
 - TPM2 unlock and the systemd initramfs migration it needs
 - config from a kernel-parameter URL
 - lock-file drift reports
-- `kitchen config export`
+- `chefs-kitchen config export`
 - encrypted recovery-key output
 
 **Guiding rule.** Omakase stays the wizard's only recipe. Anything beyond the defaults goes in `install.toml`, not in more screens.
@@ -126,7 +126,7 @@ This ships first. It has no dependencies and gives the most value per line of co
 
 **Free-space mode** uses the same screen. "What dies" becomes "Nothing is erased", followed by the free region to be used.
 
-**Unattended installs.** `kitchen plan` and `kitchen install` render the same table to stdout and the install log (see §4.4).
+**Unattended installs.** `chefs-kitchen plan` and `chefs-kitchen install` render the same table to stdout and the install log (see §4.4).
 
 ### 2.3 Picker fixes in the same PR
 
@@ -175,10 +175,10 @@ The wipe summary that follows shows the result under "What gets created" (`LUKS2
 ### 4.1 Commands
 
 ```
-kitchen validate install.toml                    # schema + semantic checks, no hardware access (CI-friendly)
-kitchen plan     --config install.toml           # resolve disks, print the wipe summary; touches nothing
-kitchen install  --config install.toml           # interactive: shows the wipe summary, typed confirm
-kitchen install  --config install.toml --yes     # unattended: guarded by [disk].on_existing_data
+chefs-kitchen validate install.toml                    # schema + semantic checks, no hardware access (CI-friendly)
+chefs-kitchen plan     --config install.toml           # resolve disks, print the wipe summary; touches nothing
+chefs-kitchen install  --config install.toml           # interactive: shows the wipe summary, typed confirm
+chefs-kitchen install  --config install.toml --yes     # unattended: guarded by [disk].on_existing_data
 ```
 
 **Config sources, in order:**
@@ -190,8 +190,8 @@ kitchen install  --config install.toml --yes     # unattended: guarded by [disk]
 The wizard gains one entry on its first screen: **"Load install.toml from USB"**.
 
 **Every clicked install is also a described one:**
-- The wizard writes `/root/install.toml`, then runs `kitchen install --config /root/install.toml`.
-- The installer copies that file, with secrets stripped, to `/etc/kitchen/install.toml` on the target.
+- The wizard writes `/root/install.toml`, then runs `chefs-kitchen install --config /root/install.toml`.
+- The installer copies that file, with secrets stripped, to `/etc/chefs-kitchen/install.toml` on the target.
 
 ### 4.2 Schema v1
 
@@ -260,29 +260,29 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 
 ### 4.3 Validation rules
 
-**`kitchen validate`** (static, no hardware access):
+**`chefs-kitchen validate`** (static, no hardware access):
 - It rejects plaintext secrets. The only exception is `passphrase = { insecure_plaintext = "…" }`, which prints a warning in every mode.
 - It rejects unknown keys. A typo must never be silently ignored.
 - `theme` and `agent` must be names the ISO knows.
 
-**`kitchen plan`** (probes hardware):
+**`chefs-kitchen plan`** (probes hardware):
 - **Target disk.** `target` must resolve to **exactly one** disk. That disk must never be the install medium or a `cidata` drive, and must be at least ESP + 32 GiB.
 - **Home disk.** `home.disk` must resolve to a different disk than `target`. It gets its own "What dies" block, and in interactive mode its own typed confirmation.
 - **`on_existing_data = "abort"`** is the unattended default. If either disk has any signature, the install stops, prints the wipe table and hints at the two ways forward.
-- **`expect_fingerprint`** is a sha256 over the partition-table type plus, for each partition, its start, size, type GUID and filesystem UUID. `kitchen plan` prints the current value so it can be pasted into the config. It is the unattended equivalent of "yes, *that* drive, with *that* data on it".
+- **`expect_fingerprint`** is a sha256 over the partition-table type plus, for each partition, its start, size, type GUID and filesystem UUID. `chefs-kitchen plan` prints the current value so it can be pasted into the config. It is the unattended equivalent of "yes, *that* drive, with *that* data on it".
 
 ### 4.4 Implementation
 
-**Compiler shim.** `kitchen_config` is a Python package: stdlib `tomllib` plus dataclasses, so no new dependencies. It turns the TOML into **today's** `user_configuration.json`, `user_credentials.json` and flag files. The orchestrator therefore runs unchanged, except for the swap and home branches above. Reading the plan directly can come later, once the shim has proved itself.
+**Compiler shim.** `chefs_kitchen_config` is a Python package: stdlib `tomllib` plus dataclasses, so no new dependencies. It turns the TOML into **today's** `user_configuration.json`, `user_credentials.json` and flag files. The orchestrator therefore runs unchanged, except for the swap and home branches above. Reading the plan directly can come later, once the shim has proved itself.
 
 **Files touched:**
 
 | File | Change |
 |---|---|
-| `omarchy-iso/configs/airootfs/usr/share/omarchy-iso/kitchen_config/` | **New.** `schema.py`, `resolve.py` (disk selectors via `/dev/disk/by-id` and `lsblk -J`), `plan.py` (wipe table and fingerprint), `compile_archinstall.py` |
-| `…/usr/local/bin/kitchen` | **New** dispatcher |
+| `omarchy-iso/configs/airootfs/usr/share/omarchy-iso/chefs_kitchen_config/` | **New.** `schema.py`, `resolve.py` (disk selectors via `/dev/disk/by-id` and `lsblk -J`), `plan.py` (wipe table and fingerprint), `compile_archinstall.py` |
+| `…/usr/local/bin/chefs-kitchen` | **New** dispatcher |
 | `…/usr/local/bin/omarchy-cidata-load` | Also accept `install.toml` |
-| `…/root/.automated_script.sh` | cidata → `kitchen install --config … --yes` |
+| `…/root/.automated_script.sh` | cidata → `chefs-kitchen install --config … --yes` |
 | `…/root/configurator` | Write `install.toml`. Remove the direct JSON writers and the Ctrl+C toggle. Add the wipe summary and "Load from USB". |
 | `orchestrator/phases_impl.py` | Swap-strategy skip in `configure_hibernation`. `/home` disk mount and crypttab. Strip secrets and copy `install.toml` to the target. `validate_boot` encryption assertion in both directions. |
 | `omarchy/manual/51-unattended-installs.md` | Rewrite around `install.toml` |
@@ -324,7 +324,7 @@ omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn
    With a checksum enrolled, Limine refuses a modified `limine.conf`. The UKI entries are EFI loads, so the firmware checks their signatures.
 4. **Sign the boot chain.** Sign `limine_x64.efi`, every UKI in `EFI/Linux/` and the fallback UKI with `sbctl sign -s`, so sbctl tracks them for re-signing.
 5. **Install the hooks.**
-   - `zz-kitchen-secureboot.hook` is a pacman hook ordered after sbctl's own `zz-sbctl.hook`.
+   - `zz-omarchy-secureboot.hook` is a pacman hook ordered after sbctl's own `zz-sbctl.hook`.
    - A Limine post-hook runs after `limine-update` and `limine-snapper-sync`. It re-enrolls the config checksum, re-signs `limine_x64.efi`, and signs new snapshot UKIs (`*.efi_sha256_*`, `*.efi_b3_*`).
    - **Failure policy:** never leave an unsigned boot artifact in place of a signed one. The hook fails the transaction loudly instead.
 6. **Check Setup Mode.** If the firmware isn't in Setup Mode:
@@ -381,12 +381,12 @@ The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars witho
 | B | Blank target | Plain Yes/No confirm |
 | C | cidata drive present *and* invalid | The wizard never offers it |
 | D | "Not encrypted" chosen | No LUKS. No `cryptdevice=`. SDDM login screen, no autologin. |
-| E | TOML equivalent of the default install | Boots. Parity with a wizard install. `/etc/kitchen/install.toml` has no secrets. |
+| E | TOML equivalent of the default install | Boots. Parity with a wizard install. `/etc/chefs-kitchen/install.toml` has no secrets. |
 | F | `on_existing_data = "abort"` against a disk with data | Refuses. Table in the log. |
 | G | Stale `expect_fingerprint` | Refuses |
 | H | `home.location = "disk"`, encrypted | One prompt at boot. `/home` on disk 2. Snapshot of `/` still works. |
 | I | `swap.strategy = "zram"` | No swapfile, no `resume=` |
-| J | Unknown key or plaintext secret in TOML | `kitchen validate` fails with the key name |
+| J | Unknown key or plaintext secret in TOML | `chefs-kitchen validate` fails with the key name |
 | K | Installed VM, `omarchy secureboot enable` in Setup Mode | Enrolled. Boots with SB enforcing. `sbctl verify` clean. |
 | L | Flip a byte in the UKI on the ESP | Firmware refuses it |
 | M | Edit `limine.conf` by hand | Limine refuses (hash mismatch) |
@@ -402,9 +402,9 @@ The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars witho
 
 1. **Limine config-enrollment key.** Confirm the exact key name in the shipped `limine-mkinitcpio-hook`, and whether `limine-snapper-sync` re-enrolls on its own.
 2. **Microsoft 2023 CAs.** Microsoft's 2011 Secure Boot CAs expire during 2026. Confirm that the shipped sbctl's `--microsoft` bundle includes the 2023 UEFI CA and KEK.
-3. **Vendor vs. write.** Licence and maintenance status of `peregrinus879/omarchy-secureboot`.
-4. **Upstreaming.** Phases 0 and 1 are self-contained and arguably upstreamable. Decide before the fork diverges.
-5. **Name.** Settle the installer CLI name before Phase 1 ships, because it appears in every user's `install.toml` workflow.
+3. ~~**Vendor vs. write.**~~ Decided 2026-09-25: vendor OmaSecBoot (MIT) into the `omarchy` fork at a pinned commit, with attribution. Keep its enrolment, BootNext and firmware workarounds close to upstream so fixes cherry-pick cleanly, and reshape the command layer into `omarchy secureboot`. See `docs/decisions.md`.
+4. ~~**Upstreaming.**~~ Decided 2026-09-25: upstream PRs wait until all phases are done. Upstreamable work stays on topic branches from `quattro` until then.
+5. ~~**Name.**~~ Decided 2026-09-25: Chefs Kitchen, CLI `chefs-kitchen`.
 
 ## Sources
 

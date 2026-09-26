@@ -2,6 +2,33 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-25: Name, upstreaming, and the Secure Boot tool
+
+**Decision.**
+- **Name.** The installer is called Chefs Kitchen, and its CLI is `chefs-kitchen`: `chefs-kitchen validate|plan|install`, `/etc/chefs-kitchen/install.toml` on installed systems, and the `chefs_kitchen_config` Python package. Commands on installed systems keep Omarchy's own naming (`omarchy secureboot`, `zz-omarchy-secureboot.hook`). The umbrella repo, the forks' `kitchen` branches and the product name "Omarchy: The Kitchen Is Open" stay as they are. This closes spec §8 question 5.
+- **Upstreaming waits until all phases are done.** Upstreamable changes stay on their own topic branches from `quattro` until then (today: `t2-bcm-firmware-fetcher`, `wipe-summary`, `visible-encryption`, `quiet-cloud-init`). This closes §8 question 4.
+- **Phase 2 vendors OmaSecBoot** (`peregrinus879/omasecboot`, MIT) into the `omarchy` fork at a pinned commit, with attribution. It keeps the hard-won parts (enrolment steps, BootNext dual boot, hook ordering, firmware workarounds) close to upstream so their fixes cherry-pick, and reshapes the command layer into `omarchy secureboot`. This closes §8 question 3.
+- **Deferred:** checking the laptop hint on real hardware.
+
+**Why vendor.** As of 2026-09-25, OmaSecBoot is v0.1.0 with one maintainer, 67 commits in the last 30 days, about 3,300 lines of Bash with tests, one field report (a Framework 13 AMD), and no AUR package.
+- Depending on it as a package ties §5 to one person's pace and design choices, behind a v0.1.0 CLI that isn't `omarchy secureboot`.
+- Writing our own would re-learn its firmware lessons from zero.
+- Vendoring costs manual syncing, so keep the diff against it small.
+
+**What would change it.** OmaSecBoot reaching a stable, packaged release whose behaviour matches §5.3: then depend on it (option A) and keep only a thin wrapper.
+
+## Findings, 2026-09-25: cloud-init on the live ISO
+
+- **Arch's live-ISO profile enables five cloud-init units** (`cloud-init-local`, `-main` and `-network`, plus `cloud-config` and `cloud-final`), and all of them log with `StandardOutput=journal+console`. cloud-init runs whenever a drive labelled cidata is attached. With a cidata drive whose config the installer couldn't load, its output (including SSH host key fingerprints, which `keys_to_console` also writes straight to `/dev/console`) covered the wizard on tty1.
+- **Fixed on `quiet-cloud-init`:**
+  - A `cloud-.service.d` drop-in; the prefix applies it to every `cloud-*.service` unit.
+  - `cloud.cfg.d/90-omarchy-quiet-console.cfg`, which sets `ssh.emit_keys_to_console: false` and `no_ssh_fingerprints: true`.
+- **Verified on a test ISO with the invalid cidata drive attached:**
+  - tty1 stays clean through the picker.
+  - `systemctl show` reports `StandardOutput=journal` for the cloud-init units.
+  - cloud-init still ran, and its fingerprint lines are in the journal.
+  - The config passes `cloud-init schema`, given the `#cloud-config` header that user-data needs and `cloud.cfg.d` files don't.
+
 ## 2026-09-25: Phase 0 shape
 
 **Decision.**
