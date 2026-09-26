@@ -1,8 +1,8 @@
 # Omarchy "The Kitchen Is Open": Installer Spec
 
-**Status:** Draft v2 · 2026-09-26. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred. Phases 0 and 1 are built; §2–§4 and §7 were updated to match.
-**Base:** `omacom/omarchy` (formerly `basecamp/omarchy`) 4.0.0.alpha and `omarchy-iso` (both at HEAD on 2026-09-25)
-**Scope:** Phases 0 and 1 are built on the forks' topic branches; Phase 2 is design only.
+**Status:** Draft v2 · 2026-09-26. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred. Phases 0, 1 and 2 are built; §2–§5 and §7 were updated to match.
+**Base:** `omacom/omarchy` (formerly `basecamp/omarchy`) and `omarchy-iso`, both on upstream's `quattro` branch. That's the 4.x development line; 4.0.x releases (v4.0.4 on 2026-09-15) are cut from branches of their own. File references are from 2026-09-25, and the forks were last rebased on 2026-09-26.
+**Scope:** Phases 0–2 are built on the forks' topic branches. Phase 2's hardware rows are still open (§7).
 
 > **Naming.** The installer is called Chefs Kitchen, and its CLI is `chefs-kitchen` (decided 2026-09-25, §8 question 5). Commands on the installed system keep Omarchy's `omarchy <noun> <verb>` convention, which comes from the `omarchy-*` scripts in `bin/`. That way the fork stays easy to rebase on upstream.
 
@@ -314,7 +314,7 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 
 **The installed system is the right place.** Putting Secure Boot into Setup Mode, enrolling your own keys and signing the boot chain is something the installed system can do as well as the installer. It is also far easier to recover from if it goes wrong, because the machine already boots.
 
-**It stays separate from the install path.** Keeping signed boot out of the installer means the 14 orchestrator phases don't change, and a signing failure can never take down a fresh install.
+**It stays separate from the install path.** Keeping signed boot out of the installer means no orchestrator phase changes for it, and a signing failure can never take down a fresh install.
 
 ### 5.2 Command
 
@@ -348,7 +348,7 @@ The engine is [OmaSecBoot](https://github.com/peregrinus879/omasecboot) (MIT), v
 
 | File | Change |
 |---|---|
-| `omarchy/manual/02-getting-started.md:7` | Ships with Phase 2, when the command it names exists. Replace with: "Secure Boot: if it's on, switch it off or put it in **Setup Mode** to boot the installer. After installing, run `omarchy secureboot enable` to turn it back on with keys owned by your machine. Leave the TPM alone; nothing needs it disabled." |
+| `omarchy/manual/02-getting-started.md:7` | Shipped with Phase 2: "Secure Boot has to be off to boot the installer. Once Omarchy is installed, `omarchy secureboot enable` turns it back on with keys owned by your machine … Leave the TPM alone: nothing needs it disabled." It doesn't offer Setup Mode, as an earlier draft did: firmware left in Setup Mode has no vendor keys to keep, so `enable` would then take the rebuild path instead of appending. |
 | `omarchy/manual/44-mac-support.md:19–28` | Keep. T2 Macs use Apple's own Secure Boot with no user key enrollment. Add one sentence saying why. |
 | New manual page: "Secure Boot" | The `enable` flow, recovery (turning SB off in firmware always gets you back in), and firmware-update notes |
 
@@ -377,7 +377,7 @@ The engine is [OmaSecBoot](https://github.com/peregrinus879/omasecboot) (MIT), v
 | **1** | §4 TOML: validate, plan, install. Compiler shim. cidata TOML. Wizard writes TOML. `/home` disk and swap branches. Theme, agent, extra packages. | Rows E–J, plus every existing `omarchy-iso-test` scenario passing from TOML |
 | **2** | §5 `omarchy secureboot`, which runs on installed systems and is independent of the ISO. §5.4 docs, including line 7. | Rows K–N, plus hardware |
 
-The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars without enrolled keys start in Setup Mode.
+The rows ran by hand in QEMU plus OVMF, with the helpers in `omarchy-kitchen/scripts/qemu/`. `bin/omarchy-iso-test` needs an Omarchy host and hasn't been run yet, which leaves part of Phase 1's exit criterion open. OVMF vars without enrolled keys start in Setup Mode.
 
 | Row | Scenario | Asserts |
 |---|---|---|
@@ -398,7 +398,7 @@ The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars witho
 
 **Hardware for Phase 2:**
 - one desktop with a discrete GPU, to prove that the appended enrollment keeps its option ROM starting
-- one laptop with Windows and BitLocker, to test the BootNext path
+- one laptop with Windows and BitLocker, to test the BootNext path. Deferred on 2026-09-26 until a laptop is procured. It stays an exit criterion, so the upstream PRs wait for it.
 
 ---
 
@@ -415,5 +415,5 @@ The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars witho
 - Omarchy source: `omacom/omarchy`, `omarchy-iso`. File and line references are from the 2026-09-25 HEAD.
 - Upstream plan: `omarchy-iso/plans/consumer-secure-boot.md`
 - Limine Secure Boot semantics: https://github.com/limine-bootloader/limine/blob/trunk/USAGE.md
-- Working Omarchy + sbctl + Limine reference: https://github.com/peregrinus879/omarchy-secureboot
+- Working Omarchy + sbctl + Limine reference, now OmaSecBoot and vendored for Phase 2: https://github.com/peregrinus879/omasecboot
 - sbctl: https://man.archlinux.org/man/sbctl.8

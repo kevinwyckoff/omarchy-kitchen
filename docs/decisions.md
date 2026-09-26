@@ -2,6 +2,50 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-26: Fixes from the first real-hardware installs
+
+**Decision.**
+- **"Done" waits for the laptop.** The Windows+BitLocker row (BootNext, `omarchy secureboot windows setup|bootnext`) and the laptop-hint check wait until Kevin has procured a laptop. The row stays a Phase 2 exit criterion, so the upstream PRs stay held until it passes.
+- **Missing sync databases: carry upstream's fix.** omacom/omarchy#11388 (open) syncs any repository that has never been synced, in `post-install/pacman.sh` and in `omarchy-pkg-add` and `omarchy-pkg-aur-add`, through a new `omarchy-pkg-db-sync`. It sits at the bottom of the omarchy `kitchen` stack, unchanged except for keeping quattro's `--` in `omarchy-pkg-aur-add`, and a local `pr-11388` branch holds it. It gets no PR of ours. It also fixes Phase 2: `omarchy secureboot enable` begins with `omarchy-pkg-add sbctl efibootmgr`, and sbctl isn't installed. It's in the offline mirror, but the mirror is gone after install. The Phase 2 shape entry's "so `enable` works from the offline mirror" was wrong: without the fix, `enable` failed on a fresh install until a full update ran.
+- **`99-omarchy-limine.hook` goes on standard UEFI installs** (omarchy-iso `drop-limine-copy-hook`). The packaged `80-limine-efi-deploy.hook` already runs `limine-install`, which deploys the same loader to the same path, keeps the `.bak` and leaves sealing and signing intact. The hook stays for BIOS, for the removable `EFI/BOOT` slot and for any other loader path. No omarchy migration for existing installs yet: kitchen-sink keeps its hook so the hardware row can show the watcher re-sealing after it. omacom/omarchy#12246 removes the hook by migration but then runs `sbctl sign -s` on the loader, which needs checking against sealing before we rely on it.
+- **ufw in the install chroot** (omarchy-iso `quiet-ufw-chroot`). The "ERROR: problem running" message was hiding a bug. `firewall.sh` sets ENABLED=yes first, so a later `ufw allow` tries to load rules into the live ISO's netfilter and dies after writing the IPv4 rule, before the IPv6 one. Every install with SSH access had port 22, and tailscale0, open over IPv4 only. The installer now runs `ufw allow` with ENABLED=no and restores the file afterwards. Both families get written, and a non-zero exit fails the phase. **This changes behaviour:** SSH is now reachable over IPv6 too, which is what `ufw allow ssh` asks for.
+- **The live greeter waits for an address** (private `live-ssh`). With live SSH on, it waits for an IPv4 address before drawing the SSH hint, showing "waiting for a network...". It checks up to 20 times, half a second apart (about 10 s). Return ends the wait, and it's skipped inside an SSH session.
+- **NvPCR failures on AMD fTPMs are a known issue, not a fix.** Omarchy masks nothing. Acceptance runs on such hardware pass `OMARCHY_ACCEPTANCE_IGNORE_UNITS='systemd-(tpm2-setup-early|pcrproduct|pcrlogin@)'`. Revisit before TPM2 unlock.
+- **omarchy synced to upstream c5b4db77.** That takes in #13323, one sudo prompt per `omarchy update` where we answered about nine, and #13361, which removes the `setpriv` TERM message at the end of an update. Both were findings of ours.
+
+**What would change it.** Upstream merging or rejecting #11388 or #12246, or a laptop arriving.
+
+## Findings, 2026-09-26: the fixes in QEMU
+
+Four scenarios, run in parallel from one ISO built from `build/live-ssh` with local omarchy `kitchen` (omarchy-dev r6642). The baseline was an A/B against the morning ISO (dae8932).
+
+- **Morning ISO, unattended online install:** it has the 99 hook. `ufw status` shows 22 for IPv4 only, and `user6.rules` and `ip6tables` have no port 22. "ERROR: problem running" appears only in the live `/var/log/omarchy-install.log`. There are no core, extra, multilib or omarchy databases, and `omarchy-pkg-add sbctl` fails with "target not found".
+- **New ISO, the same install:**
+  - no 99 hook
+  - a `limine` reinstall after the loader was made stale redeploys it through the 80 hook; one Limine NVRAM entry remains, and the machine boots through it
+  - 22 and 22 (v6) allowed, with ENABLED=yes restored
+  - no ufw error
+  - the databases are synced during the install, and `omarchy-pkg-add sbctl efibootmgr` works
+  - 0 failed units
+- **New ISO, installed with the link down throughout:**
+  - The install finishes, with all 16 phases ok.
+  - The install-time `pacman -Sy` fails with DNS errors in the log without failing the phase.
+  - After the link comes up, the first `omarchy-pkg-add` runs one `pacman -Sy` and installs. A second `omarchy-pkg-db-sync` does nothing.
+- **Greeter:**
+  - Link down: "waiting for a network...". The link came up about 4 s later, and the address showed 0.5 s after that; SSH works.
+  - Link never up: the old fallback line, then Return works.
+  - Return during the wait: the next step appears in 0.23 s.
+  - No keys: no SSH line and no delay.
+  - The wait counts checks, not seconds, so under host load it stretched to 12–15 s.
+- **New, not caused by these fixes:**
+  - **The target's install log stops at "User finalization complete."** The later phases write only to the live log, and an unattended install reboots and loses it. That's why kitchen-sink's disk never showed the ufw error. Candidate: copy the live log to the target once the last phase is done.
+  - **Unencrypted installs print "Failed to open encryption mapping"** at first boot, because `encrypt` is always among the initramfs hooks. Row D checked the command line, not the console. Upstream omacom/omarchy-iso#143 (open, mergeable) removes the hook on unencrypted installs. Candidate: carry it like #11388.
+  - **Smaller oddities, not yet looked into:**
+    - the install log writes vconsole.conf with an empty keymap although install.toml said `keyboard = "us"`
+    - `installed_packages` is 953 against 952 expected
+    - a stray `offline.db` is left in the sync directory
+    - with no network, `pacman-init` waits for time sync, so the keyring setup lands mid-wizard
+
 ## 2026-09-26: Remote installs over SSH, on a private branch
 
 **Decision.**
