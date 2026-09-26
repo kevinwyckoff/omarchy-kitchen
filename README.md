@@ -2,7 +2,13 @@
 
 A fork of [Omarchy](https://omarchy.org) that reworks the installer so it's more open: you can see what it's about to erase, choose whether to encrypt, describe an install in a text file, and keep Secure Boot on with keys your machine owns.
 
-**Status:** Phases 0 (wipe summary, visible encryption choice) and 1 (`install.toml` and `chefs-kitchen`) are built and tested on the forks. Phase 2 (signed boot) is next. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
+**Status:** All three phases are built and tested on the forks:
+
+- Phase 0: the wipe summary and a visible encryption choice
+- Phase 1: `install.toml` and `chefs-kitchen`
+- Phase 2: `omarchy secureboot`, rows K–N in QEMU
+
+The Phase 2 hardware rows are still open. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
 
 ## Repositories
 

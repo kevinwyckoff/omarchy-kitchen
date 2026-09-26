@@ -2,6 +2,35 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-26: Remote installs over SSH, on a private branch
+
+**Decision.**
+- **Opening SSH:** a USB or `cidata` drive carrying `live_authorized_keys` opens key-only root SSH on the live ISO. So does an ISO with that file at its root. Without the file, nothing changes.
+- **Driving the install:** `omarchy-iso-remote install|wizard|follow` asks the questions (the wipe summary and confirmation, or the wizard) in the SSH session. The install then runs on tty1, where a dropped connection can't stop it. tty1 shows a notice meanwhile, so nobody starts a second install from the greeter.
+- **Private branch:** this lives on the local `live-ssh` branch in omarchy-iso (e1bc754, 7ae213e, 6feeb7b), which is neither pushed nor merged into `kitchen`, at Kevin's request. Remote root access to an installer is a choice for this workspace, not a default for the public fork. `build/live-ssh` adds the #196 fix for local ISO builds.
+- **One stick:** a personal ISO carries the public key at its root, remastered with `xorriso -boot_image any replay -map`. A second stick isn't needed, and Windows can't add a file to a flashed stick anyway.
+
+**What would change it.** Wanting remote installs on the public fork, or upstream shipping an equivalent.
+
+## Findings, 2026-09-26: first installs on real hardware
+
+The machine: an ASRock B650M-HDV/M.2 (AMI BIOS 1.28), a Ryzen 7 7700X, a GTX 1650 and two NVMe drives. Everything was driven over SSH from the WSL workstation with `omarchy-iso-remote`.
+
+- **Free-space install beside Windows 11:** the plan listed every Windows partition as kept, and they were. It took 1m54s.
+- **Whole-disk install on the other NVMe drive:** the typed confirmation was answered with the device name. It took 1m57s. The first drive was cleared separately and became an encrypted data drive, with a key file on the encrypted root and the password as a second key slot.
+- **`omarchy update -y` over SSH works:**
+  - It needs `OMARCHY_PATH` set in the session. The security entrypoint refuses without it, before changing anything.
+  - Each run answers about nine sudo prompts.
+  - The kitchen build (r6638) stays installed, because edge's upstream `omarchy-dev` has a lower version number. The flip side is that the machine takes no upstream Omarchy changes until it's rebuilt from the fork.
+- **For the forks:**
+  - `ufw allow ssh` in the install chroot prints `ERROR: problem running`. It's harmless, because the rule lands in `user.rules`, which the installer checks. But it reads like a failure in the log. Candidate: silence it or explain it.
+  - A fresh install has no pacman sync databases, because it was installed from the offline mirror. The first `omarchy-pkg-add` then fails with "target not found" until a full update runs. Candidate: sync on first boot, or have `omarchy-pkg-add` sync when the databases are missing.
+  - NVMe device names differ between the live ISO and the installed system on this board. That confirms selecting disks by serial in `install.toml` was right.
+  - systemd 262's NvPCR units fail on this AMD firmware TPM, leaving 3 failed units after every boot. It's cosmetic, but "0 failed units" checks fail on such hardware. It also bears on TPM2 unlock later.
+  - The live greeter can draw before DHCP finishes, and then says "once this machine is on a network".
+  - On this AMI firmware, `efibootmgr --bootnext` to a hand-made `HD(MBR)` entry for the stick was ignored. The firmware's own "UEFI: <stick>" entry works.
+- **Next:** this machine fits the Phase 2 hardware row for a desktop with a discrete GPU (the GTX 1650's option ROM). Secure Boot hasn't been enabled on it yet.
+
 ## 2026-09-26: Phase 2 shape
 
 **Decision.**
