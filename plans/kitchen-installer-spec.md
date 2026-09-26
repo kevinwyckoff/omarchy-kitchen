@@ -1,8 +1,8 @@
 # Omarchy "The Kitchen Is Open": Installer Spec
 
-**Status:** Draft v2 · 2026-09-25. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred. Phase 0 is in progress; §2.3, §3 and §7 were updated to match what was built.
+**Status:** Draft v2 · 2026-09-26. Rescoped from v1: the Custom screen and TPM unlock were cut or deferred. Phases 0 and 1 are built; §2–§4 and §7 were updated to match.
 **Base:** `omacom/omarchy` (formerly `basecamp/omarchy`) 4.0.0.alpha and `omarchy-iso` (both at HEAD on 2026-09-25)
-**Scope:** Design, with Phase 0 under way on the forks' `wipe-summary` and `visible-encryption` branches.
+**Scope:** Phases 0 and 1 are built on the forks' topic branches; Phase 2 is design only.
 
 > **Naming.** The installer is called Chefs Kitchen, and its CLI is `chefs-kitchen` (decided 2026-09-25, §8 question 5). Commands on the installed system keep Omarchy's `omarchy <noun> <verb>` convention, which comes from the `omarchy-*` scripts in `bin/`. That way the fork stays easy to rebase on upstream.
 
@@ -176,7 +176,8 @@ The wipe summary that follows shows the result under "What gets created" (`LUKS2
 
 ```
 chefs-kitchen validate install.toml                    # schema + semantic checks, no hardware access (CI-friendly)
-chefs-kitchen plan     --config install.toml           # resolve disks, print the wipe summary; touches nothing
+chefs-kitchen plan     --config install.toml [--yes]   # resolve disks, print the wipe summary; touches nothing
+                                                       # (--yes applies the unattended rules)
 chefs-kitchen install  --config install.toml           # interactive: shows the wipe summary, typed confirm
 chefs-kitchen install  --config install.toml --yes     # unattended: guarded by [disk].on_existing_data
 ```
@@ -187,11 +188,12 @@ chefs-kitchen install  --config install.toml --yes     # unattended: guarded by 
 3. The legacy cidata JSON pair (still accepted)
 4. The wizard
 
-The wizard gains one entry on its first screen: **"Load install.toml from USB"**.
+The wizard gains one entry on its first screen: **"Load install.toml from USB"**. The greeter reads it as "type L and press Return". It finds `install.toml` at the top of any drive other than the install medium, copies that drive privately to `/root/usb`, and runs `chefs-kitchen install` interactively (summary, typed confirmation, passphrase prompt).
 
 **Every clicked install is also a described one:**
-- The wizard writes `/root/install.toml`, then runs `chefs-kitchen install --config /root/install.toml`.
-- The installer copies that file, with secrets stripped, to `/etc/chefs-kitchen/install.toml` on the target.
+- The wizard writes `/root/install.toml` and the user's password to a private file under `/run/chefs-kitchen/wizard/`, then runs `chefs-kitchen install --config /root/install.toml --yes`. It has already shown the wipe summary and had it confirmed, so the file says `on_existing_data = "wipe"` and pins `expect_fingerprint` to the disk as confirmed: no second confirmation, and a refusal if the disk changed in between. The disk is named by its serial when no other disk shares it, else its by-id name, else its path.
+- The wizard no longer writes the orchestrator's JSON itself. `chefs-kitchen`'s compiler is the only place those files come from.
+- The installer copies that file, with secrets stripped, to `/etc/chefs-kitchen/install.toml` on the target. The copy is written from the parsed config rather than copied, so nothing in the original can carry a secret through.
 
 ### 4.2 Schema v1
 
@@ -203,11 +205,13 @@ hostname = "marvin"
 timezone = "America/Toronto"
 keyboard = "us"
 
-[[users]]
+[[users]]                                       # exactly one in v1 (none with provisioning.defer)
 name          = "kevin"
 full_name     = "Kevin"                         # optional, used for git config
 email         = "…"                             # optional, used for git config
 password_hash = "$6$…"                          # openssl passwd -6
+# password    = { file = "kevin.pass" }         # instead of password_hash; needed for an
+                                                # unattended encrypted install with same_as_user
 ssh_authorized_keys = []
 
 [disk]
@@ -231,11 +235,11 @@ passphrase = { same_as_user = "kevin" }         # default. Alternatives:
 # passphrase = { file = "luks.pass" }           # relative to install.toml (cidata)
 
 [desktop]
-theme = "tokyo-night"                           # any name `omarchy-theme-set` accepts
-agent = "claude"                                # any name `omarchy-default-agent` accepts
+theme = "tokyo-night"                           # any theme the ISO ships, named as `omarchy-theme-set` names it
+agent = "claude"                                # any name `omarchy-default-agent` accepts; installs at first login
 
 [packages]
-extra = []                                      # offline mirror if present, otherwise first boot with network
+extra = []                                      # from the ISO's offline mirror (first boot with network: deferred)
 
 [network]
 tailscale_authkey = { file = "tailscale.key" }
@@ -253,6 +257,9 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 | `swap.strategy = "zram"` | Skip `configure_hibernation` |
 | `swap.strategy = "none"` | Also drop the zram-generator drop-in |
 | `disk.home.location = "disk"` | Second btrfs filesystem mounted at `/home`. When encrypted: its own LUKS2 volume, unlocked from `/etc/crypttab` with a keyfile in `/etc/cryptsetup-keys.d/` on the encrypted root, so there is still one prompt at boot. |
+| `desktop.theme` | `omarchy-theme-set`, headless, as the user, after user setup |
+| `desktop.agent` | Recorded in `~/.local/state/omarchy/first-run-agent`. Installing an agent needs a network and the user's own tools (mise), so Omarchy's first-login setup (an `omarchy` fork change) offers it with a notification that installs it on click. |
+| `packages.extra` | Installed from the offline mirror, next to the runtime packages |
 | everything else | Maps 1:1 onto what the configurator already writes |
 
 - The filesystem stays btrfs, the bootloader stays Limine, and the subvolume layout is unchanged.
@@ -261,13 +268,17 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 ### 4.3 Validation rules
 
 **`chefs-kitchen validate`** (static, no hardware access):
-- It rejects plaintext secrets. The only exception is `passphrase = { insecure_plaintext = "…" }`, which prints a warning in every mode.
+- It rejects plaintext secrets. Every secret (`users.password`, `encryption.passphrase`, `network.tailscale_authkey`) accepts `{ insecure_plaintext = "…" }`, which prints a warning in every mode.
 - It rejects unknown keys. A typo must never be silently ignored.
-- `theme` and `agent` must be names the ISO knows.
+- Username and hostname follow the wizard's own rules (`setup-form.sh`).
+- `same_as_user` with only a `password_hash` warns that the install can't run with `--yes`.
+- `provisioning.defer = true` rules out `[[users]]`, `encryption.passphrase` and `[desktop]`.
+- `theme`, `agent` and `packages.extra` are checked by `plan`, not `validate`. The ISO knows them, and `validate` runs anywhere: the ISO build records the bundled runtime's themes and agents in `/usr/share/omarchy-iso/`, and `packages.extra` is resolved, dependencies included, against the offline mirror.
 
-**`chefs-kitchen plan`** (probes hardware):
+**`chefs-kitchen plan`** (probes hardware; `--yes` applies the unattended rules):
 - **Target disk.** `target` must resolve to **exactly one** disk. That disk must never be the install medium or a `cidata` drive, and must be at least ESP + 32 GiB.
-- **Home disk.** `home.disk` must resolve to a different disk than `target`. It gets its own "What dies" block, and in interactive mode its own typed confirmation.
+- **Home disk.** `home.disk` must resolve to a different disk than `target`, of at least 8 GiB. It gets its own "What dies" block, and in interactive mode its own typed confirmation. It isn't supported with `mode = "free-space"`.
+- **Free space.** The largest free region must fit a 2 GiB ESP and 32 GiB, and no partition may be BitLocker-encrypted. Nothing is erased, so `on_existing_data` doesn't apply. `expect_fingerprint` still does.
 - **`on_existing_data = "abort"`** is the unattended default. If either disk has any signature, the install stops, prints the wipe table and hints at the two ways forward.
 - **`expect_fingerprint`** is a sha256 over the partition-table type plus, for each partition, its start, size, type GUID and filesystem UUID. `chefs-kitchen plan` prints the current value so it can be pasted into the config. It is the unattended equivalent of "yes, *that* drive, with *that* data on it".
 
@@ -279,14 +290,19 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 
 | File | Change |
 |---|---|
-| `omarchy-iso/configs/airootfs/usr/share/omarchy-iso/chefs_kitchen_config/` | **New.** `schema.py`, `resolve.py` (disk selectors via `/dev/disk/by-id` and `lsblk -J`), `plan.py` (wipe table and fingerprint), `compile_archinstall.py` |
+| `omarchy-iso/configs/airootfs/usr/share/omarchy-iso/chefs_kitchen_config/` | **New.** `schema.py`, `resolve.py` (disk selectors via `/dev/disk/by-id` and `lsblk -J`), `plan.py` (wipe table and fingerprint), `compile_archinstall.py`, `helpers.py` (calls the Bash disk helpers, so the wizard and `chefs-kitchen` share one implementation) |
+| `…/usr/share/omarchy-iso/free-space.sh` | **New.** The free-space region analysis and partitioning, moved out of the configurator: the wizard decides, `chefs-kitchen` partitions |
+| `…/usr/share/omarchy-iso/wizard-toml.sh` | **New.** The wizard's answers as `install.toml` |
 | `…/usr/local/bin/chefs-kitchen` | **New** dispatcher |
-| `…/usr/local/bin/omarchy-cidata-load` | Also accept `install.toml` |
-| `…/root/.automated_script.sh` | cidata → `chefs-kitchen install --config … --yes` |
+| `…/usr/local/bin/omarchy-iso-run` | **New.** The dashboard and orchestrator launch, moved out of `.automated_script.sh`, so every path starts installs the same way |
+| `…/usr/local/bin/omarchy-cidata-load` | Also accept `install.toml` (exit 10), which wins over the legacy pair |
+| `…/root/.automated_script.sh` | cidata → `chefs-kitchen install --config … --yes --no-launch`, then `omarchy-iso-run` |
 | `…/root/configurator` | Write `install.toml`. Remove the direct JSON writers and the Ctrl+C toggle. Add the wipe summary and "Load from USB". |
-| `orchestrator/phases_impl.py` | Swap-strategy skip in `configure_hibernation`. `/home` disk mount and crypttab. Strip secrets and copy `install.toml` to the target. `validate_boot` encryption assertion in both directions. |
+| `orchestrator/` | Swap-strategy skip in `configure_hibernation`. `/home` disk mount and crypttab. Theme and agent (`configure_desktop`). Extra packages. Copy the stripped `install.toml` to the target (`record_install_toml`). `validate_boot` encryption assertion in both directions, and the `/home` disk's fstab, crypttab and key. |
+| `builder/build-iso.sh` | Record the bundled runtime's themes and agents for `plan` |
+| `omarchy/install/user/first-run/chosen-agent.sh` | **New.** Offer the agent chosen in `install.toml` at first login |
 | `omarchy/manual/51-unattended-installs.md` | Rewrite around `install.toml` |
-| `omarchy-iso/bin/omarchy-iso-test` | Scenarios driven from TOML fixtures |
+| `omarchy-iso/bin/omarchy-iso-test` | Its wizard scenarios now install through `install.toml`, since the wizard writes one. TOML-fixture scenarios are still to do: the harness needs an Omarchy host, and rows E–J were run by hand in QEMU. |
 
 ---
 
@@ -362,6 +378,8 @@ omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn
 | Reuse existing `/home` | UID and LUKS edge cases | `/home` on its own disk makes the next reinstall a natural test case |
 | **TPM2 unlock** | Needs the systemd initramfs migration (snapshot-overlay hook risk), first-boot TPM setup (because PCR 7 changes after enrollment), recovery-key screens, and **an autologin rule change**: with silent unlock, encrypted autologin would boot a stolen laptop to the desktop | `omarchy secureboot enable` running cleanly on your own hardware for a few weeks. `plans/kitchen-installer-spec-v1-full.md` §6.5 has the full design (PCR 7 + 15, `tpm2-measure-pcr`). |
 | Config from a kernel-parameter URL, lock-file drift, `config export`, encrypted recovery-key output | Nice-to-haves | When someone needs them |
+| `packages.extra` from the network at first boot | New first-boot machinery; the offline mirror covers the common case | A package people want that the mirror doesn't carry |
+| More than one `[[users]]` | The wizard and orchestrator create one user | A real multi-user machine |
 
 ---
 
@@ -370,7 +388,7 @@ omarchy secureboot disable    # stop re-signing hooks; tell the user how to turn
 | Phase | Contents | Exit criteria |
 |---|---|---|
 | **0** | §2 wipe summary and picker fixes. §3 visible encryption choice. | Rows A–D |
-| **1** | §4 TOML: validate, plan, install. Compiler shim. cidata TOML. Wizard writes TOML. `/home` disk and swap branches. | Rows E–J, plus every existing `omarchy-iso-test` scenario passing from TOML |
+| **1** | §4 TOML: validate, plan, install. Compiler shim. cidata TOML. Wizard writes TOML. `/home` disk and swap branches. Theme, agent, extra packages. | Rows E–J, plus every existing `omarchy-iso-test` scenario passing from TOML |
 | **2** | §5 `omarchy secureboot`, which runs on installed systems and is independent of the ISO. §5.4 docs, including line 7. | Rows K–N, plus hardware |
 
 The harness is QEMU plus OVMF, extending `bin/omarchy-iso-test`. OVMF vars without enrolled keys start in Setup Mode.

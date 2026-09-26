@@ -2,6 +2,39 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-26: Phase 1 shape
+
+**Decision.**
+- **A user's password can be a file** (`password = { file = … }`), as an alternative to `password_hash`. The spec's default `same_as_user` passphrase otherwise has no plaintext to format LUKS with on an unattended install. With only a hash, `same_as_user` works interactively (it prompts) and `--yes` refuses it.
+- **Theme and agent in Phase 1; extra packages from the offline mirror only.**
+  - The theme is applied at install.
+  - The agent installs at first login through a notification, which needs an `omarchy` fork change (`install-toml-agent`). Installing it needs a network and mise, and recording only its name leaves a default `omarchy agent` refuses to launch.
+  - First-boot network installs of extra packages are deferred.
+- **Python owns config, Bash owns disks.** `chefs_kitchen_config` parses, validates and compiles, and calls the configurator's Bash helpers (`disk-inspect.sh`, `free-space.sh`) for everything that touches disks, so the wizard and `chefs-kitchen` can't disagree about a disk.
+- **The wizard installs through `install.toml`** with `on_existing_data = "wipe"` and the confirmed disk's `expect_fingerprint`. Its direct JSON writers are gone.
+- **Five `omarchy-iso` branches, stacked on `visible-encryption`:** `install-toml`, `swap-strategies`, `home-disk`, `wizard-install-toml`, `desktop-packages`. Plus two `omarchy` branches from `quattro`: `install-toml-agent` and `unattended-installs-manual`.
+
+**What would change it.** Upstream taking a different shape for declarative installs.
+
+## Findings, 2026-09-26: Phase 1 on test ISOs
+
+- **Row E passes.** An unattended cidata install from `install.toml` (password as a file, encrypted, by serial) boots with the user's password. It gets the hostname, timezone, git identity and SSH key from the file, the same LUKS2 → btrfs layout, zram plus a RAM-sized swapfile and `resume=` as a wizard install, and 0 failed units. `/etc/chefs-kitchen/install.toml` has no secrets. The wipe summary and fingerprint are in the install log.
+- **Row F passes.** `on_existing_data = "abort"` against the Windows-like disk refuses at boot, with the summary, the reason and the fix (the fingerprint to pin), on screen and in the log.
+- **Row G passes.** A stale `expect_fingerprint` refuses. The current one, with `on_existing_data = "wipe"`, goes ahead.
+- **Row H passes.** `/home` on a second encrypted disk boots with one passphrase prompt and zero console password requests. `/home` is on its own LUKS2 volume, unlocked by `/etc/cryptsetup-keys.d/omarchy_home.key` (0400), and a root snapper snapshot still works.
+- **Row I passes.** `swap.strategy = "zram"` gives zram only: no swapfile, no `resume=`.
+- **Row J passes** in unit tests. An unknown key or a plaintext secret fails `validate`, naming the key.
+- **The wizard's own path works on the ISO.**
+  - A full-disk encrypted wizard install goes through `install.toml` without a second confirmation, and the result records the disk by serial, with its fingerprint.
+  - A free-space wizard install is partitioned by `chefs-kitchen`, and `qemu-img map` shows no writes inside the Windows partitions.
+- **Loading from USB works.** "L" at the greeter finds `install.toml` on a USB stick and installs it interactively.
+- **Theme, agent and extra packages work.** The Nord theme is applied, `claude` is recorded for first login, and `qmk-hid` installed from the offline mirror.
+- **Three bugs only the VM runs caught**, all fixed and now covered by tests:
+  - `chefs-kitchen` wrote refusals to stderr while stdout was buffered through the log pipe, so the reason scrolled away above the summary and never reached the log.
+  - `parted` read the home disk's `-1MiB` end as options, fixed with `--`.
+  - The free-space helper's Bash bridge shifted away its first argument.
+- **Not run:** the upstream `omarchy-iso-test` harness, which needs an Omarchy host. Its wizard scenarios now install through `install.toml` by construction. It was updated for the Phase 0 screens but not run.
+
 ## 2026-09-25: Name, upstreaming, and the Secure Boot tool
 
 **Decision.**
