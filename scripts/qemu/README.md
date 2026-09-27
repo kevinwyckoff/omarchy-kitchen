@@ -43,6 +43,13 @@ qemu-system-x86_64 -cpu host -enable-kvm -machine q35 -smp 8 -m 8192 \
   - turning Secure Boot on: `virt-fw-vars --inplace vars.fd --set-true SecureBootEnable`
 - **Destructive rows:** run them on a throwaway overlay (`qemu-img create -f qcow2 -b base.qcow2 -F qcow2 row.qcow2`) with a copy of the vars file.
 
+## Serial consoles and the LUKS prompt
+
+`-serial file:…` is handy for grepping boot messages, but it changes what boots. With a serial port present, systemd-stub appends `console=uart,io,0x3f8 console=tty0` to the kernel command line, and Plymouth then drops to its text "details" mode. That mode reads keys through the tty, and so through the kernel keymap, whatever the initramfs says about XKB.
+- Any row that tests **which keyboard layout the LUKS prompt uses** must boot with `-serial none` and screenshot the graphical prompt. With a serial port, a broken layout still unlocks.
+- Use a character that differs between the console keymap and the XKB layout (for `no-latin1`, `$` is Shift+4 on the console and AltGr+4 in XKB `no`), and try both.
+- Boot-time initramfs errors reach only the console, never the journal. Grep the serial log for them; a `journalctl` grep can never match.
+
 ## Driving a machine over SSH
 
 Used for the live installer (`omarchy-iso-remote`, on the private `live-ssh` branch) and for installed systems. Drive interactive prompts with Python `pexpect` over `ssh -tt`.

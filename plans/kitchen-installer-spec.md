@@ -133,7 +133,7 @@ This ships first. It has no dependencies and gives the most value per line of co
 - Exclude every disk labelled `cidata`/`CIDATA`.
 - Exclude `mmcblk*boot*` and `mmcblk*rpmb`.
 - Add serial and a short "what's on it" to each picker line, so identical drives never render identically anywhere. Order the line from most to least telling (path, size, what's on it, serial, model), so an 80-column console truncates the model name, which is the one thing two identical drives share.
-- Refuse full-disk installs below ESP + 32 GiB. This matches the existing free-space minimum at `configurator:595`.
+- Refuse full-disk installs on disks smaller than 32 GiB. That's the same as the existing free-space minimum at `configurator:595`, which counts the 2 GiB ESP inside the 32 GiB. Upstream has no full-disk minimum. A draft of this spec said "ESP + 32 GiB"; that was a misreading, corrected on 2026-09-27.
 
 ---
 
@@ -175,12 +175,14 @@ The wipe summary that follows shows the result under "What gets created" (`LUKS2
 ### 4.1 Commands
 
 ```
-chefs-kitchen validate install.toml                    # schema + semantic checks, no hardware access (CI-friendly)
+chefs-kitchen validate --config install.toml           # schema + semantic checks, no hardware access (CI-friendly)
 chefs-kitchen plan     --config install.toml [--yes]   # resolve disks, print the wipe summary; touches nothing
                                                        # (--yes applies the unattended rules)
 chefs-kitchen install  --config install.toml           # interactive: shows the wipe summary, typed confirm
 chefs-kitchen install  --config install.toml --yes     # unattended: guarded by [disk].on_existing_data
 ```
+
+`validate` also takes the file as a plain argument (`chefs-kitchen validate install.toml`); two different files is a usage error.
 
 **Config sources, in order:**
 1. `--config PATH`
@@ -273,12 +275,12 @@ The options are limited to ones that need **no new orchestrator branches beyond 
 - Username and hostname follow the wizard's own rules (`setup-form.sh`).
 - `same_as_user` with only a `password_hash` warns that the install can't run with `--yes`.
 - `provisioning.defer = true` rules out `[[users]]`, `encryption.passphrase` and `[desktop]`.
-- `theme`, `agent` and `packages.extra` are checked by `plan`, not `validate`. The ISO knows them, and `validate` runs anywhere: the ISO build records the bundled runtime's themes and agents in `/usr/share/omarchy-iso/`, and `packages.extra` is resolved, dependencies included, against the offline mirror.
+- `theme`, `agent`, `packages.extra` and whether `system.keyboard` names a console keymap that exists are checked by `plan`, not `validate`. The ISO knows them, and `validate` runs anywhere (it checks only that `keyboard` is shaped like a keymap name, because keymap sets differ between distributions): the ISO build records the bundled runtime's themes and agents in `/usr/share/omarchy-iso/`, and `packages.extra` is resolved, dependencies included, against the offline mirror.
 
 **`chefs-kitchen plan`** (probes hardware; `--yes` applies the unattended rules):
-- **Target disk.** `target` must resolve to **exactly one** disk. That disk must never be the install medium or a `cidata` drive, and must be at least ESP + 32 GiB.
+- **Target disk.** `target` must resolve to **exactly one** disk. That disk must never be the install medium or a `cidata` drive, and must be at least 32 GiB, the ESP included.
 - **Home disk.** `home.disk` must resolve to a different disk than `target`, of at least 8 GiB. It gets its own "What dies" block, and in interactive mode its own typed confirmation. It isn't supported with `mode = "free-space"`.
-- **Free space.** The largest free region must fit a 2 GiB ESP and 32 GiB, and no partition may be BitLocker-encrypted. Nothing is erased, so `on_existing_data` doesn't apply. `expect_fingerprint` still does.
+- **Free space.** The largest free region must be at least 32 GiB, including the 2 GiB ESP (an exact 32 GiB gap fits), and no partition may be BitLocker-encrypted. Nothing is erased, so `on_existing_data` doesn't apply. `expect_fingerprint` still does.
 - **`on_existing_data = "abort"`** is the unattended default. If either disk has any signature, the install stops, prints the wipe table and hints at the two ways forward.
 - **`expect_fingerprint`** is a sha256 over the partition-table type plus, for each partition, its start, size, type GUID and filesystem UUID. `chefs-kitchen plan` prints the current value so it can be pasted into the config. It is the unattended equivalent of "yes, *that* drive, with *that* data on it".
 

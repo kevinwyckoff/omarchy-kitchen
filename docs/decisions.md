@@ -2,6 +2,100 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-27: Keyboard, console font, minimums and install-log fixes
+
+**Decision.** Everything below went through review and QEMU before landing. Each is its own topic branch from `quattro`, or a commit on the chain branch that introduced the bug.
+- **The login greeter uses the installed keyboard layout** (omarchy `greeter-keyboard-layout`). SDDM's Hyprland always used US, so a non-US user typed their password on the wrong layout at the greeter. The greeter now reads `/etc/vconsole.conf` through a shared `default/hypr/keyboard.lua`, and falls back to US if that fails. **Behaviour change:** it follows the system layout, not a user's `input.lua` override, because SDDM can't know who will log in.
+- **Nine picker layouts now reach Hyprland** (`picker-layouts-reach-hyprland`, in both omarchy and omarchy-iso). systemd's kbd-model-map has no row for colemak, azerty, bg-cp1251, cz, de_CH-latin1, kyrgyz, no-latin1, pl or ua. Those users got their console keymap but a US desktop.
+  - The picker list now carries an XKB layout for each of them, and both writers add it: the ISO's `keyboard.py` and first-boot provisioning.
+  - "Azerbaijani|azerty" becomes "French (AZERTY)", because kbd's azerty is French and kbd has no Azerbaijani keymap.
+  - **The LUKS prompt stays on the console keymap.** With XKBLAYOUT set, Plymouth switches from the console keymap to XKB, and for azerty and no-latin1 some keys type different characters: `$` is Shift+4 on the no-latin1 console but AltGr+4 in XKB `no`. So when `vconsole.conf` carries exactly the picker's pin, a new `omarchy-vconsole` initcpio hook puts the file into the initramfs without the XKB lines. Any other file goes in through `FILES+=` as before.
+  - Upstream omarchy #11418, #8685 and #11056 each cover part of this; none fixes both writers.
+- **First-boot provisioning keeps the console font** (`first-boot-keeps-console-font`). `systemd-firstboot --force` drops `FONT=`, so deferred and factory-reset machines lost `default8x16` and the consolefont hook, with a warning on every UKI rebuild. They now match direct installs, as upstream omarchy-iso #93 intends.
+- **chefs-kitchen:** `validate` checks only that `keyboard` is shaped like a keymap name, so it gives the same answer on any host. `plan` checks the keymap exists and refuses before anything is erased. `validate` also takes `--config`, like `plan` and `install`.
+- **Minimums:**
+  - Full-disk is 32 GiB total. Our 34 GiB rested on a misreading of the free-space minimum, which counts the 2 GiB ESP inside the 32; upstream has no full-disk minimum.
+  - An exact 32 GiB free-space gap now fits. parted reports a free region's end byte inclusively, which lost a MiB.
+  - The free-space ESP is exactly 2 GiB. It was one sector over, leaving a 1 MiB hole and a 30719 MiB root.
+  - The last two are upstream bugs too, fixed on `free-space-tip`.
+- **Log and screen wording:**
+  - `honest-progress-lines`: no "+ encrypting" on plain installs, and no "creating user" line for deferred provisioning.
+  - The swap-strategy line says what each strategy leaves.
+  - The free-space wipe summary no longer numbers the partitions it will create.
+  - A blank disk is offered for use rather than erasure.
+- **No fix:**
+  - The "Unable to resume from device" line: Plymouth captures it on a normal boot.
+  - The one-off `setfont` ENOSYS: it's a race in mkinitcpio's consolefont hook. The hook-reorder idea is kept on the local branch `inv-vconsole/console-hooks-before-plymouth` for a try on real hardware.
+  - archinstall's empty-keymap log lines: that's upstream's deliberate skip path, and the end state is right.
+
+**What would change it.** Upstream taking any of these a different way; systemd adding kbd-model-map rows for the pinned keymaps; or upstream #13362 landing, since it restructures the hooks files.
+
+## Findings, 2026-09-27: these fixes in QEMU
+
+The ISO was omarchy-dev r6647, and each scenario's audit re-checked its evidence.
+- **German, whole 32 GiB disk, unencrypted, `swap = "none"`:**
+  - accepted and installed
+  - the log lines are right
+  - the greeter's Hyprland uses `de`; a password typed on German key positions logs in, and the same keys at US positions are refused
+- **Norwegian (no-latin1), encrypted, passphrase with `$`, graphical Plymouth prompt with no serial port:**
+  - Shift+4 unlocks and AltGr+4 is refused.
+  - An extra keyslot with `+` proved the prompt reads the no-latin1 console keymap, not a US fallback.
+  - The initramfs `vconsole.conf` has no XKB lines, and the package files are unmodified.
+  - A control boot without the hook failed on Shift+4.
+- **`keyboard = "german"`:** `validate` passes, `plan` refuses, and the unattended install stops before touching the disk. The disk was byte-identical afterwards.
+- **Free space with Polish:**
+  - A gap 1 MiB short of 32 GiB is refused, and an exact 32 GiB gap is accepted.
+  - The ESP is exactly 4194304 sectors, root starts on the next sector and is 30720 MiB, and the Windows partitions are unchanged.
+  - Polish reaches the greeter and the session.
+- **Deferred provisioning, owner picks Polish:** no "creating user" line, `FONT=default8x16` kept, no consolefont warning, and the owner's passphrase unlocks.
+- **Harness lesson.** A `-serial` port makes systemd-stub add `console=ttyS0`. Plymouth then drops to its text prompt, which reads keys through the console keymap whatever the initramfs says. LUKS-keyboard rows must boot with `-serial none`. This is now in `scripts/qemu/README.md`.
+- **Suites:** omarchy 269 shell tests and omarchy-iso 186 Python tests plus all shell tests showed no regressions against the old kitchen, and every new test fails on the old code.
+- **Candidates noticed, not fixed:**
+  - A free-space install's log doesn't record which partitions chefs-kitchen created.
+  - Hibernation's `resume=` uses a kernel device name (`/dev/vda5`) on unencrypted multi-disk machines, and NVMe numbering changes between boots on kitchen-sink.
+  - After a free-space install, the Limine menu has no Windows entry: `FIND_BOOTLOADERS` scans only Omarchy's own ESP.
+  - `validate` still checks timezones against the host's tzdata.
+  - The picker's "Lao|la-latin1" row is really Latin American Spanish (upstream #11004/#11056).
+  - Machines already installed with one of the nine keymaps get no migration; picking the layout again fixes them.
+  - German and French passphrases with non-ASCII letters differ between the console keymap and Plymouth's XKB (upstream #8680/#8682).
+
+## 2026-09-26: The encrypt hook: carry omarchy#9686, not omarchy-iso#143
+
+**Decision.** This supersedes the "carry #143" candidate in the entry below.
+- **Carry omacom/omarchy#9686** (open, no reviews) at the bottom of the omarchy `kitchen` stack, above #11388, the same way as #11388: an upstream PR, carried until upstream merges it, never a PR of ours. A local `pr-9686` branch holds it.
+  - It adds a filter to the packaged `omarchy_hooks.conf` that drops `encrypt` only when the root is verifiably plain: ext4 or btrfs on a `/dev/*` whose `lsblk` stack is only disk and partition, no `cryptdevice=`, `cryptkey=` or `crypto=` on the command line, and no active `crypttab.initramfs`. It keeps the hook whenever it can't tell.
+  - Migration 1788279117 rebuilds existing plain-root installs once.
+- **Why not #143.** It edits a file that `omarchy-settings` owns and lists in `backup=()`, so on every install it touches:
+  - the file freezes, and each later upstream change to it becomes a `.pacnew` that nothing applies
+  - `omarchy-channel-set` silently puts `encrypt` back
+  - its pattern also matches the indented NVIDIA line, so encrypted installs get that line rewritten, and NVIDIA-only machines run `encrypt` twice
+  - our own fix for that turned into a hard install failure once omarchy#13362 (open) moves the hook list out of the file
+  - an ISO-side fix belongs in an installer-owned drop-in, never in the package's own file
+
+**What would change it.** Upstream merging #9686, or #13362 landing first. #9686 then needs a rebase, which should be trivial because it's a filter.
+
+## Findings, 2026-09-26: #9686 in QEMU
+
+Built from an ISO with omarchy-dev r6643. Each scenario's audit re-checked it independently.
+- **Unencrypted install:**
+  - The boot image built in the installer's arch-chroot has no `encrypt`. There, `/proc/cmdline` is the live ISO's, and `findmnt /` sees `/dev/vda2` with an `lsblk` stack of partition and disk.
+  - No "Failed to open encryption mapping" on first boot or after a rebuild. A positive control (forcing the hook back) shows that error on the serial console at exactly the point where these boots are clean.
+  - `omarchy_hooks.conf` stays unmodified (`pacman -Qkk`), and there are 0 failed units.
+- **Encrypted install:**
+  - In the installer chroot the stack is `crypt part disk`, so `encrypt` stays (exactly once, before `filesystems`). The command line alone would have dropped it; the `lsblk` check is what keeps it.
+  - The passphrase prompt unlocks on both boots.
+  - Run by hand, the migration exits without rebuilding.
+- **Encrypted deferred provisioning:** the first boot unlocks through `cryptkey=` with no prompt. After the owner is provisioned and the disk re-keyed, `encrypt` is still there, and the next boot prompts for the owner's passphrase.
+- **Existing unencrypted install** (made from the morning ISO, r6638):
+  - Before the fix it shows the error.
+  - `pacman -U` of the new packages replaces the unmodified hooks file, with no `.pacnew`.
+  - `omarchy-migrate` runs only 1788279117, which rebuilds without `encrypt` and doesn't repeat. The next boot is clean.
+  - Not exercised: the real `omarchy update` path. There, the no-update sudo wrapper revokes the timestamp before migrations, so the migration's `sudo limine-mkinitcpio` would ask for the password again. Encrypted machines such as kitchen-sink exit before any sudo call.
+- **Seen along the way, unrelated to #9686:**
+  - Every boot on an install with hibernation prints "Unable to resume from device … continuing boot process." The resume hook prints it whenever there's no hibernation image, and it looks like an error.
+  - The installer prints "› partitioning + formatting + encrypting" even when not encrypting (`phases_impl.py`, upstream code). Candidate: a one-line fix on `visible-encryption`.
+  - A consolefont warning ("no font found") after provisioning's keyboard step, and a one-off `setfont` error on one encrypted first boot. With the empty vconsole keymap seen earlier, that points to the keyboard/vconsole path. Candidate: look into it.
+
 ## 2026-09-26: Fixes from the first real-hardware installs
 
 **Decision.**
