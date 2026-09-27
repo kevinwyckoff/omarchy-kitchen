@@ -2,6 +2,55 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## Findings, 2026-09-27: Secure Boot on real hardware (kitchen-sink)
+
+The machine is kitchen-sink:
+- an ASRock B650M-HDV/M.2 with AMI BIOS 1.28 (UEFI 2.80, AMI 5.26)
+- a Ryzen 7 7700X, whose Radeon iGPU was unused
+- a GTX 1650 as the display
+- omarchy-dev r6638, whose Secure Boot engine is byte-identical to kitchen's
+
+`omarchy secureboot enable` was driven over SSH (pexpect over `ssh -tt`, answering sudo and the gum prompts), and the firmware steps were done at the machine.
+
+- **Baseline.** An earlier session had left the firmware in Setup Mode with no keys, so Kevin installed the factory defaults:
+  - PK is ASRock's (expired 2022)
+  - KEK is Microsoft's KEK CA 2011
+  - db holds Microsoft's UEFI CA 2011 and the Windows Production PCA 2011
+  - dbx is the factory list (10160 bytes)
+  - none of Microsoft's 2023 certificates are there
+  
+  CSM was off. Limine was moved to Boot #1, because the raw fallback ("UEFI OS") had been first.
+- **Run 1** sealed and signed the boot files and backed up the factory keys. The missing 2023 KEK warning was accepted. With Omarchy's old `99-omarchy-limine.hook` still on this machine, a `limine` reinstall put the raw loader back, and the watcher re-sealed and re-signed it within 20 s. That's the watcher's repair on real hardware, and it's why the ISO no longer writes that hook.
+- **The firmware step went down the rebuild path, not append.** The option used was a clear-all rather than the per-key "delete PK". It emptied KEK, db and dbx along with the PK, which the release checklist treats as a STOP for the append row. Kevin chose to go on with the rebuild path (Stage 7):
+  - `enable` wrote db and KEK (Microsoft 2011 and 2023, the firmware's defaults, and ours) and PK, and read each back.
+  - Nothing from the backup was lost except dbx.
+  - After the reset, SetupMode was 0 (this firmware updates it only at a reset).
+  - The next run confirmed, and Secure Boot was turned on in Custom mode.
+- **Secure Boot enforcing:**
+  - `bootctl` reports "enabled (user)", and the kernel logs "Secure boot enabled".
+  - **The GTX 1650's option ROM runs.** The firmware chose it as the boot display (`boot_vga=1`, vgaarb "setting as boot VGA device"), trusted through Microsoft's UEFI CA in db.
+  - The NVIDIA DKMS driver loads, because linux-omarchy doesn't enforce module signatures.
+  - Across two restarts the sealed Limine and signed UKI boot, and `status` passes.
+- **Updates with Secure Boot on:**
+  - A kernel reinstall re-signs the UKI.
+  - DKMS prints "Error! Installation aborted." on a same-version reinstall ("already installed at version …"). That's harmless, and a real kernel update builds fresh modules.
+  - A `limine` reinstall is re-sealed by the watcher.
+  - The new snapshots get entries.
+  - `status` passes after each, and the guarded restart boots enforcing.
+- **dbx.** The clear-all emptied dbx, and the engine never writes it. fwupd 2.1.8 offers no dbx release for an empty dbx (its version reads as null). dbx was put back from run 1's backup with efitools, signed with our KEK, and the live variable's hash equals the backup's. **Candidate:** the engine holds both the backup and the KEK, so it could offer this restore itself when a key menu wipes dbx.
+- **Not done:**
+  - the append path on this firmware (it needs the per-key PK delete; the menu's wording was not recorded)
+  - refusal of the pre-enable snapshot entry (not observed)
+  - the restore and remove drills (Stages 4 and 6)
+  - the Windows rows (no Windows on this machine)
+  
+  The machine stays on Secure Boot with our keys.
+- **Noise seen:**
+  - Hyprland segfaults in `libaquamarine` at shutdown on this dual-GPU machine.
+  - The firmware logs ACPI `AE_ALREADY_EXISTS` errors.
+  - The three NvPCR units fail, as before.
+- **Harness:** `systemctl reboot --firmware-setup` over SSH needs sudo, because polkit wants interactive authentication.
+
 ## 2026-09-27: Keyboard, console font, minimums and install-log fixes
 
 **Decision.** Everything below went through review and QEMU before landing. Each is its own topic branch from `quattro`, or a commit on the chain branch that introduced the bug.

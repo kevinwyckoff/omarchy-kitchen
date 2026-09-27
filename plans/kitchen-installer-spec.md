@@ -399,7 +399,7 @@ The rows ran by hand in QEMU plus OVMF, with the helpers in `omarchy-kitchen/scr
 | N | Kernel update plus new snapper snapshot | New UKI signed, loader re-sealed, and the new snapshot boots with SB on. Snapshots from before `enable` stay unsigned and are refused. Reboots cleanly. |
 
 **Hardware for Phase 2:**
-- one desktop with a discrete GPU, to prove that the appended enrollment keeps its option ROM starting
+- one desktop with a discrete GPU, to prove that the appended enrollment keeps its option ROM starting. Run on 2026-09-27 on kitchen-sink (ASRock B650M, AMI BIOS 1.28, GTX 1650): the GTX 1650's option ROM runs with Secure Boot enforcing and the machine keeps booting through updates. It went through the rebuild path, because a clear-all option emptied KEK and db along with the PK, so append on this firmware is still unproven. See the findings in `docs/decisions.md`.
 - one laptop with Windows and BitLocker, to test the BootNext path. Deferred on 2026-09-26 until a laptop is procured. It stays an exit criterion, so the upstream PRs wait for it.
 
 ---

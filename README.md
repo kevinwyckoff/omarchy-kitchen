@@ -8,7 +8,7 @@ A fork of [Omarchy](https://omarchy.org) that reworks the installer so it's more
 - Phase 1: `install.toml` and `chefs-kitchen`
 - Phase 2: `omarchy secureboot`, rows K–N in QEMU
 
-The Phase 2 hardware rows are still open. The laptop row waits until a laptop is procured, and the upstream PRs wait for it. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
+The desktop hardware row passed on 2026-09-27 (Secure Boot enforcing on an ASRock board with a GTX 1650). The laptop row waits until a laptop is procured, and the upstream PRs wait for it. The current plan is [plans/kitchen-installer-spec.md](plans/kitchen-installer-spec.md).
 
 ## Repositories
 
