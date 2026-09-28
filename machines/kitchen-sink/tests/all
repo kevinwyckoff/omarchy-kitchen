@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# Every test for kitchen-sink's files, from any Docker host. Nothing runs on
+# the machine it starts from beyond containers.
+#
+#   tests/all                          every part
+#   tests/all checkup install          some of them
+#
+#   checkup     the check-up's suites (tests/run) in an Arch container, as root
+#               and again as an ordinary user
+#   update      the updater's suites (tests/update/run.sh), one container each
+#   install     install.sh and uninstall.sh (tests/install/run.sh), in a
+#               container booted with systemd
+#   lint        shellcheck over every shell script in the tree
+
+set -uo pipefail
+ROOT=$(readlink -f "$(dirname "$0")/..")
+IMAGE=${KITCHEN_TEST_IMAGE:-archlinux:latest}
+PARTS=(checkup update install lint)
+(($#)) && PARTS=("$@")
+
+failed=()
+
+part_checkup() {
+  docker run --rm -v "$ROOT:/w:ro" -w /w "$IMAGE" bash -c '
+    pacman -Sy --noconfirm --needed jq python >/dev/null 2>&1 || { echo "pacman -S failed"; exit 1; }
+    echo "---- as root"
+    tests/run || exit 1
+    echo "---- as an ordinary user (the root-only end-to-end runs are skipped)"
+    useradd -m tester && runuser -u tester -- tests/run'
+}
+
+part_update() { "$ROOT/tests/update/run.sh"; }
+
+part_install() { "$ROOT/tests/install/run.sh"; }
+
+part_lint() {
+  local files
+  mapfile -t files < <(cd "$ROOT" && {
+    printf '%s\n' install.sh uninstall.sh bin/kitchen-checkup bin/kitchen-update tests/run tests/all
+    printf '%s\n' lib/notify lib/safe-to-update lib/preflight lib/postflight
+    printf '%s\n' tests/*.sh tests/update/*.sh tests/install/*.sh
+  })
+  docker run --rm -v "$ROOT:/mnt:ro" -w /mnt koalaman/shellcheck:stable -x -s bash "${files[@]}" &&
+    echo "shellcheck: ${#files[@]} files, clean"
+}
+
+for part in "${PARTS[@]}"; do
+  echo "######## $part"
+  if ! declare -F "part_$part" >/dev/null; then
+    echo "tests/all: no part '$part' (checkup, update, install, lint)" >&2
+    exit 2
+  fi
+  "part_$part" || failed+=("$part")
+done
+
+echo "########"
+if ((${#failed[@]})); then
+  echo "FAILED: ${failed[*]}"
+  exit 1
+fi
+echo "all passed: ${PARTS[*]}"

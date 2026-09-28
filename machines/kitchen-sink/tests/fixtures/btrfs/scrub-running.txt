@@ -1,0 +1,8 @@
+UUID:             9da107d4-458f-497e-828d-a684c1699c4e
+	no stats available
+Time left:        0:00:00
+ETA:              Mon Sep 28 12:35:09 2026
+Total to scrub:   2.45GiB
+Bytes scrubbed:   0.00B  (0.00%)
+Rate:             0.00B/s
+Error summary:    no errors found

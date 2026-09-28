@@ -1,0 +1,5 @@
+[/dev/mapper/root].write_io_errs    0
+[/dev/mapper/root].read_io_errs     0
+[/dev/mapper/root].flush_io_errs    0
+[/dev/mapper/root].corruption_errs  4
+[/dev/mapper/root].generation_errs  0

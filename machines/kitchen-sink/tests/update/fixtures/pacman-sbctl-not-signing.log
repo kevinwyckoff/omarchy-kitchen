@@ -1,0 +1,43 @@
+[2026-09-27T08:37:53-0400] [PACMAN] Running 'pacman -S --noconfirm --needed -- sbctl efibootmgr'
+[2026-09-27T08:37:53-0400] [ALPM] running '10-limine-snapper-lock.hook'...
+[2026-09-27T08:37:53-0400] [ALPM] transaction started
+[2026-09-27T08:37:53-0400] [ALPM] installed sbctl (0.18-2)
+[2026-09-27T08:37:53-0400] [ALPM] transaction completed
+[2026-09-27T08:37:53-0400] [ALPM] running '35-systemd-update.hook'...
+[2026-09-27T08:37:53-0400] [ALPM] running '90-mkinitcpio-install.hook'...
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] Building UKI for linux-omarchy (7.2.5-4-omarchy)
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'nvidia.conf'
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'omarchy_hooks.conf'
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'omarchy_resume.conf'
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'thunderbolt_module.conf'
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET] ==> Starting build: '7.2.5-4-omarchy'
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET]   -> Running build hook: [base]
+[2026-09-27T08:37:53-0400] [ALPM-SCRIPTLET]   -> Running build hook: [udev]
+[2026-09-27T08:37:54-0400] [ALPM-SCRIPTLET]   -> Running build hook: [plymouth]
+[2026-09-27T08:37:54-0400] [ALPM-SCRIPTLET]   -> Running build hook: [keyboard]
+[2026-09-27T08:37:54-0400] [ALPM-SCRIPTLET] ==> WARNING: Possibly missing firmware for module: 'xhci_pci_renesas'
+[2026-09-27T08:37:55-0400] [ALPM-SCRIPTLET]   -> Running build hook: [autodetect]
+[2026-09-27T08:37:55-0400] [ALPM-SCRIPTLET]   -> Running build hook: [microcode]
+[2026-09-27T08:37:55-0400] [ALPM-SCRIPTLET]   -> Running build hook: [modconf]
+[2026-09-27T08:37:55-0400] [ALPM-SCRIPTLET]   -> Running build hook: [kms]
+[2026-09-27T08:37:59-0400] [ALPM-SCRIPTLET]   -> Running build hook: [keymap]
+[2026-09-27T08:37:59-0400] [ALPM-SCRIPTLET]   -> Running build hook: [consolefont]
+[2026-09-27T08:37:59-0400] [ALPM-SCRIPTLET]   -> Running build hook: [block]
+[2026-09-27T08:37:59-0400] [ALPM-SCRIPTLET]   -> Running build hook: [encrypt]
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET] ==> WARNING: Possibly missing firmware for module: 'qat_6xxx'
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET]   -> Running build hook: [filesystems]
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET]   -> Running build hook: [fsck]
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET]   -> Running build hook: [btrfs-overlayfs]
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET]   -> Running build hook: [resume]
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET] ==> Generating module dependencies
+[2026-09-27T08:38:00-0400] [ALPM-SCRIPTLET] ==> Creating zstd-compressed initcpio image
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET]   -> Early uncompressed CPIO image generation successful
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] ==> Initcpio image generation successful
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] ==> Creating unified kernel image: '/tmp/limine-mkinitcpio.3CC7WO/linux-omarchy.efi'
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] ==> Unified kernel image generation successful
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] ==> Running post hooks
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET]   -> Running post hook: [sbctl]
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] Secureboot key directory doesn't exist, not signing!
+[2026-09-27T08:38:01-0400] [ALPM-SCRIPTLET] ==> Post processing done
+[2026-09-27T08:38:02-0400] [ALPM-SCRIPTLET] [1;32mUpdated:[0m /boot/limine.conf
+[2026-09-27T08:38:03-0400] [PACMAN] Running 'pacman -D --asexplicit sbctl'

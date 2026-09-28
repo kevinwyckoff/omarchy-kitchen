@@ -1,0 +1,6 @@
+Verifying file database and EFI images in /boot...
+✗ /boot/EFI/BOOT/BOOTX64.EFI is not signed
+✓ /boot/EFI/Linux/omarchy_linux-omarchy.efi is signed
+✓ /boot/EFI/limine/limine_x64.efi is signed
+✓ /boot/0123456789abcdef0123456789abcdef/limine_history/omarchy_linux-omarchy.efi_sha256_372e16dccf6fae98afbe30fd809a738338d897b8142ca694973c35713ba0c339 is signed
+✗ /boot/0123456789abcdef0123456789abcdef/limine_history/omarchy_linux-omarchy.efi_sha256_caf6fbf98b77d4d729d29691263e283c0bf3254fefda67a95a2b819f9f9ed3be is not signed

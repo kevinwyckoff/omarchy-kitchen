@@ -1,0 +1,14 @@
+# /etc/systemd/system/kitchen-checkup.timer
+[Unit]
+Description=Daily kitchen-sink check-up
+
+[Timer]
+# After the nightly update slots (02:30 to 05:30), when someone is at the desk
+# to read the toast.
+OnCalendar=*-*-* 09:00
+RandomizedDelaySec=10min
+# Missed while off or asleep: run at the next boot or resume.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

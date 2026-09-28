@@ -1,0 +1,44 @@
+# /etc/systemd/system/kitchen-update.service
+# One nightly slot of the gated `omarchy update -y` (see /usr/local/sbin/kitchen-update).
+# Started by kitchen-update.timer, or by hand for a supervised run:
+#   sudo touch /run/kitchen-update/force-idle && sudo systemctl start --no-block kitchen-update.service
+[Unit]
+Description=kitchen-sink nightly update (gated omarchy update)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kitchen-update
+# The sudo grant's backstops: this, the rule's own NOTAFTER, and tmpfiles at boot.
+# It also kills any process still carrying the kitchen-update group, and turns
+# a night left RUNNING (the run was stopped or killed after S5) into FAILED.
+ExecStopPost=/usr/local/sbin/kitchen-update --revoke
+# The sum of the run's own limits, worst case: S1 about 15 min (Secure Boot
+# status 3 min, checkupdates 5 min, a boot-check re-run 5 min), S2 QUIET_SECS
+# (10 min) and two passes, S3 about 15 min, S5 UPDATE_TIMEOUT + UPDATE_KILL_AFTER
+# (105 min), S7 PACMAN_WAIT_SECS (20 min, when the timeout left pacman running)
+# plus the watchers and Secure Boot status (5 min), S9's toast (1 min): about
+# 2 h 55 min. The grant is revoked at S6, so this does not stretch it.
+TimeoutStartSec=3h30min
+# kitchen-sink's DefaultTimeoutStopSec is 5 s (Omarchy's faster shutdown). A
+# stop needs time for the run's own exit (revoke, status, the critical toast
+# waits up to NOTIFY_WAIT_SECS) and then for the stop hook below.
+TimeoutStopSec=3min
+# mixed, not control-group: a stop or a timeout sends TERM to kitchen-update
+# alone. With control-group, sudo (still in this cgroup) would relay its TERM
+# to a pacman in the middle of a transaction. Everything left in the cgroup is
+# SIGKILLed at the end; pacman itself runs in its own scope and always finishes.
+# That SIGKILL is NOT what contains the grant's group: a process the update
+# starts through the user manager (uwsm app, systemd-run --user --scope) is
+# moved out of this cgroup and survives it. The run kills every process that
+# carries the group at S6, the stop hook does again, and the next grant is
+# refused while any exists.
+KillMode=mixed
+SyslogIdentifier=kitchen-update
+StateDirectory=kitchen-update
+StateDirectoryMode=0755
+LogsDirectory=kitchen-update
+LogsDirectoryMode=0755
+# No PrivateTmp, ProtectSystem or ProtectHome: omarchy update installs packages,
+# writes /tmp/omarchy-update.log, and needs /run/user/1000 (its lock and the session bus).

@@ -1,0 +1,69 @@
+[2026-09-27T08:53:40-0400] [PACMAN] Running 'pacman -S --noconfirm linux-omarchy'
+[2026-09-27T08:53:42-0400] [ALPM] running '00-omarchy-update-guard.hook'...
+[2026-09-27T08:53:42-0400] [ALPM] running '10-limine-snapper-lock.hook'...
+[2026-09-27T08:53:42-0400] [ALPM] running '10-linux-modules-pre.hook'...
+[2026-09-27T08:53:45-0400] [ALPM] running '70-dkms-upgrade.hook'...
+[2026-09-27T08:53:45-0400] [ALPM-SCRIPTLET] ==> dkms remove --no-depmod nvidia/615.71.09 -k 7.2.5-4-omarchy
+[2026-09-27T08:53:48-0400] [ALPM] transaction started
+[2026-09-27T08:53:48-0400] [ALPM] reinstalled linux-omarchy (7.2.5-4)
+[2026-09-27T08:53:49-0400] [ALPM] transaction completed
+[2026-09-27T08:53:49-0400] [ALPM] running '10-linux-modules-post.hook'...
+[2026-09-27T08:53:49-0400] [ALPM-SCRIPTLET] ++ uname -r
+[2026-09-27T08:53:49-0400] [ALPM-SCRIPTLET] + KVER=7.2.5-4-omarchy
+[2026-09-27T08:53:49-0400] [ALPM-SCRIPTLET] + test -e /usr/lib/modules/backup/7.2.5-4-omarchy
+[2026-09-27T08:53:49-0400] [ALPM-SCRIPTLET] + rsync -AHXal --ignore-existing /usr/lib/modules/backup/7.2.5-4-omarchy /usr/lib/modules/
+[2026-09-27T08:53:49-0400] [ALPM-SCRIPTLET] + rm -rf /usr/lib/modules/backup
+[2026-09-27T08:53:49-0400] [ALPM] running '35-systemd-update.hook'...
+[2026-09-27T08:53:49-0400] [ALPM] running '60-depmod.hook'...
+[2026-09-27T08:53:50-0400] [ALPM] running '70-dkms-install.hook'...
+[2026-09-27T08:53:50-0400] [ALPM-SCRIPTLET] ==> dkms install --no-depmod nvidia/615.71.09 -k 7.2.5-4-omarchy
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Module /usr/lib/modules/7.2.5-4-omarchy/updates/dkms/nvidia.ko.zst already installed at version 615.71.09, override by specifying --force
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Module /usr/lib/modules/7.2.5-4-omarchy/updates/dkms/nvidia-uvm.ko.zst already installed at version 615.71.09, override by specifying --force
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Module /usr/lib/modules/7.2.5-4-omarchy/updates/dkms/nvidia-modeset.ko.zst already installed at version 615.71.09, override by specifying --force
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Module /usr/lib/modules/7.2.5-4-omarchy/updates/dkms/nvidia-drm.ko.zst already installed at version 615.71.09, override by specifying --force
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Module /usr/lib/modules/7.2.5-4-omarchy/updates/dkms/nvidia-peermem.ko.zst already installed at version 615.71.09, override by specifying --force
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] 
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] Error! Installation aborted.
+[2026-09-27T08:54:32-0400] [ALPM-SCRIPTLET] ==> WARNING: `dkms install --no-depmod nvidia/615.71.09 -k 7.2.5-4-omarchy' exited 6
+[2026-09-27T08:54:33-0400] [ALPM] running '90-mkinitcpio-install.hook'...
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] Building UKI for linux-omarchy (7.2.5-4-omarchy)
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'nvidia.conf'
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'omarchy_hooks.conf'
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'omarchy_resume.conf'
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] ==> Using drop-in configuration file: 'thunderbolt_module.conf'
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET] ==> Starting build: '7.2.5-4-omarchy'
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET]   -> Running build hook: [base]
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET]   -> Running build hook: [udev]
+[2026-09-27T08:54:33-0400] [ALPM-SCRIPTLET]   -> Running build hook: [plymouth]
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET]   -> Running build hook: [keyboard]
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET] ==> WARNING: Possibly missing firmware for module: 'xhci_pci_renesas'
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET]   -> Running build hook: [autodetect]
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET]   -> Running build hook: [microcode]
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET]   -> Running build hook: [modconf]
+[2026-09-27T08:54:34-0400] [ALPM-SCRIPTLET]   -> Running build hook: [kms]
+[2026-09-27T08:54:38-0400] [ALPM-SCRIPTLET]   -> Running build hook: [keymap]
+[2026-09-27T08:54:38-0400] [ALPM-SCRIPTLET]   -> Running build hook: [consolefont]
+[2026-09-27T08:54:38-0400] [ALPM-SCRIPTLET]   -> Running build hook: [block]
+[2026-09-27T08:54:39-0400] [ALPM-SCRIPTLET]   -> Running build hook: [encrypt]
+[2026-09-27T08:54:39-0400] [ALPM-SCRIPTLET] ==> WARNING: Possibly missing firmware for module: 'qat_6xxx'
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET]   -> Running build hook: [filesystems]
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET]   -> Running build hook: [fsck]
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET]   -> Running build hook: [btrfs-overlayfs]
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET]   -> Running build hook: [resume]
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET] ==> Generating module dependencies
+[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET] ==> Creating zstd-compressed initcpio image
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET]   -> Early uncompressed CPIO image generation successful
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ==> Initcpio image generation successful
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ==> Creating unified kernel image: '/tmp/limine-mkinitcpio.PGykTU/linux-omarchy.efi'
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ==> Unified kernel image generation successful
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ==> Running post hooks
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET]   -> Running post hook: [sbctl]
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] Signing /tmp/limine-mkinitcpio.PGykTU/linux-omarchy.efi
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ✓ Signed /tmp/limine-mkinitcpio.PGykTU/linux-omarchy.efi
+[2026-09-27T08:54:41-0400] [ALPM-SCRIPTLET] ==> Post processing done
+[2026-09-27T08:54:42-0400] [ALPM-SCRIPTLET] [1;32mCopied:[0m /tmp/limine-mkinitcpio.PGykTU/linux-omarchy.efi -> /boot/EFI/Linux/omarchy_linux-omarchy.efi
+[2026-09-27T08:54:42-0400] [ALPM-SCRIPTLET] [1;32mUpdated:[0m /boot/limine.conf
+[2026-09-27T08:54:42-0400] [ALPM-SCRIPTLET] Config file BLAKE2B successfully enrolled.
+[2026-09-27T08:54:42-0400] [ALPM-SCRIPTLET] ✓ Signed /boot/EFI/limine/limine_x64.efi
+[2026-09-27T08:54:43-0400] [ALPM] running 'zz-sbctl.hook'...
+[2026-09-27T08:54:43-0400] [ALPM-SCRIPTLET] Generating EFI bundles....

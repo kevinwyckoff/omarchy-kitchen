@@ -1,0 +1,15 @@
+glibc
+containerd
+coreutils
+fastfetch
+hunspell
+inotify-tools
+lib32-glibc
+libcupsfilters
+limine
+limine-mkinitcpio-hook
+mise-bin
+omarchy-settings-dev
+omarchy-dev
+tobi-try
+ttfx

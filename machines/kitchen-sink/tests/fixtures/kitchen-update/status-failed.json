@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "night": "2026-09-28",
+  "state": "FAILED",
+  "settled": true,
+  "time": "2026-09-28T04:12:40-04:00",
+  "reasons": ["postflight: /boot/EFI/Linux/omarchy_linux-omarchy.efi is not signed", "omarchy secureboot status failed"],
+  "action": "read /var/log/kitchen-update/2026-09-28.log before rebooting",
+  "care": ["boot-chain update (linux-omarchy): Secure Boot + UKI postflight gates required"],
+  "pending": ["linux-omarchy 7.2.5-4 -> 7.2.6-1"],
+  "upgraded": ["linux-omarchy 7.2.5-4 -> 7.2.6-1"],
+  "reboot": "needed",
+  "reboot_reasons": ["kernel 7.2.6-1-omarchy installed, 7.2.5-4-omarchy running"],
+  "secureboot": "not-clean",
+  "grant": "revoked",
+  "update_rc": "0",
+  "postflight_rc": "1",
+  "log": "/var/log/kitchen-update/2026-09-28.log",
+  "last_success": "2026-09-27T03:40:11-04:00",
+  "nights_without_update": 1,
+  "counted_night": "2026-09-28"
+}

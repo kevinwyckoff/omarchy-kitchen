@@ -1,0 +1,461 @@
+#!/bin/bash
+
+# postflight: did tonight's update leave a machine that will boot?
+#
+# Part of kitchen-update (S7). READ-ONLY; runs as root right after the update.
+#
+#   postflight --from LINE [--workdir DIR] [--update-rc N] [--update-log FILE]
+#              [--pacman-log FILE] [--log-only]
+#   postflight --live-boot-only [--pacman-log FILE]
+#
+#   --from LINE        the first pacman.log line written by this run
+#   --workdir DIR      the preflight's work dir: targets.txt and
+#                      failed-units.before are compared, and postflight.facts
+#                      is written there for the reboot check
+#   --update-rc N      omarchy-update's exit status
+#   --update-log FILE  omarchy-update's output
+#   --log-only         judge the logs only, skip every live-system check (tests)
+#   --live-boot-only   only the live boot checks: pacman's state, each kernel's
+#                      UKI and nvidia module, Secure Boot and the ESP. kitchen-update
+#                      runs this at S1 (and for --boot-check) while a failed night's
+#                      boot-check record stands, and clears the record when it passes
+#
+# One line per gate: "ok    ", "info  ", "WARN  " or "FAIL  " followed by a
+# label ("pacman:", "uki:", "secureboot:", ...). kitchen-update's toast says
+# DO NOT REBOOT when a FAIL carries a boot label (pacman, uki, kernel, nvidia,
+# dkms, secureboot, esp). The last line is "VERDICT PASS" or "VERDICT FAIL".
+#
+# Exit: 0 every gate passed | 1 at least one FAIL: do not reboot until a human has looked
+#
+# The UKI markers are limine-mkinitcpio-hook's and sbctl's own words, as they
+# appear in kitchen-sink's pacman.log. A new wording fails safe: a false
+# "do not reboot", never a false "all clear". Re-check them after an update of
+# limine-mkinitcpio-hook or sbctl.
+
+set -uo pipefail
+# No `set -e`: every gate must be evaluated and reported.
+
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+
+# ---- settings (override in /etc/kitchen-sink/update.conf) ---------------------
+DESKTOP_USER=kevinwyckoff
+WATCHER_WAIT_SECS=120
+PACMAN_WAIT_SECS=1200
+KNOWN_FAILED_UNITS="systemd-pcrlogin@1000.service systemd-pcrproduct.service systemd-tpm2-setup-early.service"
+UKI_PATTERN=/boot/EFI/Linux/omarchy_%s.efi
+ESP_MARGIN_MIB=64
+SB_MARKER=/var/lib/omarchy-secureboot/enabled
+SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
+PACMAN_LOCK=/var/lib/pacman/db.lck
+CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+
+MiB=$((1024 * 1024))
+
+load_conf() {
+  local owner mode
+  [[ -e $CONF ]] || return 0
+  read -r owner mode < <(stat -Lc '%u %a' -- "$CONF")
+  if [[ $owner != "0" ]] || (( 8#$mode & 022 )); then
+    echo "info  config: ignoring $CONF (it must be owned by root and not writable by others)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$CONF"
+}
+
+bad=0
+ok()   { echo "ok    $*"; }
+info() { echo "info  $*"; }
+warn() { echo "WARN  $*"; }
+fail() { echo "FAIL  $*"; bad=1; }
+
+# ---- log parsing (the unit tests run these against fixture logs) -------------------
+
+# Terminal escapes (colours, cursor moves, OSC titles) and carriage returns.
+strip_ansi() {
+  local esc=$'\e' bel=$'\a' cr=$'\r'
+  sed -E "s#${esc}\\][^${bel}${esc}]*(${bel}|${esc}\\\\)##g; s#${esc}\\[[0-9;?]*[ -/]*[@-~]##g; s#${esc}[()][0-9A-Za-z]##g; s#${cr}##g"
+}
+
+# pacman.log from line FROM on, without colour codes.
+pacman_slice() { tail -n +"$2" -- "$1" | strip_ansi; }
+
+# The slice from the last "starting full system upgrade" on.
+upgrade_part() {
+  awk '/\[PACMAN\] starting full system upgrade/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$1"
+}
+
+# "name" for every package the upgrade installed, upgraded, reinstalled or downgraded.
+changed_names() {
+  sed -nE 's/^\[[^]]+\] \[ALPM\] (upgraded|installed|reinstalled|downgraded) ([^ ]+) \(.*/\2/p' | sort -u
+}
+
+check_update_rc() {
+  if [[ -z $1 ]]; then
+    return
+  elif (( $1 == 0 )); then
+    ok "update: omarchy-update exited 0"
+  elif (( $1 == 124 || $1 == 137 )); then
+    fail "update: omarchy-update timed out (exit $1) and was stopped after its current phase"
+  else
+    fail "update: omarchy-update exited $1"
+  fi
+}
+
+# Omarchy's own failure lines (omarchy-update's ERR trap, omarchy-update-secureboot,
+# omarchy-update-analyze-logs, the lock and the free-space check).
+check_update_log() {
+  local log=$1 clear=1
+  [[ -r $log ]] || { info "update-log: none given"; return; }
+  if grep -q 'Something went wrong during the update' "$log"; then fail "update: omarchy update reported \"Something went wrong during the update!\""; clear=0; fi
+  if grep -q 'Secure Boot needs attention' "$log"; then fail "secureboot: omarchy update reported \"Secure Boot needs attention\""; clear=0; fi
+  if grep -q 'Initramfs generation may have failed' "$log"; then fail "uki: omarchy update reported \"Initramfs generation may have failed\""; clear=0; fi
+  if grep -q 'An Omarchy update is already running' "$log"; then fail "update: another omarchy update held the lock"; clear=0; fi
+  if grep -q 'You need at least 10 GiB free' "$log"; then fail "update: omarchy update refused: less than 10 GiB free"; clear=0; fi
+  (( ! clear )) || ok "update-log: no failure lines from omarchy update"
+  # omarchy update carries on when its pre-update snapshot fails, and says so;
+  # the night then has no way back. Not a failure, but not an all-clear either.
+  if grep -qE 'Continuing the update without a snapshot|No Snapper configs found' "$log"; then
+    warn "snapshot: omarchy update ran WITHOUT a pre-update snapshot ($(grep -m 1 -oE 'Continuing the update without a snapshot|No Snapper configs found[^.]*' "$log")): tonight's changes have no rollback point"
+  else
+    ok "snapshot: no snapshot failure in the update log"
+  fi
+}
+
+check_transaction() {
+  local slice=$1 part n
+  if ! grep -q '\[PACMAN\] starting full system upgrade' "$slice"; then
+    warn "pacman: no full system upgrade was started (omarchy update stopped before pacman, so the boot chain is untouched)"
+    return
+  fi
+  part=$(upgrade_part "$slice")
+  n=$(changed_names <<<"$part" | grep -c .)
+  if grep -qE '\[ALPM\] transaction (failed|interrupted)' <<<"$part"; then
+    fail "pacman: the upgrade transaction failed or was interrupted: the system may be half-upgraded"
+  elif grep -q '\[ALPM\] transaction started' <<<"$part"; then
+    if grep -q '\[ALPM\] transaction completed' <<<"$part"; then
+      ok "pacman: the upgrade transaction completed ($n packages)"
+    else
+      fail "pacman: the upgrade transaction started but never completed"
+    fi
+  else
+    warn "pacman: the full system upgrade installed nothing"
+  fi
+}
+
+# Every UKI built in this run must have been generated, signed by sbctl's
+# mkinitcpio post hook and copied to the ESP.
+check_uki_builds() {
+  local slice=$1 builds m count
+  builds=$(grep -c 'Building UKI for' "$slice")
+  if (( builds == 0 )); then
+    info "uki: no UKI was rebuilt"
+    return
+  fi
+  for m in 'Initcpio image generation successful' 'Unified kernel image generation successful' \
+    '✓ Signed /tmp/limine-mkinitcpio' 'Copied: .* -> /boot/EFI/Linux/'; do
+    count=$(grep -cE -- "$m" "$slice")
+    if (( count >= builds )); then
+      ok "uki: '$m' for all $builds build(s)"
+    else
+      fail "uki: '$m' appears $count time(s) for $builds build(s)"
+    fi
+  done
+  if grep -q '==> ERROR' "$slice"; then fail "uki: mkinitcpio reported an ERROR: $(grep -m 1 '==> ERROR' "$slice" | sed 's/^\[[^]]*\] \[[^]]*\] //')"; fi
+  if grep -q 'not signing!' "$slice"; then fail "uki: sbctl skipped signing: $(grep -m 1 'not signing!' "$slice" | sed 's/^\[[^]]*\] \[[^]]*\] //')"; fi
+}
+
+check_dkms() {
+  local slice=$1 failed
+  # dkms exits 6 when the module is already installed, which is harmless:
+  # "==> WARNING: `dkms install --no-depmod nvidia/615.71.09 -k 7.2.5-4-omarchy' exited 6"
+  failed=$(grep -E "dkms install .* exited [0-9]+" "$slice" | grep -vE 'exited 6$')
+  if [[ -n $failed ]]; then
+    fail "dkms: a DKMS build failed: $(head -n 1 <<<"$failed" | sed 's/^\[[^]]*\] \[[^]]*\] //')"
+  elif grep -q 'dkms install' "$slice"; then
+    ok "dkms: DKMS installs finished"
+  fi
+}
+
+# The installed set should be what the preflight checked; the edge mirror can
+# move in the seconds between the two.
+check_installed_set() {
+  local slice=$1 targets=$2 extra missing
+  [[ -r $targets ]] || return
+  upgrade_part "$slice" | changed_names >"$tmpd/changed.txt"
+  sort -u "$targets" >"$tmpd/targets.sorted"
+  extra=$(comm -13 "$tmpd/targets.sorted" "$tmpd/changed.txt" | paste -sd' ' -)
+  missing=$(comm -23 "$tmpd/targets.sorted" "$tmpd/changed.txt" | paste -sd' ' -)
+  if [[ -z $extra && -z $missing ]]; then
+    ok "set: installed exactly the $(grep -c . "$tmpd/changed.txt") packages the preflight checked"
+  else
+    warn "set: installed set differs from the checked one${extra:+; not checked: $extra}${missing:+; checked but not installed: $missing}"
+  fi
+}
+
+# Facts for kitchen-update's reboot check, as KEY=VALUE lines.
+write_facts() {
+  local slice=$1 out=$2 part
+  part=$(upgrade_part "$slice")
+  {
+    echo "uki_builds=$(grep -c 'Building UKI for' "$slice")"
+    echo "loader_signed=$(grep -c 'Signed /boot/EFI/limine/limine_x64.efi' "$slice")"
+    echo "changed=$(changed_names <<<"$part" | grep -c .)"
+    echo "kernels=$(changed_names <<<"$part" | grep -E '^linux(-[a-z0-9]+)*$' | grep -v -- '-headers$' | paste -sd' ' -)"
+  } >"$out"
+}
+
+# What a pacman that died left behind, from pacman.log (the whole file). libalpm
+# logs "transaction completed" BEFORE the post-transaction hooks (DKMS, the UKI
+# build and its signing, limine's deploy), which take most of the time; a
+# pacman killed during those looks complete there. Prints "hooks", "started"
+# or "unknown".
+pacman_died_during() {
+  awk '
+    /\[ALPM\] transaction (started|completed|failed|interrupted)$/ { last = $NF; hooks = 0; next }
+    /\[PACMAN\] Running / { last = "new"; hooks = 0; next }
+    last == "completed" && /\[ALPM\] running .*\.hook.\.\.\.$/ { hooks = 1 }
+    END {
+      if (last == "started") print "started"
+      else if (last == "completed" && hooks) print "hooks"
+      else print "unknown"
+    }' "$1" 2>/dev/null
+}
+
+pacman_running() { pgrep -x 'pacman|yay|paru' >/dev/null; }
+
+# The FAIL line for a lock that no pacman holds.
+fail_dead_pacman() {
+  case $(pacman_died_during "$1") in
+    hooks) fail "pacman: pacman died during its post-transaction hooks ($PACMAN_LOCK is left): DKMS, the UKI build and signing may be unfinished. Do NOT reboot. At the machine: remove the lock, reinstall the kernel packages (or run limine-mkinitcpio), then run omarchy secureboot status" ;;
+    started) fail "pacman: pacman died in the middle of its transaction ($PACMAN_LOCK is left): the system is half-upgraded. Do NOT reboot. At the machine: read the end of /var/log/pacman.log, remove the lock, run omarchy update, then omarchy secureboot status" ;;
+    *) fail "pacman: $PACMAN_LOCK exists with no package manager running: pacman died (a crash or a power cut?). Do NOT reboot until the end of /var/log/pacman.log is understood; then remove the lock at the machine and run omarchy update" ;;
+  esac
+}
+
+# ---- live-system checks ---------------------------------------------------------------
+
+# Wait for a transaction still running (the update's timeout does not stop
+# pacman), but not for a pacman that is gone: its lock will never go.
+wait_for_pacman() {
+  local log=$1 waited=0 gone=0
+  while [[ -e $PACMAN_LOCK ]] && (( waited < PACMAN_WAIT_SECS )); do
+    if pacman_running; then
+      gone=0
+    else
+      gone=$((gone + 1))
+      (( gone < 2 )) || break
+    fi
+    (( waited == 0 )) && info "pacman: a transaction is still running; waiting up to $((PACMAN_WAIT_SECS / 60)) min"
+    sleep 5
+    waited=$((waited + 5))
+  done
+  [[ -e $PACMAN_LOCK ]] || return 0
+  if pacman_running; then
+    fail "pacman: still running after $((PACMAN_WAIT_SECS / 60)) min ($PACMAN_LOCK)"
+  else
+    fail_dead_pacman "$log"
+  fi
+}
+
+# pacman's state now: its lock, and how its last transaction ended.
+check_pacman_state() {
+  local log=$1 last
+  if [[ -e $PACMAN_LOCK ]]; then
+    if pacman_running; then
+      fail "pacman: a transaction is running now; the boot chain can only be judged once it is done"
+    else
+      fail_dead_pacman "$log"
+    fi
+    return
+  fi
+  last=$(grep -E '\[ALPM\] transaction (started|completed|failed|interrupted)$' "$log" 2>/dev/null | tail -n 1)
+  case $last in
+    *"transaction started" | *"transaction interrupted")
+      fail "pacman: the last transaction ($(sed -E 's/^\[([^]]+)\].*/\1/' <<<"$last")) never completed: the system may be half-upgraded; run omarchy update at the machine"
+      ;;
+    *) ok "pacman: no lock, and the last transaction ended" ;;
+  esac
+}
+
+check_kernels() {
+  local k dir kv pkgbase uki uname nvidia_dkms
+  nvidia_dkms=$(pacman -Qq 2>/dev/null | grep -E '^nvidia(-open)?(-[0-9a-z]+)?-dkms$' | head -n 1)
+  for k in /usr/lib/modules/*/vmlinuz; do
+    [[ -f $k ]] || continue
+    # Only package-owned kernels: kernel-modules-hook keeps the running one's
+    # modules around unowned until the reboot.
+    pacman -Qqo "$k" >/dev/null 2>&1 || continue
+    dir=${k%/vmlinuz}
+    kv=${dir##*/}
+    pkgbase=$(<"$dir/pkgbase")
+    # shellcheck disable=SC2059 # the pattern is the format, by design
+    uki=$(printf "$UKI_PATTERN" "$pkgbase")
+    if [[ ! -f $uki ]]; then
+      fail "kernel: $uki is missing for installed kernel $kv"
+    else
+      uname=$(objcopy -O binary --only-section=.uname "$uki" "$tmpd/uname" 2>/dev/null && tr -d '\0' <"$tmpd/uname")
+      if [[ $uname == "$kv" ]]; then
+        ok "kernel: $uki carries $kv"
+      else
+        fail "kernel: $uki carries '${uname:-nothing}', not the installed kernel $kv (stale or failed UKI)"
+      fi
+    fi
+    if [[ -n $nvidia_dkms ]]; then
+      if modinfo -k "$kv" -F filename nvidia 2>/dev/null | grep -q '/updates/dkms/'; then
+        ok "nvidia: $nvidia_dkms module built for $kv"
+      else
+        fail "nvidia: no $nvidia_dkms module for $kv: a black screen on the GTX 1650 after reboot"
+      fi
+    fi
+  done
+}
+
+sbctl_unsigned() {
+  sed 's/\x1b\[[0-9;]*m//g' | grep -E '^(✗|‼)' | grep -vE 'EFI/BOOT/BOOTX64\.EFI|/limine_history/'
+}
+
+check_secureboot() {
+  local waited=0 unsigned
+  if [[ ! -e $SB_MARKER ]]; then
+    info "secureboot: not managed by Omarchy here; Secure Boot gates skipped"
+    return
+  fi
+  # A limine upgrade changes the loader and limine.conf; the path watchers then
+  # re-seal them. Judge only once they are done.
+  while systemctl list-units --no-legend --plain --state=activating 'omarchy-secureboot-watch@*' 2>/dev/null | grep -q . &&
+    (( waited < WATCHER_WAIT_SECS )); do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if systemctl list-units --no-legend --plain --state=activating 'omarchy-secureboot-watch@*' 2>/dev/null | grep -q .; then
+    fail "secureboot: a Secure Boot watcher is still running after ${WATCHER_WAIT_SECS}s"
+  fi
+  if systemctl list-units --failed --no-legend --plain 'omarchy-secureboot-watch@*' 2>/dev/null | grep -q .; then
+    fail "secureboot: a Secure Boot watcher failed: $(systemctl list-units --failed --no-legend --plain 'omarchy-secureboot-watch@*' | awk '{print $1}' | paste -sd' ' -)"
+  fi
+  if [[ ! -x $SB_ENGINE ]]; then
+    fail "secureboot: the Secure Boot engine is gone (omarchy-dev replaced?)"
+    return
+  fi
+  if OMARCHY_PATH=/usr/share/omarchy timeout 180 "$SB_ENGINE" status --quiet >/dev/null 2>&1; then
+    ok "secureboot: omarchy secureboot status is clean"
+  else
+    fail "secureboot: omarchy secureboot status is NOT clean: run 'omarchy secureboot status' at the machine"
+  fi
+  unsigned=$(sbctl verify 2>/dev/null | sbctl_unsigned | paste -sd';' -)
+  if [[ -n $unsigned ]]; then
+    fail "secureboot: sbctl verify: $unsigned"
+  else
+    ok "secureboot: sbctl verify: every active boot file is signed"
+  fi
+}
+
+check_esp() {
+  local free largest
+  free=$(df --output=avail -B1 /boot | tail -n 1)
+  largest=$(find /boot -type f -printf '%s\n' 2>/dev/null | sort -n | tail -n 1)
+  largest=${largest:-0}
+  if (( free < largest )); then
+    fail "esp: $((free / MiB)) MiB free: not even room for one more $((largest / MiB)) MiB UKI"
+  elif (( free < largest + ESP_MARGIN_MIB * MiB )); then
+    warn "esp: $((free / MiB)) MiB free: the next UKI rebuild will be held until there is more room"
+  else
+    ok "esp: $((free / MiB)) MiB free, room for the next UKI"
+  fi
+}
+
+check_failed_units() {
+  local before=$1 new u
+  [[ -r $before ]] || return
+  new=$(comm -13 "$before" <(systemctl --failed --no-legend --plain 2>/dev/null | awk '{ print $1 }' | sort))
+  for u in $KNOWN_FAILED_UNITS; do new=$(grep -vxF -- "$u" <<<"$new"); done
+  if [[ -n $new ]]; then
+    warn "units: newly failed: $(paste -sd' ' <<<"$new")"
+  else
+    ok "units: no newly failed units"
+  fi
+}
+
+check_hyprland() {
+  local entry uid gid home his errors
+  entry=$(getent passwd "$DESKTOP_USER") || return
+  IFS=: read -r _ _ uid gid _ home _ <<<"$entry"
+  his=$(find "/run/user/$uid/hypr" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-)
+  [[ -n $his ]] || { info "hyprland: no running instance to ask for config errors"; return; }
+  if ! errors=$(setpriv --reuid="$uid" --regid="$gid" --init-groups -- env -i HOME="$home" PATH=/usr/bin \
+    XDG_RUNTIME_DIR="/run/user/$uid" HYPRLAND_INSTANCE_SIGNATURE="$his" timeout 10 hyprctl -j configerrors 2>/dev/null); then
+    info "hyprland: could not ask for config errors"
+    return
+  fi
+  errors=$(jq -r '.[]? | select(type == "string" and . != "")' <<<"$errors" 2>/dev/null | head -n 3 | paste -sd';' -)
+  if [[ -n $errors ]]; then warn "hyprland: config errors: $errors"; else ok "hyprland: no config errors"; fi
+}
+
+finish() {
+  if (( bad )); then
+    echo "VERDICT FAIL"
+    exit 1
+  fi
+  echo "VERDICT PASS"
+  exit 0
+}
+
+main() {
+  local from="" workdir="" update_rc="" update_log="" pacman_log=/var/log/pacman.log log_only=0 live_boot=0
+  while (( $# )); do
+    case $1 in
+      --from) from=${2:-}; shift ;;
+      --workdir) workdir=${2:-}; shift ;;
+      --update-rc) update_rc=${2:-}; shift ;;
+      --update-log) update_log=${2:-}; shift ;;
+      --pacman-log) pacman_log=${2:-}; shift ;;
+      --log-only) log_only=1 ;;
+      --live-boot-only) live_boot=1 ;;
+      -h | --help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; exit 0 ;;
+      *) echo "postflight: unknown argument: $1" >&2; exit 64 ;;
+    esac
+    shift
+  done
+  if (( ! live_boot )) && [[ ! $from =~ ^[0-9]+$ ]]; then
+    echo "postflight: --from LINE is required" >&2
+    exit 64
+  fi
+  load_conf
+
+  tmpd=$(mktemp -d /tmp/kitchen-postflight.XXXXXX) || exit 1
+  trap 'rm -rf -- "$tmpd"' EXIT
+
+  if (( live_boot )); then
+    check_pacman_state "$pacman_log"
+    check_kernels
+    check_secureboot
+    check_esp
+    finish
+  fi
+
+  (( log_only )) || wait_for_pacman "$pacman_log"
+  pacman_slice "$pacman_log" "$from" >"$tmpd/slice"
+
+  check_update_rc "$update_rc"
+  check_update_log "$update_log"
+  check_transaction "$tmpd/slice"
+  check_uki_builds "$tmpd/slice"
+  check_dkms "$tmpd/slice"
+  [[ -z $workdir ]] || check_installed_set "$tmpd/slice" "$workdir/targets.txt"
+  [[ -z $workdir ]] || write_facts "$tmpd/slice" "$workdir/postflight.facts"
+
+  if (( ! log_only )); then
+    check_kernels
+    check_secureboot
+    check_esp
+    [[ -z $workdir ]] || check_failed_units "$workdir/failed-units.before"
+    check_hyprland
+  fi
+  finish
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

@@ -1,0 +1,13 @@
+glibc
+containerd
+coreutils
+fastfetch
+hunspell
+inotify-tools
+lib32-glibc
+libcupsfilters
+limine
+limine-mkinitcpio-hook
+mise-bin
+tobi-try
+ttfx

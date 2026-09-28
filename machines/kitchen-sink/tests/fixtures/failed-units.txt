@@ -1,0 +1,3 @@
+systemd-pcrlogin@1000.service    loaded failed failed TPM NvPCR Measurement of User Record for UID 1000
+systemd-pcrproduct.service       loaded failed failed TPM NvPCR Product ID Measurement
+systemd-tpm2-setup-early.service loaded failed failed Early TPM SRK Setup

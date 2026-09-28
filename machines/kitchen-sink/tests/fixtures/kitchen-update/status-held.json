@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "night": "2026-09-28",
+  "state": "HELD",
+  "settled": true,
+  "time": "2026-09-28T03:01:12-04:00",
+  "reasons": ["Arch news since the last update: \"glibc 2.44 needs a manual step\" https://archlinux.org/news/example/"],
+  "action": "Read the news item, then run 'omarchy update' at the machine",
+  "care": [],
+  "pending": ["glibc 2.44+r24+g16be1518495f-1 -> 2.44+r50+g1848099f063e-1"],
+  "upgraded": [],
+  "reboot": "none",
+  "reboot_reasons": [],
+  "secureboot": "clean",
+  "grant": "none",
+  "update_rc": "",
+  "postflight_rc": "",
+  "log": "/var/log/kitchen-update/2026-09-28.log",
+  "last_success": "",
+  "nights_without_update": 1,
+  "counted_night": "2026-09-28"
+}

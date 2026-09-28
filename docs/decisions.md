@@ -2,6 +2,29 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-28: kitchen-sink: the kitchen build is pinned, and it gets a daily check-up and a gated nightly update
+
+**Decision.**
+- **Pin the kitchen build.** Edge's omarchy-dev now sorts newer than the kitchen build (r6663 against r6647), and it has no Secure Boot engine. Installing it with Secure Boot on would leave Limine unsigned (limine 12.9.1 is pending), so the machine wouldn't boot.
+  - kitchen-sink's `/etc/pacman.conf` has `IgnorePkg = omarchy-dev omarchy-settings-dev`.
+  - A `pre-refresh-pacman` Omarchy hook restores the pin after `omarchy-refresh-pacman`.
+  - Newer Omarchy reaches the machine only as a kitchen build installed by hand.
+- **The daily check-up** (`machines/kitchen-sink/`) runs read-only at 09:00. It covers Secure Boot, the boot chain, the pin, failed units, disk space, NVMe health, btrfs and its scrubs, time sync, pending updates, reboots and leftover grants. It writes a report plus a toast (low, normal or critical), and nothing leaves the machine. Monthly btrfs scrubs of `/` and `/mnt/data` are on.
+- **The nightly updater runs Omarchy's own `omarchy update -y`, only when the night's gates pass.** It tries at 02:30, 03:30, 04:30 and 05:30.
+  - **Idle:** 10 minutes without input, and no SSH session, audio, fullscreen app, GPU or CPU load, or download.
+  - **Compatibility:** a dry-run upgrade resolves, no Arch news since the last update, no AUR updates, room on the ESP, Secure Boot clean.
+  - **Afterwards:** every UKI is signed and matches its kernel, the NVIDIA module is built, and Secure Boot is clean.
+  - It never reboots, and it holds every later night while the boot chain needs attention.
+- **sudo** comes from a per-run grant for an empty group, `%kitchen-update NOTAFTER=+120min NOPASSWD: ALL`. setpriv adds that group only to the update's process tree.
+  - Stray carriers are killed, and the grant is dropped before the AUR phase.
+  - It's revoked after the run, with ExecStopPost and boot-time removal as backstops.
+  - The trade-off: Omarchy's hooks and mise run with root and nobody watching, which is the same trust an attended update gives them.
+- **Machine details stay off this public repo.** The drive serials live only in the machine's own `/etc/kitchen-sink/checkup.conf`; the tree uses placeholders.
+
+**Status.** The check-up and scrubs are live on kitchen-sink. The updater is installed, and its dry run and grant self-test passed on the machine. Its timer stays off until one supervised run at the machine.
+
+**What would change it.** A kitchen build that tracks edge automatically, or upstream shipping the Secure Boot engine.
+
 ## Findings, 2026-09-27: Secure Boot on real hardware (kitchen-sink)
 
 The machine is kitchen-sink:

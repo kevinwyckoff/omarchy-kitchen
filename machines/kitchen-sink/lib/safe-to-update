@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# safe-to-update: is kitchen-sink idle enough for an unattended update right now?
+#
+# Part of kitchen-update (S2). Runs as root, reads state and changes nothing.
+# It runs every instant check, then waits for QUIET_SECS of keyboard and mouse
+# silence, then runs the instant checks again, because something may have
+# started during the quiet window.
+#
+#   safe-to-update                   stop at the first stage that says busy
+#   safe-to-update --all             evaluate and print every check, even after
+#                                    an earlier one said busy (for dry runs)
+#   safe-to-update --quiet-secs N    use an N-second input window
+#
+# One line per check: "ok    ", "BUSY  ", "HARD  " or "info  ", then
+# "VERDICT SAFE|BUSY|HARD" last.
+#
+# Exit: 0 safe now | 75 busy, retry at the next slot | 2 hard blocker, skip tonight
+#
+# A dry run started over SSH sees its own SSH session as a remote login, and a
+# terminal it runs in as recent terminal input. Those are reported like any
+# other reason, marked as the check's own, not hidden: the real run under
+# systemd has neither.
+
+set -uo pipefail
+# No `set -e`: a check that cannot run must be reported (as busy), not end the script.
+
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+
+# ---- settings (override in /etc/kitchen-sink/update.conf) ---------------------
+DESKTOP_USER=kevinwyckoff
+QUIET_SECS=600
+TTY_IDLE_SECS=1800
+AGENT_IDLE_SECS=1800
+LOAD5_MAX=2.0
+PSI_CPU_MAX=5
+PSI_IO_MAX=10
+GPU_MAX=15
+NET_MAX_BYTES_PER_SEC=1048576
+LIB_DIR=/usr/local/lib/kitchen-sink
+# The audit session this check runs in (logind uses it as the session id).
+SELF_SESSION_FILE=/proc/self/sessionid
+CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+
+# Anything that means a package transaction, or the boot chain, is being changed.
+# pgrep matches the kernel's process name, which is cut at 15 characters, so
+# limine-snapper-sync and limine-mkinitcpio are spelled the way it sees them.
+TOOLING='pacman|yay|paru|makepkg|mkinitcpio|limine-update|limine-install|limine-snapper-|limine-mkinitcp|snapper|pacman-key|fwupdmgr|omarchy-update'
+
+load_conf() {
+  local owner mode
+  [[ -e $CONF ]] || return 0
+  read -r owner mode < <(stat -Lc '%u %a' -- "$CONF")
+  if [[ $owner != "0" ]] || (( 8#$mode & 022 )); then
+    echo "info  config: ignoring $CONF (it must be owned by root and not writable by others)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$CONF"
+}
+
+# ---- output -----------------------------------------------------------------
+busy_n=0 hard_n=0
+ok()   { echo "ok    $*"; }
+info() { echo "info  $*"; }
+busy() { echo "BUSY  $*"; busy_n=$((busy_n + 1)); }
+hard() { echo "HARD  $*"; hard_n=$((hard_n + 1)); }
+
+# ---- the desktop user ----------------------------------------------------------
+uid="" gid="" home="" rt="" his="" wd=""
+
+load_user() {
+  local entry
+  entry=$(getent passwd "$DESKTOP_USER") || return 1
+  IFS=: read -r _ _ uid gid _ home _ <<<"$entry"
+  rt=/run/user/$uid
+  session_vars
+}
+
+# The session's Hyprland signature and Wayland display, from the user's systemd
+# manager (uwsm puts them there), falling back to the newest live instance.
+session_vars() {
+  local json entry
+  his="" wd=""
+  if [[ -S $rt/bus ]]; then
+    json=$(as_user timeout 10 busctl --user --json=short get-property org.freedesktop.systemd1 \
+      /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager Environment 2>/dev/null)
+    while IFS= read -r entry; do
+      case $entry in
+        HYPRLAND_INSTANCE_SIGNATURE=*) his=${entry#*=} ;;
+        WAYLAND_DISPLAY=*) wd=${entry#*=} ;;
+      esac
+    done < <(jq -r '.data[]?' <<<"$json" 2>/dev/null)
+  fi
+  if [[ -z $his || ! -d $rt/hypr/$his ]]; then
+    his=$(find "$rt/hypr" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-)
+  fi
+}
+
+# Run a read-only command as the desktop user, on their session bus.
+as_user() {
+  local env=(HOME="$home" USER="$DESKTOP_USER" LOGNAME="$DESKTOP_USER" PATH=/usr/share/omarchy/bin:/usr/bin
+    XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" OMARCHY_PATH=/usr/share/omarchy)
+  [[ -z $his ]] || env+=(HYPRLAND_INSTANCE_SIGNATURE="$his")
+  [[ -z $wd ]] || env+=(WAYLAND_DISPLAY="$wd")
+  setpriv --reuid="$uid" --regid="$gid" --init-groups -- env -i "${env[@]}" "$@"
+}
+
+at_least() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+
+# The parent of a process, read past the comm field (which may hold spaces).
+ppid_of() {
+  local stat ppid
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  stat=${stat##*) }
+  read -r _ ppid _ <<<"$stat"
+  echo "$ppid"
+}
+
+# Terminals this check and its callers (sudo, the SSH shell) are attached to.
+own_ttys() {
+  local pid=$$ fd t
+  while [[ -n $pid ]] && (( pid > 1 )); do
+    for fd in 0 1 2; do
+      t=$(readlink "/proc/$pid/fd/$fd" 2>/dev/null) || continue
+      [[ $t == /dev/pts/* ]] && echo "$t"
+    done
+    pid=$(ppid_of "$pid") || break
+  done | sort -u
+}
+
+# ---- instant checks --------------------------------------------------------------
+
+check_package_tooling() {
+  local p lock_fd
+  if [[ -e /var/lib/pacman/db.lck ]]; then
+    if pgrep -x 'pacman|yay|paru' >/dev/null; then
+      busy "pacman: a transaction is running (/var/lib/pacman/db.lck)"
+    else
+      # pacman.log says "transaction completed" before the post-transaction hooks
+      # (DKMS, the UKI build and signing), so a complete-looking log proves nothing.
+      hard "pacman: /var/lib/pacman/db.lck exists but no package manager is running: pacman died, maybe during its post-transaction hooks (DKMS, the UKI build and signing). Do not reboot; at the machine read the end of /var/log/pacman.log, remove the lock, reinstall the kernel packages (or run limine-mkinitcpio), then run omarchy secureboot status. It is never removed automatically"
+    fi
+  fi
+  p=$(pgrep -l -x "$TOOLING" | awk '{ print $2 "(" $1 ")" }' | paste -sd' ' -)
+  if [[ -n $p ]]; then busy "tooling: package or boot tooling is running: $p"; else ok "tooling: no pacman, yay, mkinitcpio, limine, snapper or omarchy-update running"; fi
+
+  # Omarchy's own update lock. Open it read-only (never create it: a root-owned
+  # lock file would lock the user out of their own updates) and try the lock.
+  if [[ -e $rt/omarchy-update.lock ]]; then
+    if exec {lock_fd}<"$rt/omarchy-update.lock"; then
+      if flock -n "$lock_fd"; then ok "update-lock: $rt/omarchy-update.lock is free"; else busy "update-lock: an omarchy update is already running"; fi
+      exec {lock_fd}<&-
+    else
+      busy "update-lock: cannot open $rt/omarchy-update.lock"
+    fi
+  else
+    ok "update-lock: no omarchy update lock file"
+  fi
+}
+
+check_inhibitors() {
+  local json inh
+  if ! json=$(busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager ListInhibitors 2>/dev/null); then
+    busy "inhibitors: cannot ask logind for its inhibitors"
+    return
+  fi
+  # Only block-mode inhibitors mean someone asked not to be disturbed; the delay-mode
+  # sleep ones (NetworkManager, UPower, Omarchy's lock-before-suspend) are always there.
+  inh=$(jq -r '.data[0][] | select(.[3] == "block") | "\(.[1]) (\(.[0])): \(.[2])"' <<<"$json" 2>/dev/null | paste -sd';' -)
+  if [[ -n $inh ]]; then busy "inhibitors: block-mode inhibitor held: $inh"; else ok "inhibitors: no block-mode inhibitors"; fi
+}
+
+check_remote_sessions() {
+  local self s line key value found=0
+  local -A p
+  self=$(cat "$SELF_SESSION_FILE" 2>/dev/null)
+  while read -r s _; do
+    [[ -n $s ]] || continue
+    p=()
+    while IFS='=' read -r key value; do p[$key]=$value; done < <(loginctl show-session "$s" -p Remote -p State -p Service -p Name -p RemoteHost 2>/dev/null)
+    [[ ${p[Remote]:-} == "yes" && ${p[State]:-} =~ ^(active|online)$ ]] || continue
+    found=1
+    line="remote-login: session $s (${p[Service]:-?}, ${p[Name]:-?} from ${p[RemoteHost]:-?}, ${p[State]})"
+    if [[ $s == "$self" ]]; then
+      busy "$line is the session running this check: a dry run over SSH always sees itself; the timer's run has no session"
+    else
+      busy "$line"
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+  (( found )) || ok "remote-login: no active remote sessions"
+}
+
+check_terminals() {
+  local now t atime newest=0 newest_tty="" own mine=""
+  now=$(date +%s)
+  own=$(own_ttys)
+  # The tty layer updates a pts's atime when it is read, so the newest atime is
+  # the last keystroke into any terminal (8 s granularity).
+  for t in /dev/pts/[0-9]*; do
+    [[ -e $t ]] || continue
+    atime=$(stat -c %X "$t" 2>/dev/null) || continue
+    if (( now - atime < TTY_IDLE_SECS )); then
+      if grep -qxF -- "$t" <<<"$own"; then mine+="$t "; continue; fi
+      if (( atime > newest )); then newest=$atime newest_tty=$t; fi
+    fi
+  done
+  if (( newest )); then
+    busy "terminals: typed into $newest_tty $(( (now - newest) / 60 )) min ago (limit $(( TTY_IDLE_SECS / 60 )) min)"
+  fi
+  if [[ -n ${mine:-} ]]; then
+    busy "terminals: ${mine% } recently used: the terminal running this check (a dry run from a terminal always sees itself)"
+  fi
+  if (( newest == 0 )) && [[ -z ${mine:-} ]]; then
+    ok "terminals: no terminal input for $(( TTY_IDLE_SECS / 60 )) min"
+  fi
+}
+
+# Newest `.timestamp` in the three most recently written Claude Code and Pi
+# transcripts, as epoch seconds. Claude rewrites trailing metadata while idle,
+# so the file's mtime says nothing; the last real entry's timestamp does.
+latest_agent_entry() {
+  local f ts e best=0
+  while IFS= read -r f; do
+    ts=$(tail -n 200 -- "$f" 2>/dev/null | jq -rR 'fromjson? | .timestamp? // empty' 2>/dev/null | tail -n 1)
+    [[ -n $ts ]] || continue
+    if [[ $ts =~ ^[0-9]+$ ]]; then
+      e=$ts
+      (( e > 100000000000 )) && e=$(( e / 1000 )) # epoch milliseconds
+    else
+      e=$(date -d "$ts" +%s 2>/dev/null) || continue
+    fi
+    (( e > best )) && best=$e
+  done < <(find "$home/.claude/projects" "$home/.pi/agent/sessions" -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null |
+    sort -rn | head -n 3 | cut -d' ' -f2-)
+  echo "$best"
+}
+
+check_agents() {
+  local a kids=() last now
+  # A Claude or Pi process with a child is in the middle of a tool call.
+  for a in $(pgrep -x 'claude|pi'); do
+    pgrep -P "$a" >/dev/null && kids+=("$a")
+  done
+  if (( ${#kids[@]} )); then busy "agents: agent process ${kids[*]} has a running child (a tool call)"; fi
+  now=$(date +%s)
+  last=$(latest_agent_entry)
+  if (( last > 0 && now - last < AGENT_IDLE_SECS )); then
+    busy "agents: a Claude/Pi transcript was written to $(( (now - last) / 60 )) min ago (limit $(( AGENT_IDLE_SECS / 60 )) min)"
+  elif (( ${#kids[@]} == 0 )); then
+    ok "agents: no agent tool call running, no transcript activity for $(( AGENT_IDLE_SECS / 60 )) min"
+  fi
+}
+
+check_windows() {
+  local json w
+  if [[ -z $his ]]; then
+    busy "windows: no Hyprland instance found, so fullscreen and idle-inhibiting windows cannot be checked"
+  elif ! json=$(as_user timeout 10 hyprctl -j clients 2>/dev/null) || ! jq -e 'type == "array"' <<<"$json" >/dev/null 2>&1; then
+    busy "windows: cannot ask Hyprland for its windows"
+  else
+    # Browsers and video players inhibit idle through Wayland, not logind, so
+    # they show up only here. fullscreen is a number since Hyprland 0.42.
+    w=$(jq -r '.[] | select((.fullscreen | if type == "boolean" then . else . > 0 end) or .inhibitingIdle == true)
+      | "\(.class) (fullscreen \(.fullscreen), idle-inhibit \(.inhibitingIdle))"' <<<"$json" | paste -sd';' -)
+    if [[ -n $w ]]; then busy "windows: $w"; else ok "windows: no fullscreen or idle-inhibiting window"; fi
+  fi
+  if pgrep -f 'SteamLaunch|gamescope' >/dev/null; then busy "games: Steam game or gamescope running"; fi
+}
+
+check_audio() {
+  local json streams
+  if ! json=$(as_user timeout 10 pw-dump 2>/dev/null); then
+    busy "audio: cannot read PipeWire's graph (pw-dump failed)"
+    return
+  fi
+  streams=$(jq -r '.[] | select(.type == "PipeWire:Interface:Node")
+    | select((.info.props["media.class"] // "") | startswith("Stream/"))
+    | select(.info.state == "running")
+    | (.info.props["application.name"] // .info.props["node.name"] // "?")' <<<"$json" 2>/dev/null | sort -u | paste -sd',' -)
+  if [[ -n $streams ]]; then busy "audio: stream playing or recording: $streams"; else ok "audio: no running PipeWire streams"; fi
+}
+
+check_gpu() {
+  local models samples g gu ge
+  # Ollama not running (curl fails) simply means no model is loaded.
+  models=$(curl -s --max-time 3 http://127.0.0.1:11434/api/ps 2>/dev/null | jq -r '.models[]?.name' 2>/dev/null | paste -sd',' -)
+  if [[ -n $models ]]; then busy "ollama: model loaded: $models"; else ok "ollama: no model loaded"; fi
+
+  if ! command -v nvidia-smi >/dev/null; then
+    info "gpu: nvidia-smi not installed; GPU load not checked"
+    return
+  fi
+  if ! samples=$(for _ in 1 2 3 4 5; do
+    nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder --format=csv,noheader,nounits || exit 1
+    sleep 1
+  done 2>/dev/null); then
+    # A driver/library mismatch after an nvidia update without a reboot lands
+    # here. Blocking every night until a reboot would help nobody.
+    info "gpu: nvidia-smi failed (driver updated but not rebooted?); GPU load not checked"
+    return
+  fi
+  g=$(awk -F', *' '{ u += $1; if ($2 + $3 > 0) e = 1 } END { printf "%d %d", u / NR, e }' <<<"$samples")
+  read -r gu ge <<<"$g"
+  if (( gu >= GPU_MAX )); then busy "gpu: busy ${gu}% on average (limit ${GPU_MAX}%)"; fi
+  if (( ge )); then busy "gpu: video encoder or decoder active"; fi
+  if (( gu < GPU_MAX && ! ge )); then ok "gpu: ${gu}% busy, no video encode/decode"; fi
+}
+
+check_cpu() {
+  local load5 pc pio clear=1
+  load5=$(cut -d' ' -f2 /proc/loadavg)
+  pc=$(awk '/^some/ { sub("avg60=", "", $3); print $3 }' /proc/pressure/cpu 2>/dev/null)
+  pio=$(awk '/^some/ { sub("avg60=", "", $3); print $3 }' /proc/pressure/io 2>/dev/null)
+  if at_least "$load5" "$LOAD5_MAX"; then busy "cpu: load5 $load5 (limit $LOAD5_MAX)"; clear=0; fi
+  if [[ -n $pc ]] && at_least "$pc" "$PSI_CPU_MAX"; then busy "cpu: pressure ${pc}% (limit ${PSI_CPU_MAX}%)"; clear=0; fi
+  if [[ -n $pio ]] && at_least "$pio" "$PSI_IO_MAX"; then busy "io: pressure ${pio}% (limit ${PSI_IO_MAX}%)"; clear=0; fi
+  (( clear )) && ok "cpu: load5 $load5, cpu pressure ${pc:-?}%, io pressure ${pio:-?}%"
+}
+
+# Bytes received plus sent on every interface but lo.
+net_bytes() {
+  awk 'NR > 2 { sub(":", " "); if ($1 != "lo") s += $2 + $10 } END { printf "%d\n", s }' "${1:-/proc/net/dev}"
+}
+
+check_network() {
+  local b1 b2 rate
+  b1=$(net_bytes)
+  sleep 5
+  b2=$(net_bytes)
+  rate=$(( (b2 - b1) / 5 ))
+  if (( rate >= NET_MAX_BYTES_PER_SEC )); then
+    busy "network: $(( rate / 1024 )) KiB/s over 5 s (limit $(( NET_MAX_BYTES_PER_SEC / 1024 )) KiB/s): a download or stream?"
+  else
+    ok "network: $(( rate / 1024 )) KiB/s over 5 s"
+  fi
+}
+
+check_guests() {
+  local clear=1
+  if pgrep -f '^qemu-system-' >/dev/null; then busy "vms: a QEMU VM is running"; clear=0; fi
+  if systemctl is-active -q docker 2>/dev/null && [[ -n $(docker ps -q 2>/dev/null) ]]; then busy "containers: docker containers are running"; clear=0; fi
+  if systemctl is-active -q libvirtd 2>/dev/null && [[ -n $(virsh list --name 2>/dev/null | tr -d '\n') ]]; then busy "vms: libvirt domains are running"; clear=0; fi
+  (( clear )) && ok "vms: no QEMU VMs, docker containers or libvirt domains"
+}
+
+instant_checks() {
+  check_package_tooling
+  check_inhibitors
+  check_remote_sessions
+  check_terminals
+  check_agents
+  check_windows
+  check_audio
+  check_gpu
+  check_cpu
+  check_network
+  check_guests
+}
+
+watch_input() {
+  local out rc
+  out=$(python3 "$LIB_DIR/evwatch.py" "$QUIET_SECS" 2>&1)
+  rc=$?
+  case $rc in
+    0) ok "input: $out" ;;
+    1) busy "input: $out" ;;
+    *) busy "input: the input watch failed (exit $rc), which counts as busy: ${out:-no output}" ;;
+  esac
+}
+
+# Omarchy's own view, for the log only: while Stay Awake is on, "idle" is always false.
+context_info() {
+  local idle lock hint display
+  [[ -n $his ]] || return 0
+  idle=$(as_user timeout 5 omarchy-shell idle status 2>/dev/null | jq -c '{enabled, stayAwake, idle}' 2>/dev/null)
+  lock=$(as_user timeout 5 omarchy-shell lock status 2>/dev/null | jq -c '{locked}' 2>/dev/null)
+  display=$(loginctl show-user "$DESKTOP_USER" -p Display --value 2>/dev/null)
+  [[ -z $display ]] || hint=$(loginctl show-session "$display" -p IdleHint --value 2>/dev/null)
+  info "context: omarchy idle ${idle:-unknown}, lock ${lock:-unknown}, logind IdleHint ${hint:-unknown} (Omarchy never sets it)"
+}
+
+verdict() {
+  if (( hard_n )); then
+    echo "VERDICT HARD"
+    exit 2
+  elif (( busy_n )); then
+    echo "VERDICT BUSY"
+    exit 75
+  else
+    echo "VERDICT SAFE"
+    exit 0
+  fi
+}
+
+main() {
+  local all=0 quiet_override=""
+  while (( $# )); do
+    case $1 in
+      --all) all=1 ;;
+      --quiet-secs)
+        [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "safe-to-update: --quiet-secs needs a number of seconds" >&2; exit 64; }
+        quiet_override=$2
+        shift
+        ;;
+      -h | --help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; exit 0 ;;
+      *) echo "safe-to-update: unknown argument: $1" >&2; exit 64 ;;
+    esac
+    shift
+  done
+
+  load_conf
+  [[ -z $quiet_override ]] || QUIET_SECS=$quiet_override
+  if (( EUID != 0 )); then
+    echo "safe-to-update: run as root" >&2
+    exit 64
+  fi
+  if ! load_user; then
+    hard "user: $DESKTOP_USER does not exist"
+    verdict
+  fi
+
+  context_info
+  info "pass 1: instant checks"
+  instant_checks
+  if (( ! all )) && (( hard_n || busy_n )); then verdict; fi
+
+  info "input: watching keyboard, mouse and touch for ${QUIET_SECS}s"
+  watch_input
+  if (( ! all )) && (( busy_n )); then verdict; fi
+
+  info "pass 2: instant checks again (anything that started during the quiet window)"
+  session_vars
+  instant_checks
+  verdict
+}
+
+# Sourcing this file (the tests do) defines the checks without running them.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

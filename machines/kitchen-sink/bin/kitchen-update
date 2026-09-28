@@ -1,0 +1,1631 @@
+#!/bin/bash
+
+# kitchen-update: the gated nightly `omarchy update` for kitchen-sink.
+#
+# Runs as root from kitchen-update.service, which kitchen-update.timer starts
+# at 02:30, 03:30, 04:30 and 05:30. It calls Omarchy's own
+# `/usr/bin/omarchy-update -y`, so migrations, the pre-update snapshot, hooks,
+# the shell restart and the Secure Boot re-integration all stay Omarchy's. What
+# this adds is the gates around it, a sudo grant only the update can use, the
+# checks afterwards, and a record of how the night ended.
+#
+#   kitchen-update                    one nightly slot (what the timer runs)
+#   kitchen-update --dry-run [--quiet-secs N]
+#                                     evaluate and print every gate, the sudo rule, and the
+#                                     exact environment and command; never grants, never
+#                                     updates, writes nothing outside a temp dir
+#   kitchen-update --grant-test       write the sudo grant, prove it works with the group and
+#                                     not without, that newgrp can't join it, then revoke it
+#                                     and prove that
+#   kitchen-update --revoke           remove any grant and prove it is gone, kill anything
+#                                     still carrying the grant's group, and record a night
+#                                     whose update was cut off as FAILED (ExecStopPost)
+#   kitchen-update --boot-check       re-run the postflight's boot checks now; clears the
+#                                     record a failed night left once they pass
+#
+# A supervised run skips the activity check once:
+#   sudo touch /run/kitchen-update/force-idle && sudo systemctl start --no-block kitchen-update.service
+#
+# Each night ends in exactly one state, in /var/lib/kitchen-update/status.json and the journal:
+#   BUSY        something or someone is active, or the mirror is down: the next slot retries
+#   DEFERRED    the last slot was busy too; nothing changed tonight
+#   UP-TO-DATE  nothing pending; omarchy update is not called (it would still snapshot)
+#   HELD        a safety or compatibility gate failed; nothing changed; a human decides
+#   DONE        updated, and every postflight gate passed
+#   FAILED      the update started, then omarchy-update or a postflight gate failed, or
+#               the run was cut off before it could say
+# While the update itself runs, status.json says RUNNING (not settled). A RUNNING
+# that outlives its run is how a stop, a kill or a power cut after S5 is caught:
+# the stop hook (--revoke) or the next slot turns it into FAILED.
+#
+# The order, as designed: S0 entry, S1 static gates, S2 activity (safe-to-update),
+# S3 compatibility (preflight), S4 grant, S5 the update as the user, S6 revoke,
+# S7 postflight, S8 reboot check, S9 status and toast. It never reboots.
+#
+# What it leaves behind (the daily check-up reads these):
+#   /var/lib/kitchen-update/status.json     the last slot's result: night, state, settled,
+#                                           reasons, warnings, action, care, pending, upgraded,
+#                                           reboot, reboot_reasons, secureboot, grant, boot_check,
+#                                           log, last_success, nights_without_update (schema 1)
+#   /var/lib/kitchen-update/history.jsonl   one line per status write, the last 400
+#   /var/lib/kitchen-update/last-success    ISO time the news was last read before a DONE
+#   /var/lib/kitchen-update/reboot-pending  {since, level, reasons, boot_id}; void once booted
+#   /var/lib/kitchen-update/boot-check      {night, since, reasons, action, log, boot_id}: the
+#                                           boot chain failed its checks (or the run was cut off
+#                                           before them). Every later slot holds, and the check-up
+#                                           says do not reboot, until the same checks pass again
+#   /var/log/kitchen-update/<night>.log     every gate and the full omarchy-update output
+# sudo logs the deliberately refused probes (the self-test and the revoke proof)
+# as "... a password is required ; ... COMMAND=/usr/bin/true kitchen-update-probe".
+#
+# Exit: 0 for every night state but FAILED, which exits 1 (so it shows in
+# systemctl --failed); 2 for a setup or usage error.
+
+set -uo pipefail
+# No `set -e`: every failure is handled where it happens, because this script
+# must always get to the grant's revocation, the status file and the toast.
+
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+umask 022
+
+# ---- settings (override in /etc/kitchen-sink/update.conf) ---------------------
+DESKTOP_USER=kevinwyckoff
+GRANT_MINUTES=120
+GRANT_TEST_MINUTES=5
+UPDATE_TIMEOUT=100m
+UPDATE_KILL_AFTER=5m
+PIN_PACKAGES="omarchy-dev omarchy-settings-dev"
+LAST_SLOT=05:30
+NOTIFY=1
+NOTIFY_WAIT_SECS=60
+LIB_DIR=/usr/local/lib/kitchen-sink
+STATE_DIR=/var/lib/kitchen-update
+LOG_DIR=/var/log/kitchen-update
+RUN_DIR=/run/kitchen-update
+LOCK_FILE=/run/kitchen-update.lock
+SUDOERS_DIR=/etc/sudoers.d
+GRANT_NAME=98-kitchen-update
+GRANT_GROUP=kitchen-update
+TIMER_UNIT=kitchen-update.timer
+OMARCHY_BIN=/usr/bin
+OMARCHY_ROOT=/usr/share/omarchy
+PACMAN_LOG=/var/log/pacman.log
+SB_MARKER=/var/lib/omarchy-secureboot/enabled
+SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
+CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+
+# Only these names cross from the user manager's Environment into the update's
+# `env -i`. Anything else in the session (EDITOR, GUM_*, CUDA_PATH...) stays out.
+USER_ENV_WHITELIST="HOME USER LOGNAME SHELL LANG PATH WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS OMARCHY_PATH"
+
+# The Omarchy internals this design leans on. Each needle is an exact line in
+# the installed command; if one is gone, Omarchy changed underneath us and the
+# night is held until someone re-checks the design against the new code.
+# shellcheck disable=SC2016 # the needles are literal source lines, $ and all
+TRIPWIRE=(
+  # OMARCHY_UPDATE_LOGGED=1 skips the script(1) pty, so prompts fail fast instead of hanging.
+  'omarchy-update|if [[ -z ${OMARCHY_UPDATE_LOGGED:-} ]]; then'
+  # -y exports OMARCHY_UPDATE_UNATTENDED, which suppresses Omarchy's confirmations.
+  'omarchy-update|[[ ${1:-} != "-y" ]] || export OMARCHY_UPDATE_UNATTENDED=1'
+  # Without a terminal the orphan review reports and moves on instead of asking.
+  'omarchy-update-orphan-pkgs|if [[ ! -t 0 || ! -t 1 ]]; then'
+  # Unattended, the reboot prompt is only an echo: the update never reboots.
+  'omarchy-update-restart|if [[ ${OMARCHY_UPDATE_UNATTENDED:-0} == "1" ]]; then'
+  # The AUR guard removes the grant when this header appears (see copy_output).
+  'omarchy-update-aur-pkgs|echo -e "\e[32m\nUpdate AUR packages\e[0m"'
+  # The postflight warns when the update log carries this line (no pre-update snapshot).
+  'omarchy-update|echo -e "\e[33mContinuing the update without a snapshot.\e[0m" >&2'
+)
+
+# Omarchy's AUR phase header, as it reaches root's copy of the output (escapes stripped).
+AUR_HEADER="Update AUR packages"
+
+# sudo logs every refused `sudo -n`. This extra argument (true ignores it) makes
+# the updater's own probes easy to recognise, and to filter, in the journal.
+PROBE_TAG=kitchen-update-probe
+
+# ---- run state ------------------------------------------------------------------
+MODE=run
+QUIET_OVERRIDE=""
+NIGHT=$(date +%F)
+DAYLOG=""
+W=""
+uid="" gid="" home="" shell="" kgid=""
+declare -A uenv=()
+run_env=()
+run_cmd=()
+holds=() busys=() cares=() notes=() warnings=()
+grant_error=""
+LOCK_FD=""
+inhibit_pid=""
+boot_check_json=null
+pending_count=-1
+pending_rc=0
+news_checked_at=""
+sb_state=unknown
+grant_live=0
+grant_state=none
+update_started=0
+update_rc=""
+post_rc=""
+pacman_from=""
+reboot_level=none
+reboot_reasons=()
+reboot_since=""
+grant_had=0
+state_written=0
+skip_activity=0
+
+load_conf() {
+  local owner mode
+  [[ -e $CONF ]] || return 0
+  read -r owner mode < <(stat -Lc '%u %a' -- "$CONF")
+  if [[ $owner != "0" ]] || (( 8#$mode & 022 )); then
+    log warn "config: ignoring $CONF (it must be owned by root and not writable by others)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$CONF"
+}
+
+# ---- logging -----------------------------------------------------------------------
+# One line per event. Under systemd a <N> prefix gives the journal priority
+# (3 error, 4 warning, 5 notice, 6 info), so `journalctl -u kitchen-update -p warning`
+# shows only what needs a look. The day log gets the same lines, timestamped.
+# The prefix goes out only when stdout really is the journal (main checks
+# JOURNAL_STREAM's device:inode): a terminal started from the desktop can
+# inherit the variable without being the journal.
+JOURNAL_OUT=0
+log() {
+  local level=$1 prio tag
+  shift
+  case $level in
+    ok) prio=6 tag="ok   " ;;
+    info) prio=6 tag="info " ;;
+    head) prio=6 tag="==   " ;;
+    busy) prio=6 tag="BUSY " ;;
+    care) prio=5 tag="CARE " ;;
+    note) prio=5 tag="NOTE " ;;
+    hold) prio=4 tag="HOLD " ;;
+    warn) prio=4 tag="WARN " ;;
+    fail) prio=3 tag="FAIL " ;;
+    *) prio=6 tag="     " ;;
+  esac
+  if (( JOURNAL_OUT )); then
+    printf '<%d>%s %s\n' "$prio" "$tag" "$*"
+  else
+    printf '%s %s\n' "$tag" "$*"
+  fi
+  [[ -z $DAYLOG ]] || printf '%s %s %s\n' "$(date +%T)" "$tag" "$*" >>"$DAYLOG"
+}
+
+hold() { holds+=("$*"); log hold "$*"; }
+busy() { busys+=("$*"); log busy "$*"; }
+
+# Re-log a helper's output ("TAG  text" lines) at the matching priority, and keep
+# a copy in $W/STAGE.out for the reasons in the status file.
+relay() {
+  local stage=$1 line tag rest
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >>"$W/$stage.out"
+    read -r tag rest <<<"$line"
+    case $tag in
+      ok) log ok "$rest" ;;
+      info) log info "$rest" ;;
+      CARE) log care "$rest" ;;
+      BUSY | RETRY) log busy "$rest" ;;
+      HOLD | HARD) log hold "$rest" ;;
+      WARN) log warn "$rest" ;;
+      FAIL) log fail "$rest" ;;
+      VERDICT) log head "$stage verdict: $rest" ;;
+      *) log info "$line" ;;
+    esac
+  done
+}
+
+# Reasons of one kind from a helper's output, e.g. `reasons_from preflight HOLD`.
+# The activity check runs its instant checks twice, so drop repeats.
+reasons_from() {
+  local stage=$1 tag
+  shift
+  for tag in "$@"; do
+    grep -E "^$tag +" "$W/$stage.out" 2>/dev/null | sed -E "s/^$tag +//"
+  done | awk '!seen[$0]++'
+}
+
+# A command line as it would be typed: plain words bare, anything else in single quotes.
+shell_words() {
+  local w q="'\\''" out=()
+  for w in "$@"; do
+    if [[ $w =~ ^[A-Za-z0-9_./:=,@%+-]+$ ]]; then
+      out+=("$w")
+    else
+      out+=("'${w//\'/$q}'")
+    fi
+  done
+  echo "${out[*]}"
+}
+
+# Terminal escapes and carriage returns, so the day log and journal stay readable.
+strip_ansi() {
+  local esc=$'\e' bel=$'\a' cr=$'\r'
+  sed -u -E "s#${esc}\\][^${bel}${esc}]*(${bel}|${esc}\\\\)##g; s#${esc}\\[[0-9;?]*[ -/]*[@-~]##g; s#${esc}[()][0-9A-Za-z]##g; s#${cr}##g"
+}
+
+# ---- the desktop user --------------------------------------------------------------
+load_user() {
+  local entry
+  entry=$(getent passwd "$DESKTOP_USER") || return 1
+  IFS=: read -r _ _ uid gid _ home shell <<<"$entry"
+}
+
+# A read-only command as the desktop user, on their session bus.
+as_user() {
+  setpriv --reuid="$uid" --regid="$gid" --init-groups -- env -i HOME="$home" USER="$DESKTOP_USER" \
+    LOGNAME="$DESKTOP_USER" PATH="$OMARCHY_ROOT/bin:/usr/bin" XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" OMARCHY_PATH="$OMARCHY_ROOT" "$@"
+}
+
+# The user's systemd manager Environment (uwsm fills it at login), into uenv[].
+read_user_env() {
+  local json entry
+  uenv=()
+  json=$(as_user timeout 10 busctl --user --json=short get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager Environment 2>/dev/null) || return 1
+  while IFS= read -r -d '' entry; do
+    [[ ${entry%%=*} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    uenv[${entry%%=*}]=${entry#*=}
+  done < <(jq -j '.data[]? | ., "\u0000"' <<<"$json" 2>/dev/null)
+  (( ${#uenv[@]} > 0 ))
+}
+
+user_groups() { id -G "$DESKTOP_USER" | tr ' ' ','; }
+
+# The environment and command for S5, built from the whitelist. Identity and the
+# runtime paths come from passwd and the uid, never from the session; OMARCHY_PATH
+# is pinned because Omarchy's security entrypoint accepts only the packaged root.
+build_run() {
+  local name value
+  run_env=()
+  for name in $USER_ENV_WHITELIST; do
+    case $name in
+      HOME) value=$home ;;
+      USER | LOGNAME) value=$DESKTOP_USER ;;
+      SHELL) value=$shell ;;
+      XDG_RUNTIME_DIR) value=/run/user/$uid ;;
+      DBUS_SESSION_BUS_ADDRESS) value=unix:path=/run/user/$uid/bus ;;
+      OMARCHY_PATH) value=$OMARCHY_ROOT ;;
+      PATH) value=${uenv[PATH]:-$OMARCHY_ROOT/bin:/usr/local/sbin:/usr/local/bin:/usr/bin} ;;
+      *) value=${uenv[$name]:-} ;;
+    esac
+    [[ -n $value ]] || continue
+    # A value with a newline or other control character is not an environment value we pass on.
+    if [[ $value == *[[:cntrl:]]* ]]; then
+      log warn "run: dropping $name from the update's environment (control characters)"
+      continue
+    fi
+    run_env+=("$name=$value")
+  done
+  # Skips script(1): no pty, so an unexpected gum or sudo prompt fails fast instead of hanging.
+  run_env+=(OMARCHY_UPDATE_LOGGED=1)
+
+  # The user-side script: tee keeps /tmp/omarchy-update.log owned by the user
+  # (fs.protected_regular stops root writing a user's file in /tmp, and later
+  # interactive updates must be able to overwrite it); analyze-logs reads it.
+  # It execs omarchy-update rather than piping it, so the TERM that `timeout`
+  # sends lands on omarchy-update itself: its trap then revokes sudo's timestamp
+  # and stops the stay-awake inhibitor after the phase it is in. stdin is
+  # /dev/null, so nothing can wait for input.
+  local script
+  script="exec > >(exec tee /tmp/omarchy-update.log) 2>&1; exec $(printf '%q' "$OMARCHY_BIN/omarchy-update") -y </dev/null"
+  # --foreground: TERM and KILL go to omarchy-update only, never to its process
+  # group, so a pacman transaction in progress is never signalled.
+  run_cmd=(timeout --foreground -k "$UPDATE_KILL_AFTER" "$UPDATE_TIMEOUT"
+    setpriv --reuid="$uid" --regid="$gid" --groups="$(user_groups),$kgid" --
+    env -i "${run_env[@]}" /bin/bash -c "$script")
+}
+
+# ---- night state ---------------------------------------------------------------------
+
+# The state tonight already ended in, if it is settled (DONE, UP-TO-DATE, HELD, FAILED).
+settled_state() {
+  local f=$STATE_DIR/status.json night state
+  [[ -r $f ]] || return 1
+  night=$(jq -r '.night // empty' "$f" 2>/dev/null)
+  state=$(jq -r '.state // empty' "$f" 2>/dev/null)
+  [[ $night == "$NIGHT" ]] || return 1
+  case $state in
+    DONE | UP-TO-DATE | HELD | FAILED) echo "$state at $(jq -r '.time // "?"' "$f")" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Is this the night's last slot? Ask the timer when it fires next; without a
+# timer (a manual run), anything at or after LAST_SLOT counts as the last one.
+last_slot() {
+  local next
+  next=$(systemctl show "$TIMER_UNIT" -p NextElapseUSecRealtime --value --timestamp=unix 2>/dev/null)
+  if [[ $next =~ ^@[0-9]+$ ]]; then
+    [[ $(date -d "$next" +%F) != "$NIGHT" ]]
+  else
+    (( 10#$(date +%H%M) >= 10#${LAST_SLOT//:/} ))
+  fi
+}
+
+# JSON arrays of strings, from arguments or from the lines of a file (empty: []).
+json_array() { jq -cn '$ARGS.positional' --args -- "$@"; }
+json_lines() { if [[ -r ${1:-} ]]; then jq -cRn '[inputs | select(. != "")]' <"$1"; else echo '[]'; fi; }
+
+# The packages this run's system upgrade changed, as "name old -> new", from
+# pacman.log. Only from the -Syu on: omarchy update reinstalls archlinux-keyring
+# before it every time, and that is not an update.
+upgraded_lines() {
+  [[ -n $pacman_from ]] || return 0
+  tail -n +"$pacman_from" "$PACMAN_LOG" |
+    awk '/\[PACMAN\] starting full system upgrade/ { buf = ""; on = 1; next } on { buf = buf $0 "\n" } END { printf "%s", buf }' |
+    sed -nE 's/^\[[^]]+\] \[ALPM\] (upgraded|installed|reinstalled|downgraded) ([^ ]+) \((.*)\)$/\2 \3/p'
+}
+
+# RUNNING is written just before the update starts and is not a result: it
+# does not settle the night, and the run still owes its final state.
+write_status() {
+  local state=$1 action=${2:-} f=$STATE_DIR/status.json tmp settled=true
+  local prev_n=0 counted="" n reasons=()
+  [[ $state == "BUSY" || $state == "RUNNING" ]] && settled=false
+  if [[ -r $f ]]; then
+    prev_n=$(jq -r '.nights_without_update // 0' "$f" 2>/dev/null)
+    counted=$(jq -r '.counted_night // ""' "$f" 2>/dev/null)
+  fi
+  [[ $prev_n =~ ^[0-9]+$ ]] || prev_n=0
+  # Nights in a row that ended without an update while updates were pending.
+  # Counted once per night; the check-up warns at 3.
+  case $state in
+    DONE | UP-TO-DATE) n=0 counted=$NIGHT ;;
+    *)
+      if (( pending_count > 0 )) && [[ $counted != "$NIGHT" ]]; then
+        n=$((prev_n + 1)) counted=$NIGHT
+      else
+        n=$prev_n
+      fi
+      ;;
+  esac
+  case $state in
+    BUSY | DEFERRED) reasons=("${busys[@]}") ;;
+    HELD) reasons=("${holds[@]}") ;;
+    FAILED | DONE) reasons=("${notes[@]}") ;;
+  esac
+
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/.status.XXXXXX") || { log fail "status: cannot write $STATE_DIR"; return 1; }
+  jq -n \
+    --arg night "$NIGHT" --arg state "$state" --argjson settled "$settled" \
+    --arg time "$(date -Iseconds)" --arg action "$action" \
+    --argjson reasons "$(json_array "${reasons[@]}")" \
+    --argjson warnings "$(json_array "${warnings[@]}")" \
+    --argjson care "$(json_array "${cares[@]}")" \
+    --argjson pending "$(json_lines "${W:+$W/pending.txt}")" \
+    --argjson upgraded "$(upgraded_lines | jq -cRn '[inputs | select(. != "")]')" \
+    --arg reboot "$reboot_level" --argjson reboot_reasons "$(json_array "${reboot_reasons[@]}")" \
+    --arg secureboot "$sb_state" --arg grant "$grant_state" \
+    --argjson boot_check "${boot_check_json:-null}" \
+    --arg update_rc "$update_rc" --arg postflight_rc "$post_rc" --arg pacman_from "$pacman_from" \
+    --arg log "$DAYLOG" \
+    --arg last_success "$(cat "$STATE_DIR/last-success" 2>/dev/null)" \
+    --argjson nights "$n" --arg counted "$counted" \
+    '{schema: 1, night: $night, state: $state, settled: $settled, time: $time,
+      reasons: $reasons, warnings: $warnings, action: $action, care: $care, pending: $pending,
+      upgraded: $upgraded, reboot: $reboot, reboot_reasons: $reboot_reasons,
+      secureboot: $secureboot, grant: $grant, boot_check: $boot_check,
+      update_rc: $update_rc, postflight_rc: $postflight_rc, pacman_from: $pacman_from, log: $log,
+      last_success: $last_success, nights_without_update: $nights, counted_night: $counted}' >"$tmp" &&
+    chmod 0644 "$tmp" && mv -fT "$tmp" "$f"
+  jq -c . "$f" >>"$STATE_DIR/history.jsonl" 2>/dev/null
+  if (( $(wc -l <"$STATE_DIR/history.jsonl") > 400 )); then
+    tail -n 400 "$STATE_DIR/history.jsonl" >"$STATE_DIR/.history" && mv -fT "$STATE_DIR/.history" "$STATE_DIR/history.jsonl"
+  fi
+  [[ $state == "RUNNING" ]] || state_written=1
+}
+
+# Add a warning to tonight's status after the fact (the stop hook runs after
+# the night was written). Another night's status is left alone.
+amend_status() {
+  local f=$STATE_DIR/status.json tmp
+  [[ $(jq -r '.night // empty' "$f" 2>/dev/null) == "$NIGHT" ]] || return 0
+  tmp=$(mktemp "$STATE_DIR/.status.XXXXXX") || return 1
+  if ! { jq --arg w "$1" '.warnings = ((.warnings // []) + [$w])' "$f" >"$tmp" && chmod 0644 "$tmp" && mv -fT "$tmp" "$f"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Finish the night: journal line, status file, exit. Toasts are sent by the caller.
+end_night() {
+  local state=$1 action=${2:-} summary
+  case $state in
+    BUSY | DEFERRED) summary=$(printf '%s; ' "${busys[@]}") ;;
+    HELD) summary=$(printf '%s; ' "${holds[@]}") ;;
+    FAILED) summary=$(printf '%s; ' "${notes[@]}") ;;
+    *) summary="" ;;
+  esac
+  summary=${summary%; }
+  case $state in
+    FAILED) log fail "STATE $state${summary:+: $summary}" ;;
+    HELD) log hold "STATE $state${summary:+: $summary}${action:+ -> $action}" ;;
+    DEFERRED) log note "STATE $state (the last slot was busy too): $summary" ;;
+    *) log head "STATE $state${summary:+: $summary}" ;;
+  esac
+  write_status "$state" "$action"
+  if [[ $state == "FAILED" ]]; then exit 1; fi
+  exit 0
+}
+
+# BUSY, or DEFERRED when this was the night's last slot.
+end_busy() {
+  if last_slot; then end_night DEFERRED; else end_night BUSY; fi
+}
+
+# toast URGENCY TITLE BODY [WAIT]: WAIT defaults to NOTIFY_WAIT_SECS.
+toast() {
+  local urgency=$1 title=$2 body=$3 wait=${4:-$NOTIFY_WAIT_SECS} line
+  if (( ! NOTIFY )); then
+    log info "toast: skipped (NOTIFY=0): $title"
+    return 0
+  fi
+  if [[ ! -x $LIB_DIR/notify ]]; then
+    log warn "toast: $LIB_DIR/notify is not installed; no toast for: $title"
+    return 0
+  fi
+  local args=(--urgency "$urgency" --title "$title" --body "$body" --wait "$wait"
+    --user "$DESKTOP_USER" --app-name kitchen-update)
+  [[ -z $DAYLOG ]] || args+=(--open "$DAYLOG")
+  # notify always exits 0 and says on stderr what it did. It runs commands as
+  # the desktop user, so it gets no copy of the slot lock.
+  (close_lock; exec "$LIB_DIR/notify" "${args[@]}") 2>&1 | while IFS= read -r line; do log info "toast: $line"; done
+}
+
+# ---- the sudo grant (S4, S6) ----------------------------------------------------------
+# A per-run rule for an empty system group: `%kitchen-update ... NOPASSWD: ALL`.
+# Nobody is a member, and newgrp can't join it (no group password). setpriv adds
+# the gid to the update's process tree alone, and sudo matches the calling
+# process's own group list (group_source=adaptive, the default), so only that
+# tree gets root: not the desktop, not the agents, not SSH logins.
+#
+# The group is the key, so every process that carries it is part of the grant.
+# The service's cgroup does not contain them all: anything the update starts
+# through the user manager (`systemd-run --user --scope`, `uwsm app`, and so
+# Omarchy's omarchy-restart-app) is moved into user@1000.service, keeps the gid
+# and escapes the unit's final SIGKILL. So the grant is only written while no
+# process carries the gid, and S6 and the stop hook kill every carrier once the
+# update is over.
+
+grant_file() { echo "$SUDOERS_DIR/$GRANT_NAME"; }
+
+group_gid() { getent group "$GRANT_GROUP" | cut -d: -f3; }
+
+# Every live process whose supplementary groups include the gid, one per line
+# as "PID EUID CGROUP NAME". A zombie still lists its groups but can do
+# nothing, so it is left out. grep, not awk, reads /proc: a process that exits
+# between the glob and the read is a fatal error to gawk, a skipped file to grep.
+gid_carriers() {
+  local gid=${1:-$kgid} pid euid name
+  [[ $gid =~ ^[0-9]+$ ]] || return 0
+  grep -H -E '^(Name|State|Uid|Groups):' /proc/[0-9]*/status 2>/dev/null |
+    awk -v g="$gid" '
+      {
+        split($0, f, ":"); pid = f[1]; sub(/^\/proc\//, "", pid); sub(/\/status$/, "", pid)
+        val = substr($0, length(f[1]) + length(f[2]) + 3); sub(/^[ \t]+/, "", val)
+      }
+      f[2] == "Name" { name[pid] = val }
+      f[2] == "State" { zombie[pid] = (val ~ /^Z/) }
+      f[2] == "Uid" { split(val, u, /[ \t]+/); euid[pid] = u[2] }
+      f[2] == "Groups" { n = split(val, gs, /[ \t]+/); for (i = 1; i <= n; i++) if (gs[i] == g && !zombie[pid]) hit[pid] = 1 }
+      END { for (p in hit) print p, euid[p], name[p] }' |
+    while read -r pid euid name; do
+      printf '%s %s %s %s\n' "$pid" "$euid" "$(sed -n 's/^0:://p' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)" "$name"
+    done
+}
+
+# "PID NAME (CGROUP)" for the first few carriers, for a log line.
+carrier_summary() {
+  awk '{ name = $4; for (i = 5; i <= NF; i++) name = name " " $i; printf "%s%s %s (%s)", (NR > 1 ? "; " : ""), $1, name, $3 } NR == 5 { exit }'
+}
+
+# SIGKILL every process that carries the gid, except those whose cgroup ends
+# in KEEP (a run in progress keeps its own tree). Once the update is over,
+# nothing may carry it: the next night's rule would reach whatever still does.
+# Each kill is logged and kept in warnings[]; returns 1 if a carrier survives.
+kill_carriers() {
+  local keep=${1:-} pid euid cg name list="" left msg
+  [[ -n $kgid ]] || return 0
+  while read -r pid euid cg name; do
+    [[ -n $pid ]] || continue
+    [[ -z $keep || $cg != *"$keep" ]] || continue
+    kill -KILL "$pid" 2>/dev/null
+    list+="$pid $euid $cg $name"$'\n'
+  done < <(gid_carriers)
+  [[ -n $list ]] || return 0
+  msg="group: killed $(grep -c . <<<"$list") process(es) still carrying the $GRANT_GROUP group after the update: $(carrier_summary <<<"$list")"
+  log warn "$msg"
+  warnings+=("$msg")
+  sleep 1
+  left=$(gid_carriers | while read -r pid euid cg name; do
+    [[ -n $keep && $cg == *"$keep" ]] || echo "$pid $euid $cg $name"
+  done)
+  if [[ -n $left ]]; then
+    log fail "group: still carrying the $GRANT_GROUP group after SIGKILL: $(carrier_summary <<<"$left")"
+    return 1
+  fi
+}
+
+group_is_empty() {
+  local entry members g
+  entry=$(getent group "$GRANT_GROUP") || return 1
+  IFS=: read -r _ _ g members <<<"$entry"
+  [[ -z $members ]] || return 1
+  # Nor anyone's primary group.
+  ! getent passwd | awk -F: -v g="$g" '$4 == g { found = 1 } END { exit !found }'
+}
+
+grant_rule() { printf '%%%s ALL=(ALL:ALL) NOTAFTER=%s NOPASSWD: ALL\n' "$GRANT_GROUP" "$1"; }
+
+# grant_fail TEXT: a reason the grant was refused, logged and kept for S4's hold.
+grant_fail() {
+  grant_error=$*
+  log fail "grant: $*"
+}
+
+# grant_create MINUTES: write the rule through a dotted temp name (sudo's
+# includedir ignores names with a dot), check it, then rename it into place.
+grant_create() {
+  local minutes=$1 until tmp carriers
+  kgid=$(group_gid)
+  if [[ -z $kgid ]]; then
+    grant_fail "group $GRANT_GROUP does not exist (systemd-sysusers /etc/sysusers.d/kitchen-update.conf)"
+    return 1
+  fi
+  if ! group_is_empty; then
+    grant_fail "group $GRANT_GROUP has members; refusing, since only the update's process tree may carry it"
+    return 1
+  fi
+  # A process that already carries the gid would get root from the rule too.
+  # Nothing should: the last run's S6 and stop hook kill them.
+  carriers=$(gid_carriers)
+  if [[ -n $carriers ]]; then
+    grant_fail "$(grep -c . <<<"$carriers") process(es) already carry the $GRANT_GROUP group, and the rule would give them root: $(carrier_summary <<<"$carriers"). Refusing; sudo kitchen-update --revoke kills them"
+    return 1
+  fi
+  until=$(date -u -d "+$minutes min" +%Y%m%d%H%M%SZ)
+  if ! tmp=$(mktemp "$SUDOERS_DIR/.kitchen-update.XXXXXX"); then
+    grant_fail "cannot create a temp file in $SUDOERS_DIR"
+    return 1
+  fi
+  grant_live=1
+  {
+    echo "# kitchen-update: nightly grant written $(date -Iseconds), removed when the run ends."
+    echo "# Only processes carrying the $GRANT_GROUP group (added by setpriv to omarchy-update) match."
+    grant_rule "$until"
+  } >"$tmp"
+  chown root:root "$tmp"
+  chmod 0440 "$tmp"
+  if ! visudo -cqf "$tmp" >/dev/null 2>&1; then
+    grant_fail "visudo rejected the rule"
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! mv -fT -- "$tmp" "$(grant_file)"; then
+    grant_fail "could not move the rule into place"
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! visudo -cq >/dev/null 2>&1; then
+    grant_fail "the complete sudoers configuration no longer parses"
+    return 1
+  fi
+  grant_state=present
+  log ok "grant: $(grant_file) in place for %$GRANT_GROUP (gid $kgid), NOTAFTER $until UTC, visudo ok"
+}
+
+# sudo -n never asks for a password, so it can't count against faillock; -N
+# leaves no timestamp behind.
+probe_with_group() {
+  setpriv --reuid="$uid" --regid="$gid" --groups="$(user_groups),$kgid" -- \
+    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/sudo -n -N /usr/bin/true "$PROBE_TAG" >/dev/null 2>&1
+}
+
+probe_without_group() {
+  runuser -u "$DESKTOP_USER" -- env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/sudo -n -N /usr/bin/true "$PROBE_TAG" >/dev/null 2>&1
+}
+
+grant_selftest() {
+  if probe_with_group; then
+    log ok "grant: with the $GRANT_GROUP group, $DESKTOP_USER's sudo -n works"
+  else
+    grant_fail "with the $GRANT_GROUP group, sudo -n was refused"
+    return 1
+  fi
+  if probe_without_group; then
+    grant_fail "WITHOUT the group, sudo -n works too: the rule reaches $DESKTOP_USER's own processes"
+    return 1
+  fi
+  log ok "grant: without the group, $DESKTOP_USER's sudo -n is refused, so the desktop, agents and SSH logins get nothing"
+}
+
+# Remove the rule (and any temp file a crash left), then prove the grouped probe
+# fails. The probe also runs when this run wrote a rule that is already gone
+# (the AUR guard removes it early), so every run ends with the proof.
+grant_revoke() {
+  local f had=0
+  f=$(grant_file)
+  [[ ! -e $f ]] || had=1
+  grant_had=$had
+  rm -f -- "$f" "$SUDOERS_DIR"/.kitchen-update.*
+  grant_live=0
+  if [[ -e $f ]]; then
+    grant_state=present
+    log fail "revoke: $f is still there"
+    return 1
+  fi
+  kgid=$(group_gid)
+  if (( had )) || [[ $grant_state == "present" ]] && [[ -n $kgid && -n $uid ]]; then
+    if probe_with_group; then
+      grant_state=present
+      log fail "revoke: sudo -n still works with the $GRANT_GROUP group after removing $f"
+      return 1
+    fi
+    log ok "revoke: $f $( (( had )) && echo removed || echo 'already gone'); with the group, sudo -n is refused again"
+  elif (( had )); then
+    log ok "revoke: $f removed"
+  else
+    log info "revoke: no grant present"
+  fi
+  [[ $grant_state == "none" ]] || grant_state=revoked
+}
+
+# ---- S1: static gates --------------------------------------------------------------------
+
+gate_session() {
+  local his wd
+  if [[ ! -S /run/user/$uid/bus ]]; then
+    hold "session: no user bus at /run/user/$uid/bus ($DESKTOP_USER is not logged in)"
+    return
+  fi
+  if ! pgrep -u "$uid" -x Hyprland >/dev/null; then
+    hold "session: Hyprland is not running for $DESKTOP_USER"
+    return
+  fi
+  if ! read_user_env; then
+    hold "session: cannot read $DESKTOP_USER's systemd manager environment"
+    return
+  fi
+  his=${uenv[HYPRLAND_INSTANCE_SIGNATURE]:-}
+  wd=${uenv[WAYLAND_DISPLAY]:-}
+  if [[ -z $his || -z $wd || ! -d /run/user/$uid/hypr/$his ]]; then
+    hold "session: the user manager has no live HYPRLAND_INSTANCE_SIGNATURE and WAYLAND_DISPLAY"
+    return
+  fi
+  if [[ ${uenv[OMARCHY_PATH]:-} != "$OMARCHY_ROOT" ]]; then
+    log warn "session: the session's OMARCHY_PATH is '${uenv[OMARCHY_PATH]:-}'; the update runs the packaged $OMARCHY_ROOT"
+  fi
+  log ok "session: $DESKTOP_USER is logged in (Hyprland ${his:0:12}..., $wd)"
+}
+
+gate_pin() {
+  local ignored pkg missing=()
+  ignored=" $(pacman-conf IgnorePkg 2>/dev/null | tr '\n' ' ') "
+  for pkg in $PIN_PACKAGES; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 || continue
+    [[ $ignored == *" $pkg "* ]] || missing+=("$pkg")
+  done
+  if (( ${#missing[@]} )); then
+    hold "pin: IgnorePkg in /etc/pacman.conf lacks ${missing[*]}: edge would replace the kitchen build (and its Secure Boot engine)"
+  else
+    log ok "pin: IgnorePkg holds $PIN_PACKAGES"
+  fi
+  if [[ -e $SB_MARKER && ! -x $SB_ENGINE ]]; then
+    hold "pin: Secure Boot is managed but $SB_ENGINE is missing (was the kitchen build replaced?)"
+  fi
+}
+
+gate_tripwire() {
+  local entry file needle broken=()
+  for entry in "${TRIPWIRE[@]}"; do
+    file=$OMARCHY_BIN/${entry%%|*}
+    needle=${entry#*|}
+    grep -qF -- "$needle" "$file" 2>/dev/null && continue
+    # Name each file once, however many of its needles are gone.
+    [[ " ${broken[*]} " == *" ${file##*/} "* ]] || broken+=("${file##*/}")
+  done
+  if (( ${#broken[@]} )); then
+    hold "tripwire: Omarchy internals this updater relies on changed in: ${broken[*]}; re-check kitchen-update against the new code"
+  else
+    log ok "tripwire: omarchy-update, -orphan-pkgs, -restart and -aur-pkgs behave as designed ($(sha256sum "$OMARCHY_BIN/omarchy-update" | cut -c1-12))"
+  fi
+}
+
+gate_migrations() {
+  local out rc
+  out=$(as_user timeout 60 "$OMARCHY_BIN/omarchy-migrate" --pending 2>&1)
+  rc=$?
+  case $rc in
+    1) log ok "migrations: none pending" ;;
+    0) hold "migrations: $(grep -c . <<<"$out") pending ($(head -n 3 <<<"$out" | paste -sd' ' -)): run omarchy update yourself" ;;
+    *) hold "migrations: omarchy-migrate --pending failed (exit $rc)" ;;
+  esac
+}
+
+sbctl_unsigned() {
+  sed 's/\x1b\[[0-9;]*m//g' | grep -E '^(✗|‼)' | grep -vE 'EFI/BOOT/BOOTX64\.EFI|/limine_history/'
+}
+
+gate_secureboot() {
+  local unsigned
+  if [[ ! -e $SB_MARKER ]]; then
+    sb_state=not-managed
+    log info "secureboot: not managed by Omarchy here; Secure Boot gates skipped"
+    return
+  fi
+  if [[ ! -x $SB_ENGINE ]]; then
+    sb_state=not-clean
+    hold "secureboot: the engine is missing"
+    return
+  fi
+  if systemctl list-units --no-legend --plain --state=activating 'omarchy-secureboot-watch@*' 2>/dev/null | grep -q .; then
+    hold "secureboot: a Secure Boot watcher is still running"
+  fi
+  if OMARCHY_PATH=$OMARCHY_ROOT timeout 180 "$SB_ENGINE" status --quiet >/dev/null 2>&1; then
+    sb_state=clean
+    log ok "secureboot: omarchy secureboot status is clean"
+  else
+    sb_state=not-clean
+    hold "secureboot: omarchy secureboot status is NOT clean: never update (or reboot) on top of that"
+  fi
+  unsigned=$(sbctl verify 2>/dev/null | sbctl_unsigned | paste -sd';' -)
+  if [[ -n $unsigned ]]; then
+    hold "secureboot: sbctl verify: $unsigned"
+  else
+    log ok "secureboot: sbctl verify: every active boot file is signed"
+  fi
+}
+
+# ---- the boot-check record -----------------------------------------------------------------
+# status.json is rewritten every slot, so a FAILED night's "do not reboot" would
+# be gone the next night that has nothing to install. The record keeps it until
+# the postflight's live boot checks (pacman's state, each kernel's UKI and
+# nvidia module, Secure Boot, the ESP) pass again.
+
+boot_record() { echo "$STATE_DIR/boot-check"; }
+
+# write_boot_record ACTION REASON...: a record that stands keeps its first
+# failure's night and date; its reasons and action are what fails now.
+write_boot_record() {
+  local action=$1 f tmp since night
+  shift
+  f=$(boot_record)
+  since=$(jq -r '.since // empty' "$f" 2>/dev/null)
+  night=$(jq -r '.night // empty' "$f" 2>/dev/null)
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/.boot-check.XXXXXX") || { log fail "boot-check: cannot write $f"; return 1; }
+  if ! { jq -n --arg night "${night:-$NIGHT}" --arg since "${since:-$(date -Iseconds)}" --arg action "$action" \
+    --argjson reasons "$(json_array "$@")" --arg log "$DAYLOG" --arg boot_id "$(cat /proc/sys/kernel/random/boot_id)" \
+    '{night: $night, since: $since, reasons: $reasons, action: $action, log: $log, boot_id: $boot_id}' >"$tmp" &&
+    chmod 0644 "$tmp" && mv -fT "$tmp" "$f"; }; then
+    rm -f -- "$tmp"
+    log fail "boot-check: cannot write $f"
+    return 1
+  fi
+  boot_check_json=$(jq -c . "$f")
+  log note "boot-check: recorded in $f; every slot holds until the boot checks pass again"
+}
+
+# Run the postflight's live boot checks. 0: they pass (the record is removed
+# unless KEEP=1); 1: they fail, and bootcheck.out holds the lines.
+run_boot_checks() {
+  local keep=${1:-0} rc
+  KITCHEN_UPDATE_CONF=$CONF "$LIB_DIR/postflight" --live-boot-only 2>&1 | relay bootcheck
+  rc=${PIPESTATUS[0]}
+  if (( rc == 0 )); then
+    (( keep )) || rm -f -- "$(boot_record)"
+    boot_check_json=null
+    return 0
+  fi
+  return 1
+}
+
+gate_boot_record() {
+  local f night first action lines=()
+  f=$(boot_record)
+  [[ -r $f ]] || return 0
+  night=$(jq -r '.night // "an earlier night"' "$f" 2>/dev/null)
+  boot_check_json=$(jq -c . "$f" 2>/dev/null || echo null)
+  if run_boot_checks "$MODE_DRY"; then
+    log ok "boot-check: the boot chain that failed its checks on $night passes them now$( (( MODE_DRY )) || echo '; record cleared')"
+  else
+    first=$(reasons_from bootcheck FAIL | head -n 1)
+    action="do NOT reboot: $(reasons_from bootcheck FAIL | boot_remedy); then sudo kitchen-update --boot-check"
+    hold "boot-check: the boot chain has failed its checks since $night and still does (${first:-see the log}). $action"
+    if (( ! MODE_DRY )); then
+      mapfile -t lines < <(reasons_from bootcheck FAIL)
+      write_boot_record "$action" "${lines[@]}"
+    fi
+  fi
+}
+
+# What to do at the machine about the boot checks that failed (their FAIL lines on stdin).
+boot_remedy() {
+  local lines kv r=()
+  lines=$(cat)
+  kv=$(sed -nE 's/^nvidia: no [^ ]+ module for ([^:]+):.*/\1/p' <<<"$lines" | head -n 1)
+  if grep -qE '^pacman:' <<<"$lines"; then
+    r+=("finish pacman's work first (the end of /var/log/pacman.log says where it stopped; remove /var/lib/pacman/db.lck only once no pacman runs), then run omarchy update")
+  fi
+  if grep -qE '^(dkms|nvidia):' <<<"$lines"; then
+    r+=("rebuild the nvidia module with sudo dkms autoinstall${kv:+ -k $kv}, then the UKI with sudo limine-mkinitcpio")
+  elif grep -qE '^(uki|kernel):' <<<"$lines"; then
+    r+=("rebuild and sign the UKI with sudo limine-mkinitcpio")
+  fi
+  if grep -qE '^secureboot:' <<<"$lines"; then
+    r+=("run omarchy secureboot status and do what it says")
+  fi
+  if grep -qE '^esp:' <<<"$lines"; then
+    r+=("free space on /boot")
+  fi
+  (( ${#r[@]} )) || r+=("read the log")
+  printf '%s' "${r[0]}"
+  (( ${#r[@]} == 1 )) || printf '; %s' "${r[@]:1}"
+  echo
+}
+
+# A private copy of the sync DBs: checkupdates syncs it, never the real ones.
+prepare_db() {
+  local repo
+  mkdir -p "$W/db/sync"
+  ln -sfn /var/lib/pacman/local "$W/db/local"
+  for repo in $(pacman-conf --repo-list 2>/dev/null); do
+    [[ ! -f /var/lib/pacman/sync/$repo.db ]] || cp -p "/var/lib/pacman/sync/$repo.db" "$W/db/sync/"
+  done
+}
+
+# 0 = updates pending, 2 = nothing to do, 1 = could not tell.
+gate_pending() {
+  local rc
+  prepare_db
+  CHECKUPDATES_DB=$W/db timeout 300 checkupdates --nocolor >"$W/pending.txt" 2>"$W/pending.err"
+  rc=$?
+  case $rc in
+    0)
+      pending_count=$(grep -c . "$W/pending.txt")
+      log ok "pending: $pending_count repo updates: $(awk '{ print $1 }' "$W/pending.txt" | paste -sd' ' -)"
+      return 0
+      ;;
+    2)
+      pending_count=0
+      log ok "pending: nothing to update"
+      return 2
+      ;;
+    *)
+      busy "pending: checkupdates failed (exit $rc; mirror or network): $(head -n 1 "$W/pending.err")"
+      return 1
+      ;;
+  esac
+}
+
+# ---- stages -------------------------------------------------------------------------------
+
+stage_static() {
+  log head "S1 static gates"
+  gate_session
+  gate_pin
+  gate_tripwire
+  gate_migrations
+  gate_secureboot
+  gate_boot_record
+  gate_pending
+  pending_rc=$?
+}
+
+stage_activity() {
+  local args=() rc
+  log head "S2 activity (safe-to-update)"
+  (( MODE_DRY )) && args+=(--all)
+  [[ -z $QUIET_OVERRIDE ]] || args+=(--quiet-secs "$QUIET_OVERRIDE")
+  KITCHEN_UPDATE_CONF=$CONF "$LIB_DIR/safe-to-update" "${args[@]}" 2>&1 | relay activity
+  rc=${PIPESTATUS[0]}
+  case $rc in
+    0) ;;
+    75) mapfile -t -O "${#busys[@]}" busys < <(reasons_from activity BUSY) ;;
+    2)
+      mapfile -t -O "${#holds[@]}" holds < <(reasons_from activity HARD)
+      mapfile -t -O "${#busys[@]}" busys < <(reasons_from activity BUSY)
+      ;;
+    *) hold "activity: safe-to-update failed (exit $rc)" ;;
+  esac
+  return "$rc"
+}
+
+stage_preflight() {
+  local args=() rc
+  log head "S3 compatibility (preflight)"
+  (( MODE_DRY )) && args+=(--dry-run)
+  KITCHEN_UPDATE_CONF=$CONF "$LIB_DIR/preflight" "${args[@]}" "$W" 2>&1 | relay preflight
+  rc=${PIPESTATUS[0]}
+  mapfile -t -O "${#holds[@]}" holds < <(reasons_from preflight HOLD)
+  mapfile -t -O "${#busys[@]}" busys < <(reasons_from preflight RETRY)
+  mapfile -t -O "${#cares[@]}" cares < <(reasons_from preflight CARE)
+  case $rc in
+    0 | 10 | 20 | 30 | 40) ;;
+    *) hold "preflight: failed itself (exit $rc)" ;;
+  esac
+  return "$rc"
+}
+
+# ---- S5: the update, as the user ----------------------------------------------------------
+
+# In a child that is about to become something else: let go of the slot lock.
+close_lock() {
+  [[ -z $LOCK_FD ]] || exec {LOCK_FD}>&-
+}
+
+# Root's copy of the update's output, line by line, and the AUR guard. Omarchy's
+# AUR phase comes last and builds third-party PKGBUILDs with yay; its sudo
+# wrapper only adds -N, so the group rule would still match. The preflight holds
+# on AUR updates, but one can appear in the hour between; so the moment the
+# phase's header shows, the rule is removed, before yay has asked the AUR
+# anything. Nothing after that phase needs sudo (omarchy-update's own comments),
+# and a build that does asks for a password nobody types, and fails.
+copy_output() {
+  local line guarded=0
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    if (( ! guarded )) && [[ $line == "$AUR_HEADER" ]]; then
+      guarded=1
+      rm -f -- "$(grant_file)"
+      date +%T >"$W/aur-guard"
+      log note "aur: Omarchy's AUR phase is starting; the sudo grant is removed now, so no AUR build runs with root"
+    fi
+  done
+}
+
+# A block-mode shutdown inhibitor while packages install. Omarchy's own
+# inhibitor covers sleep and idle only, and a reboot from the power menu stops
+# pacman's scope with SIGTERM, which pacman neither catches nor ignores: it
+# would die mid-transaction. logind refuses the desktop user's reboot and
+# poweroff while this is held; root's `systemctl reboot` still goes through.
+inhibit_start() {
+  (
+    close_lock
+    exec systemd-inhibit --what=shutdown --mode=block --who=kitchen-update \
+      --why="Nightly update installing packages: don't restart or power off until it says it is done" \
+      sleep infinity
+  ) </dev/null >/dev/null 2>"$W/inhibit.err" &
+  inhibit_pid=$!
+  for _ in {1..20}; do
+    if systemd-inhibit --list --no-legend --no-pager 2>/dev/null | grep -q kitchen-update; then
+      log ok "run: restart and power off are held off while the update runs (logind shutdown inhibitor)"
+      return 0
+    fi
+    kill -0 "$inhibit_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  log warn "run: no shutdown inhibitor ($(head -n 1 "$W/inhibit.err" 2>/dev/null || echo 'logind did not list it')); a reboot from the menu would not be held off"
+  inhibit_stop
+}
+
+inhibit_stop() {
+  [[ -n $inhibit_pid ]] || return 0
+  kill "$inhibit_pid" 2>/dev/null
+  wait "$inhibit_pid" 2>/dev/null
+  inhibit_pid=""
+}
+
+run_update() {
+  local started out_fd out_pid update_pid
+  log head "S5 omarchy update -y as $DESKTOP_USER"
+  build_run
+  # A root-owned leftover would stop the user's tee from writing the log that
+  # omarchy-update-analyze-logs reads, so it would judge a stale one.
+  if [[ -e /tmp/omarchy-update.log && $(stat -c %u /tmp/omarchy-update.log) != "$uid" ]]; then
+    log warn "run: removing /tmp/omarchy-update.log, which $DESKTOP_USER does not own"
+    rm -f /tmp/omarchy-update.log
+  fi
+  pacman_from=$(( $(wc -l <"$PACMAN_LOG") + 1 ))
+  log info "run: pacman.log from line $pacman_from; timeout $UPDATE_TIMEOUT (+$UPDATE_KILL_AFTER)"
+  log info "run: $(shell_words "${run_cmd[@]}")"
+  # From here the night owes a result. If the run is cut off before it writes
+  # one, the stop hook (or the next slot) finds RUNNING and records FAILED.
+  write_status RUNNING
+  update_started=1
+  inhibit_start
+  toast low "Nightly update running" "kitchen-sink is installing updates. Don't restart or power off until the next notification says it is done; the power menu's restart and shutdown are held off until then." 0
+  started=$(date +%s)
+  echo "---- omarchy-update output ----" >>"$DAYLOG"
+  # Root's copy goes to the day log, the journal and the postflight's input. It
+  # is a separate copier rather than a pipe we wait on: a background process
+  # that inherited the output (a hook starting a daemon, say) must not keep the
+  # night from finishing once omarchy-update itself has exited. Neither it nor
+  # the update inherits the slot lock: a process that outlived the run holding
+  # it would make every later slot exit at S0.
+  exec {out_fd}> >(close_lock; strip_ansi | tee -a "$DAYLOG" "$W/update.out" | copy_output)
+  out_pid=$!
+  # In the background and waited for, so a TERM (systemctl stop, the unit's
+  # timeout) runs our trap at once, rather than after the update returns.
+  (close_lock; cd "$home" && exec "${run_cmd[@]}") </dev/null >&"$out_fd" 2>&1 &
+  update_pid=$!
+  wait "$update_pid"
+  update_rc=$?
+  exec {out_fd}>&-
+  for _ in {1..30}; do
+    kill -0 "$out_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$out_pid" 2>/dev/null; then
+    log warn "run: something the update started still holds its output open; not waiting for it"
+  fi
+  echo "---- end of omarchy-update output ----" >>"$DAYLOG"
+  if (( update_rc == 0 )); then
+    log ok "run: omarchy-update finished in $(( ($(date +%s) - started) / 60 )) min"
+  elif (( update_rc == 124 || update_rc == 137 )); then
+    log fail "run: omarchy-update timed out after $UPDATE_TIMEOUT (exit $update_rc)"
+  else
+    log fail "run: omarchy-update exited $update_rc after $(( ($(date +%s) - started) / 60 )) min"
+  fi
+}
+
+# ---- S8: does it need a reboot? -------------------------------------------------------------
+reboot_add() {
+  reboot_reasons+=("$2")
+  if [[ $1 == "needed" || $reboot_level == "none" ]]; then reboot_level=$1; fi
+}
+
+reboot_check() {
+  local running k kv found=0 installed=() pid exe uki_builds=0 loader_signed=0 key value
+  local carried_level=$reboot_level carried=("${reboot_reasons[@]}") r
+  reboot_level=none reboot_reasons=()
+  running=$(uname -r)
+  for k in /usr/lib/modules/*/vmlinuz; do
+    [[ -f $k ]] || continue
+    pacman -Qqo "$k" >/dev/null 2>&1 || continue
+    kv=${k%/vmlinuz}
+    kv=${kv##*/}
+    installed+=("$kv")
+    [[ $kv != "$running" ]] || found=1
+  done
+  if (( ${#installed[@]} && ! found )); then
+    reboot_add needed "kernel updated: running $running, installed ${installed[*]}"
+  fi
+  [[ ! -f $home/.local/state/omarchy/reboot-required ]] || reboot_add needed "Omarchy marked a reboot as required"
+  pid=$(pgrep -u "$uid" -x Hyprland | head -n 1)
+  exe=$(readlink "/proc/${pid:-0}/exe" 2>/dev/null)
+  [[ $exe != *"(deleted)"* ]] || reboot_add needed "Hyprland was updated"
+
+  if [[ -r $W/postflight.facts ]]; then
+    while IFS='=' read -r key value; do
+      case $key in
+        uki_builds) uki_builds=$value ;;
+        loader_signed) loader_signed=$value ;;
+      esac
+    done <"$W/postflight.facts"
+  fi
+  if [[ $reboot_level == "none" ]]; then
+    (( uki_builds == 0 )) || reboot_add recommended "the UKI was rebuilt"
+    (( loader_signed == 0 )) || reboot_add recommended "the Limine loader was re-signed"
+  fi
+
+  # A reboot still owed from an earlier night stands, with its reasons and its date.
+  if [[ $carried_level != "none" ]]; then
+    for r in "${carried[@]}"; do
+      printf '%s\n' "${reboot_reasons[@]}" | grep -qxF -- "$r" || reboot_add "$carried_level" "$r"
+    done
+  fi
+
+  # Kept until the machine boots again, so the check-up can say "reboot pending since".
+  if [[ $reboot_level != "none" ]]; then
+    jq -n --arg since "${reboot_since:-$(date -Iseconds)}" --arg level "$reboot_level" \
+      --argjson reasons "$(json_array "${reboot_reasons[@]}")" --arg boot_id "$(cat /proc/sys/kernel/random/boot_id)" \
+      '{since: $since, level: $level, reasons: $reasons, boot_id: $boot_id}' >"$STATE_DIR/reboot-pending"
+    log note "reboot: $reboot_level: ${reboot_reasons[*]} (never automatic; the LUKS passphrase is typed at the machine)"
+  else
+    log ok "reboot: not needed"
+  fi
+}
+
+# A reboot recorded earlier and not yet done still stands tonight.
+carry_reboot_pending() {
+  local f=$STATE_DIR/reboot-pending
+  [[ -r $f ]] || return 0
+  if [[ $(jq -r '.boot_id // ""' "$f" 2>/dev/null) != "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
+    rm -f -- "$f"
+    return 0
+  fi
+  reboot_level=$(jq -r '.level // "none"' "$f")
+  reboot_since=$(jq -r '.since // ""' "$f")
+  mapfile -t reboot_reasons < <(jq -r '.reasons[]?' "$f")
+}
+
+# ---- modes -------------------------------------------------------------------------------------
+
+setup_common() {
+  if (( EUID != 0 )); then
+    echo "kitchen-update: run as root" >&2
+    exit 2
+  fi
+  load_conf
+  if ! load_user; then
+    echo "kitchen-update: user $DESKTOP_USER does not exist" >&2
+    exit 2
+  fi
+  kgid=$(group_gid)
+  # A dry run writes nothing: it reads the state directory only if it exists.
+  [[ $MODE == "dry-run" ]] || mkdir -p "$RUN_DIR" "$STATE_DIR"
+}
+
+make_workdir() {
+  # 0755: pacman hands downloads to its sandbox user, which must reach the DB.
+  W=$(mktemp -d /tmp/kitchen-update.XXXXXX) || { log fail "cannot create a work dir"; exit 2; }
+  chmod 0755 "$W"
+}
+
+# The update started and the run ended without a result: stopped, killed, the
+# unit's timeout, a crash or a power cut. Record FAILED for its night, keep a
+# boot-check record (the postflight never judged the boot chain), and toast.
+record_interrupted() {
+  local why=$1 action
+  notes+=("$why")
+  action="do NOT reboot yet: read $DAYLOG, then check the end of /var/log/pacman.log and omarchy secureboot status at the machine; sudo kitchen-update --boot-check re-runs the boot checks"
+  log fail "$why; recording FAILED"
+  write_boot_record "$action" "the update was cut off before its boot checks ran: $why"
+  write_status FAILED "$action"
+  toast critical "Nightly update interrupted - do not reboot yet" "$why. Read $DAYLOG before rebooting; sudo kitchen-update --boot-check re-runs the boot checks."
+}
+
+# A RUNNING status with no run behind it (the lock is ours): that run was cut
+# off. Record it as FAILED under its own night, log and pending list.
+recover_running() {
+  local why=$1 f=$STATE_DIR/status.json since tmpw keep_night=$NIGHT keep_log=$DAYLOG keep_w=$W
+  [[ $(jq -r '.state // empty' "$f" 2>/dev/null) == "RUNNING" ]] || return 1
+  since=$(jq -r '.time // "?"' "$f")
+  NIGHT=$(jq -r '.night // empty' "$f")
+  NIGHT=${NIGHT:-$keep_night}
+  DAYLOG=$(jq -r '.log // empty' "$f")
+  DAYLOG=${DAYLOG:-$LOG_DIR/$NIGHT.log}
+  pacman_from=$(jq -r '.pacman_from // empty' "$f")
+  pending_count=$(jq -r '.pending | length' "$f" 2>/dev/null || echo -1)
+  tmpw=$(mktemp -d) || return 1
+  jq -r '.pending[]?' "$f" >"$tmpw/pending.txt" 2>/dev/null
+  W=$tmpw
+  record_interrupted "$why (the update started at $since)"
+  rm -rf -- "$tmpw"
+  W=$keep_w NIGHT=$keep_night DAYLOG=$keep_log
+  pacman_from="" pending_count=-1 notes=() state_written=0
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  inhibit_stop
+  if (( grant_live )); then
+    log warn "exit: revoking the grant on the way out"
+    grant_revoke || rc=1
+  fi
+  if [[ $MODE == "run" ]] && (( update_started && ! state_written )); then
+    # The update may still be running (a TERM during S5): it is over for us.
+    kill_carriers
+    record_interrupted "kitchen-update stopped (exit $rc) after the update had started"
+    rc=1
+  fi
+  [[ -z $W || ! -d $W ]] || rm -rf -- "$W"
+  exit "$rc"
+}
+
+# ExecStopPost, after systemd has killed what was left in the unit's cgroup.
+mode_revoke() {
+  setup_common
+  local revoked=0 have_lock=1 state w
+  mkdir -p "$LOG_DIR"
+  DAYLOG=$LOG_DIR/$NIGHT.log
+  exec {LOCK_FD}>>"$LOCK_FILE"
+  if ! flock -n "$LOCK_FD"; then
+    have_lock=0
+    log warn "revoke: a kitchen-update run is in progress; revoking its grant anyway, and leaving its own processes to it"
+  fi
+  grant_revoke && revoked=1
+  # Whatever still carries the group escaped the unit (or outlived a killed
+  # run): kill it, or the next night's rule would give it root.
+  if (( have_lock )); then kill_carriers; else kill_carriers /kitchen-update.service; fi
+  if (( have_lock )) && recover_running "kitchen-update was stopped or killed after the update had started"; then
+    :
+  elif (( have_lock && grant_had )); then
+    # The run revokes its own grant in S6, so finding one here means it never
+    # got there. Record that for the night unless the run already did.
+    state=$(jq -r --arg n "$NIGHT" 'select(.night == $n) | .state' "$STATE_DIR/status.json" 2>/dev/null)
+    if [[ $state != "FAILED" ]]; then
+      if (( revoked )); then grant_state=revoked; else grant_state=present; fi
+      (( revoked )) || notes+=("the grant could not be removed")
+      record_interrupted "kitchen-update ended without revoking its sudo grant (stopped or killed mid-run); the grant was removed afterwards"
+    fi
+  fi
+  # A night already written keeps its state; the kills are added to it.
+  if (( ! state_written )); then
+    for w in "${warnings[@]}"; do amend_status "$w"; done
+  fi
+  if (( revoked )); then
+    exit 0
+  fi
+  toast critical "kitchen-update: sudo grant still present" "$(grant_file) could not be removed or still grants root. Remove it by hand: sudo rm $(grant_file)"
+  exit 1
+}
+
+# Re-run the boot checks now, as the next slot would, and clear the record a
+# failed night left if they pass. For after a fix at the machine.
+mode_boot_check() {
+  setup_common
+  local f night="" lines=()
+  exec {LOCK_FD}>>"$LOCK_FILE"
+  if ! flock -n "$LOCK_FD"; then
+    echo "kitchen-update: a run is in progress; try again later" >&2
+    exit 2
+  fi
+  make_workdir
+  trap on_exit EXIT
+  f=$(boot_record)
+  if [[ -r $f ]]; then
+    night=$(jq -r '.night // "an earlier night"' "$f" 2>/dev/null)
+    log head "boot checks: re-checking the boot chain that failed its checks on $night"
+  else
+    log head "boot checks: no failed night on record; checking anyway"
+  fi
+  if run_boot_checks; then
+    log head "boot checks: passed${night:+; the record from $night is cleared}"
+    exit 0
+  fi
+  log fail "boot checks: FAILED${night:+; the record from $night stays, and every slot holds until they pass}. At the machine: $(reasons_from bootcheck FAIL | boot_remedy)"
+  if [[ -n $night ]]; then
+    mapfile -t lines < <(reasons_from bootcheck FAIL)
+    write_boot_record "do NOT reboot: $(reasons_from bootcheck FAIL | boot_remedy); then sudo kitchen-update --boot-check" "${lines[@]}"
+  fi
+  exit 1
+}
+
+mode_grant_test() {
+  setup_common
+  local lock_fd before during after out rc failed=0
+  exec {lock_fd}>>"$LOCK_FILE"
+  if ! flock -n "$lock_fd"; then
+    echo "kitchen-update: a run is in progress; try again later" >&2
+    exit 2
+  fi
+  trap on_exit EXIT
+  log head "grant test for %$GRANT_GROUP as $DESKTOP_USER (sudo $(sudo -V | head -n 1 | awk '{ print $3 }'))"
+  before=$(sudo -l -U "$DESKTOP_USER" 2>&1)
+
+  if ! grant_create "$GRANT_TEST_MINUTES"; then
+    grant_revoke
+    exit 1
+  fi
+  log info "grant: $(tail -n 1 "$(grant_file)")"
+  grant_selftest || failed=1
+
+  # The update's own grandchildren inherit the group, even after sudo -k.
+  if setpriv --reuid="$uid" --regid="$gid" --groups="$(user_groups),$kgid" -- env -i PATH=/usr/bin:/bin \
+    /bin/bash -c "sudo -k; /bin/bash -c '/usr/bin/sudo -n -N /usr/bin/true $PROBE_TAG'" >/dev/null 2>&1; then
+    log ok "grant: a grandchild of the grouped process gets sudo -n too, after sudo -k"
+  else
+    log fail "grant: a grandchild of the grouped process was refused"
+    failed=1
+  fi
+
+  # The user can't join the group: it has no members and no group password.
+  out=$(printf 'id -G\nexit\n' | timeout 10 setsid -w setpriv --reuid="$uid" --regid="$gid" --init-groups -- \
+    env -i PATH=/usr/bin:/bin /usr/bin/newgrp "$GRANT_GROUP" 2>&1)
+  rc=$?
+  if (( rc == 0 )) && grep -qw -- "$kgid" <<<"$out"; then
+    log fail "grant: newgrp $GRANT_GROUP let $DESKTOP_USER join the group"
+    failed=1
+  else
+    log ok "grant: newgrp $GRANT_GROUP is refused for $DESKTOP_USER (exit $rc: $(tr '\n' ' ' <<<"$out" | cut -c1-80))"
+  fi
+
+  during=$(sudo -l -U "$DESKTOP_USER" 2>&1)
+  if [[ $during == "$before" ]]; then
+    log ok "grant: sudo -l -U $DESKTOP_USER is unchanged while the rule is in place"
+  else
+    log fail "grant: sudo -l -U $DESKTOP_USER changed while the rule is in place"
+    failed=1
+  fi
+
+  grant_revoke || failed=1
+  after=$(sudo -l -U "$DESKTOP_USER" 2>&1)
+  if [[ -e $(grant_file) ]]; then
+    log fail "grant: $(grant_file) is still there"
+    failed=1
+  fi
+  if [[ $after == "$before" ]]; then
+    log ok "grant: sudo -l -U $DESKTOP_USER is the same as before the test"
+  else
+    log fail "grant: sudo -l -U $DESKTOP_USER differs from before the test"
+    failed=1
+  fi
+  if (( failed )); then
+    log fail "grant test: FAILED"
+    exit 1
+  fi
+  log head "grant test: passed"
+  exit 0
+}
+
+# Evaluate and print everything a real run would, without granting or updating.
+mode_dry_run() {
+  setup_common
+  local lock_fd settled until rc_act=0 rc_pre=0 verdict v
+  trap on_exit EXIT
+  make_workdir
+  log head "DRY RUN for night $NIGHT: every gate is evaluated and printed; nothing is granted, installed or written"
+
+  log head "S0 entry"
+  exec {lock_fd}>>"$LOCK_FILE"
+  if flock -n "$lock_fd"; then log ok "lock: no other kitchen-update is running"; else log warn "lock: a kitchen-update run is in progress"; fi
+  if settled=$(settled_state); then
+    log info "night: tonight is already settled ($settled): a timer run would exit here"
+  else
+    log ok "night: not settled yet"
+  fi
+  if [[ -e $RUN_DIR/force-idle ]]; then
+    log info "force-idle: $RUN_DIR/force-idle is present: a real run would consume it and skip S2 once (evaluated anyway below)"
+  fi
+  [[ ! -e $(grant_file) ]] || log warn "entry: $(grant_file) exists: a real run would remove it as a leftover"
+  if [[ -n $(gid_carriers) ]]; then
+    log warn "entry: processes carry the $GRANT_GROUP group: $(gid_carriers | carrier_summary); a real run would kill them"
+  fi
+  if [[ $(jq -r '.state // empty' "$STATE_DIR/status.json" 2>/dev/null) == "RUNNING" ]]; then
+    log warn "entry: status.json says RUNNING with no run behind it: a real run would record that night as FAILED"
+  fi
+
+  stage_static
+  stage_activity
+  rc_act=$?
+  stage_preflight
+  rc_pre=$?
+
+  log head "S4 grant (not written in a dry run)"
+  if [[ -n $kgid ]]; then
+    until=$(date -u -d "+$GRANT_MINUTES min" +%Y%m%d%H%M%SZ)
+    log info "grant: would write $(grant_file), mode 0440, via a dotted temp file, visudo -cf, mv -fT:"
+    log info "grant:   $(grant_rule "$until")"
+    if group_is_empty; then log ok "grant: group $GRANT_GROUP (gid $kgid) has no members"; else hold "grant: group $GRANT_GROUP has members"; fi
+    if [[ -z $(gid_carriers) ]]; then log ok "grant: no process carries the group"; else log warn "grant: processes carry the group; S0 of a real run kills them before S4"; fi
+  else
+    hold "grant: group $GRANT_GROUP does not exist (systemd-sysusers /etc/sysusers.d/kitchen-update.conf)"
+    kgid=GID-OF-$GRANT_GROUP
+  fi
+
+  log head "S5 would run, as $DESKTOP_USER with the $GRANT_GROUP group added, from $home:"
+  (( ${#uenv[@]} )) || read_user_env || log warn "run: the user manager's environment is unavailable; showing defaults"
+  build_run
+  log info "environment (env -i, whitelisted from the user manager; identity, runtime paths and OMARCHY_PATH pinned):"
+  for v in "${run_env[@]}"; do log info "  $v"; done
+  log info "command:"
+  log info "  $(shell_words "${run_cmd[@]}")"
+  log info "stdout+stderr: the user's tee writes /tmp/omarchy-update.log; root appends to $LOG_DIR/$NIGHT.log and the journal"
+  log info "while it runs: status.json says RUNNING, a logind shutdown inhibitor holds off restart and power off, and the grant is removed the moment Omarchy's '$AUR_HEADER' phase starts"
+  log info "after it: the grant is revoked and proven gone, and every process still carrying the $GRANT_GROUP group is killed"
+
+  # What a real run would have concluded, by the same priorities.
+  if (( ${#holds[@]} )); then
+    verdict="HELD"
+  elif (( pending_rc == 2 )) || (( rc_pre == 30 )); then
+    verdict="UP-TO-DATE"
+  elif (( ${#busys[@]} )) || (( rc_act == 75 || rc_pre == 40 || pending_rc == 1 )); then
+    # Both mean busy. A dry run in the daytime lands on DEFERRED: with the timer
+    # off, any time after LAST_SLOT counts as the night's last slot.
+    if last_slot; then
+      verdict="DEFERRED (busy, and no slot is left tonight: a real run now would wait for tomorrow night)"
+    else
+      verdict="BUSY (the next slot tries again)"
+    fi
+  else
+    verdict="GO: the grant, the update and the postflight would follow"
+    (( ${#cares[@]} == 0 )) || verdict+=" (with care: ${#cares[@]} boot-chain note(s))"
+  fi
+  log head "DRY RUN VERDICT: $verdict"
+  (( ${#holds[@]} == 0 )) || for v in "${holds[@]}"; do log hold "  $v"; done
+  (( ${#busys[@]} == 0 )) || for v in "${busys[@]}"; do log busy "  $v"; done
+  exit 0
+}
+
+mode_run() {
+  setup_common
+  local settled rc title body boot_fail=0 line action remedy boot_lines=()
+  mkdir -p "$LOG_DIR"
+  DAYLOG=$LOG_DIR/$NIGHT.log
+  trap on_exit EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+
+  # ---- S0: entry
+  exec {LOCK_FD}>>"$LOCK_FILE"
+  if ! flock -n "$LOCK_FD"; then
+    log note "entry: another kitchen-update holds $LOCK_FILE; this slot does nothing"
+    exit 0
+  fi
+  log head "kitchen-update slot $(date +%H:%M) for night $NIGHT"
+  # The lock is ours, so no run is in progress: a grant, a process carrying the
+  # group or a RUNNING status can only be what a run that was cut off left.
+  if [[ -e $(grant_file) ]]; then
+    log warn "entry: a sudo grant was left behind by a run that did not finish; removing it"
+    grant_revoke
+  fi
+  kill_carriers
+  recover_running "the last run was cut off after its update had started, and nothing recorded how it ended (a crash or a power cut?)"
+  if [[ -e $RUN_DIR/force-idle && $(stat -c %u "$RUN_DIR/force-idle") == "0" ]]; then
+    rm -f -- "$RUN_DIR/force-idle"
+    skip_activity=1
+    log note "entry: $RUN_DIR/force-idle consumed: supervised run, the activity check is skipped once"
+  elif settled=$(settled_state); then
+    log info "entry: tonight is already settled ($settled); a supervised run (force-idle) starts a fresh attempt"
+    # Keep what the entry had to clean up with the night it belongs to.
+    for line in "${warnings[@]}"; do amend_status "$line"; done
+    exit 0
+  fi
+  carry_reboot_pending
+  make_workdir
+
+  # ---- S1: static gates
+  stage_static
+  if (( ${#holds[@]} )); then
+    end_night HELD "fix the held gate, or run omarchy update yourself"
+  fi
+  case $pending_rc in
+    2) end_night UP-TO-DATE ;;
+    1) end_busy ;;
+  esac
+
+  # ---- S2: activity
+  if (( skip_activity )); then
+    log head "S2 activity: skipped once (force-idle)"
+  else
+    stage_activity
+    rc=$?
+    case $rc in
+      0) ;;
+      75) end_busy ;;
+      *) end_night HELD "a stale pacman lock or a broken activity check needs a human" ;;
+    esac
+  fi
+
+  # ---- S3: compatibility
+  stage_preflight
+  rc=$?
+  case $rc in
+    0 | 10) ;;
+    30) end_night UP-TO-DATE ;;
+    40) end_busy ;;
+    *) end_night HELD "read the HOLD lines; most clear after you run omarchy update yourself" ;;
+  esac
+  [[ ! -r $W/news-checked-at ]] || news_checked_at=$(<"$W/news-checked-at")
+
+  # ---- S4: grant
+  log head "S4 grant"
+  if ! grant_create "$GRANT_MINUTES" || ! grant_selftest; then
+    grant_revoke
+    hold "grant: the sudo grant could not be created or failed its self-test${grant_error:+: $grant_error}"
+    end_night HELD "run sudo kitchen-update --grant-test and read its output"
+  fi
+
+  # ---- S5: the update
+  run_update
+
+  # ---- S6: revoke
+  log head "S6 revoke"
+  if ! grant_revoke; then
+    notes+=("the sudo grant is still present after the run")
+    toast critical "Nightly update: sudo grant still present" "$(grant_file) could not be removed after tonight's update. Remove it by hand: sudo rm $(grant_file)"
+  fi
+  # The update is over, so nothing may carry the group any more: not a daemon a
+  # hook left in this unit, and not an app it relaunched into the user's session.
+  kill_carriers || notes+=("group: a process still carries the $GRANT_GROUP group after SIGKILL; the next night's grant is refused until it is gone")
+  if [[ -e $W/aur-guard ]] && (( update_rc != 0 )); then
+    notes=("aur: an AUR update came up after the preflight; the grant was removed when Omarchy's AUR phase began ($(<"$W/aur-guard")), so its build was most likely refused sudo: update AUR packages by hand" "${notes[@]}")
+  fi
+
+  # ---- S7: postflight
+  log head "S7 postflight"
+  KITCHEN_UPDATE_CONF=$CONF "$LIB_DIR/postflight" --from "$pacman_from" --workdir "$W" \
+    --update-rc "$update_rc" --update-log "$W/update.out" --pacman-log "$PACMAN_LOG" 2>&1 | relay postflight
+  post_rc=${PIPESTATUS[0]}
+  # The postflight has waited for pacman: restarting is no longer a risk to it.
+  inhibit_stop
+  [[ -e $SB_MARKER ]] && sb_state=clean
+  if grep -qE '^FAIL +secureboot:' "$W/postflight.out" 2>/dev/null; then sb_state=not-clean; fi
+  while IFS= read -r line; do
+    notes+=("$line")
+    if [[ $line =~ ^(pacman|uki|kernel|nvidia|dkms|secureboot|esp): ]]; then
+      boot_fail=1
+      boot_lines+=("$line")
+    fi
+  done < <(reasons_from postflight FAIL)
+  # No pre-update snapshot is a warning on any night: there is no way back.
+  mapfile -t -O "${#warnings[@]}" warnings < <(reasons_from postflight WARN | grep '^snapshot:')
+
+  # ---- S8: reboot check
+  log head "S8 reboot check"
+  reboot_check
+
+  # ---- S9: record and notify
+  if (( update_rc == 0 && post_rc == 0 )) && [[ $grant_state != "present" ]]; then
+    printf '%s\n' "${news_checked_at:-$(date -Iseconds)}" >"$STATE_DIR/.last-success" &&
+      mv -fT "$STATE_DIR/.last-success" "$STATE_DIR/last-success"
+    local n
+    n=$(upgraded_lines | grep -c .)
+    # The check-up counts the packages from "upgraded"; a DONE night's reasons
+    # carry what the postflight only warned about (new failed units, config
+    # errors), and its warnings what needs a look (no snapshot, killed processes).
+    mapfile -t notes < <(reasons_from postflight WARN | grep -v '^snapshot:')
+    body="$n packages updated. "
+    case $reboot_level in
+      needed) body+="Reboot needed (${reboot_reasons[*]}); the LUKS passphrase is typed at the machine. " ;;
+      recommended) body+="Reboot recommended while you are at the machine (${reboot_reasons[*]}). " ;;
+      *) body+="No reboot needed. " ;;
+    esac
+    [[ $sb_state != "clean" ]] || body+="Secure Boot: clean. "
+    (( ${#warnings[@]} == 0 )) || body+="Look at: ${warnings[0]}$( (( ${#warnings[@]} > 1 )) && echo " (and $(( ${#warnings[@]} - 1 )) more in the log)")"
+    toast normal "kitchen-sink updated overnight" "${body% }"
+    end_night DONE
+  fi
+
+  (( ${#notes[@]} )) || notes=("omarchy-update exited $update_rc")
+  if (( boot_fail )); then
+    remedy=$(printf '%s\n' "${boot_lines[@]}" | boot_remedy)
+    action="do NOT reboot: $remedy; then sudo kitchen-update --boot-check (read $DAYLOG)"
+    write_boot_record "$action" "${boot_lines[@]}"
+    title="Nightly update FAILED - DO NOT REBOOT"
+    body="The boot chain did not pass its checks: $(printf '%s; ' "${notes[@]:0:3}")At the machine: $remedy. Details: $DAYLOG"
+  else
+    action="read $DAYLOG before rebooting"
+    title="Nightly update FAILED"
+    body="$(printf '%s; ' "${notes[@]:0:3}")The boot checks passed. Read $DAYLOG before rebooting."
+  fi
+  toast critical "$title" "$body"
+  end_night FAILED "$action"
+}
+
+main() {
+  local arg
+  MODE_DRY=0
+  if [[ -n ${JOURNAL_STREAM:-} && $(stat -L -c '%d:%i' "/proc/$$/fd/1" 2>/dev/null) == "$JOURNAL_STREAM" ]]; then
+    JOURNAL_OUT=1
+  fi
+  while (( $# )); do
+    arg=$1
+    case $arg in
+      --dry-run) MODE=dry-run MODE_DRY=1 ;;
+      --quiet-secs)
+        [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "kitchen-update: --quiet-secs needs a number of seconds" >&2; exit 2; }
+        QUIET_OVERRIDE=$2
+        shift
+        ;;
+      --grant-test) MODE=grant-test ;;
+      --revoke) MODE=revoke ;;
+      --boot-check) MODE=boot-check ;;
+      -h | --help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; exit 0 ;;
+      *) echo "kitchen-update: unknown argument: $arg (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  if [[ -n $QUIET_OVERRIDE && $MODE != "dry-run" ]]; then
+    echo "kitchen-update: --quiet-secs only goes with --dry-run (a real run uses QUIET_SECS, or force-idle)" >&2
+    exit 2
+  fi
+  case $MODE in
+    run) mode_run ;;
+    dry-run) mode_dry_run ;;
+    grant-test) mode_grant_test ;;
+    revoke) mode_revoke ;;
+    boot-check) mode_boot_check ;;
+  esac
+}
+
+# Sourcing this file (the tests do) defines the functions without running anything.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

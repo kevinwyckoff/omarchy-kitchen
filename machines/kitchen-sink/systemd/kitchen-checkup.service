@@ -1,0 +1,29 @@
+# /etc/systemd/system/kitchen-checkup.service
+# The daily read-only check-up. See /usr/local/sbin/kitchen-checkup.
+[Unit]
+Description=kitchen-sink daily check-up (read-only)
+Wants=network-online.target
+After=network-online.target time-sync.target
+# Report on the night's update rather than race it: when both are queued
+# together (a catch-up at boot), the check-up waits for the update to end.
+After=kitchen-update.service
+
+[Service]
+Type=oneshot
+# Root, because it reads the NVMe SMART log (admin ioctl), btrfs device stats,
+# the Secure Boot engine's status and /etc/sudoers.d, and uses runuser for the
+# toast. It writes only its own report, state and cache directories below.
+ExecStart=/usr/local/sbin/kitchen-checkup
+# WARN (1) and FAIL (2) are results, reported in the journal, the report and
+# the toast. Only 3, the check-up itself breaking, leaves the unit failed.
+SuccessExitStatus=1 2
+SyslogIdentifier=kitchen-checkup
+LogsDirectory=kitchen-checkup
+LogsDirectoryMode=0755
+StateDirectory=kitchen-checkup
+CacheDirectory=kitchen-checkup
+Nice=10
+IOSchedulingClass=idle
+# The Secure Boot status is capped at 180 s and checkupdates at 120 s, and the
+# toast waits up to 3 minutes for a session; this is the backstop.
+TimeoutStartSec=15min

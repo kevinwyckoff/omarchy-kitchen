@@ -1,0 +1,1 @@
+{"type":"a(ssssuu)","data":[[["sleep","Omarchy","Lock screen before suspend","delay",1000,2718],["sleep","UPower","Pause device polling","delay",0,2546],["sleep","NetworkManager","NetworkManager needs to turn off networks","delay",0,1315]]]}

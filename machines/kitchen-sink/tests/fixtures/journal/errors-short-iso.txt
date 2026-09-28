@@ -1,0 +1,60 @@
+2026-09-27T08:28:46-04:00 kitchen-sink uwsm[1196]: PID 1227 exited with RC 143
+2026-09-27T08:28:47-04:00 kitchen-sink systemd-coredump[298784]: Failed to send coredump datagram: Broken pipe
+2026-09-27T08:28:47-04:00 kitchen-sink dbus-broker-launch[1062]: Activation request for 'org.freedesktop.nm_dispatcher' failed.
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: virt/tdx: TDX not supported by the host platform
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP0._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP2._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_GPE._L08], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:36:37-04:00 kitchen-sink kernel: 
+2026-09-27T08:36:37-04:00 kitchen-sink systemd[1]: Failed to start Early TPM SRK Setup.
+2026-09-27T08:36:37-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-tpm2-setup[776]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-tpm2-setup[776]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-tpm2-setup[776]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-tpm2-setup[776]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-pcrextend[789]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-pcrextend[1001]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:36:37-04:00 kitchen-sink systemd-pcrextend[1014]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:36:37-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:36:39-04:00 kitchen-sink systemd-pcrextend[1462]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:36:39-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Measurement of User Record for UID 1000.
+2026-09-27T08:36:39-04:00 kitchen-sink sddm-helper[1447]: gkr-pam: couldn't unlock the login keyring.
+2026-09-27T08:39:24-04:00 kitchen-sink uwsm[1512]: /usr/lib/uwsm/signal-handler.sh: line 37: warning: run_pending_traps: bad value in trap_list[15]: 0x1
+2026-09-27T08:39:24-04:00 kitchen-sink systemd-coredump[28732]: Failed to send coredump datagram: Connection reset by peer
+2026-09-27T08:39:25-04:00 kitchen-sink dbus-broker-launch[1290]: Activation request for 'org.freedesktop.nm_dispatcher' failed.
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: virt/tdx: TDX not supported by the host platform
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP0._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP2._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_GPE._L08], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:43:38-04:00 kitchen-sink kernel: 
+2026-09-27T08:43:38-04:00 kitchen-sink systemd[1]: Failed to start Early TPM SRK Setup.
+2026-09-27T08:43:38-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-tpm2-setup[782]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-tpm2-setup[782]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-tpm2-setup[782]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-tpm2-setup[782]: Failed to initialize NvPCR index: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-pcrextend[796]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-pcrextend[1006]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:43:38-04:00 kitchen-sink systemd-pcrextend[1025]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:43:38-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Product ID Measurement.
+2026-09-27T08:43:40-04:00 kitchen-sink systemd-pcrextend[1467]: Could not extend NvPCR: No such file or directory
+2026-09-27T08:43:40-04:00 kitchen-sink systemd[1]: Failed to start TPM NvPCR Measurement of User Record for UID 1000.
+2026-09-27T08:43:40-04:00 kitchen-sink sddm-helper[1451]: gkr-pam: couldn't unlock the login keyring.
+2026-09-27T08:44:09-04:00 kitchen-sink sudo[3057]: pam_unix(sudo:auth): conversation failed
+2026-09-27T08:44:09-04:00 kitchen-sink sudo[3057]: pam_unix(sudo:auth): auth could not identify password for [kevinwyckoff]
+2026-09-27T08:47:28-04:00 kitchen-sink sshd-session[5488]: error: mm_reap: child terminated by signal 15
+2026-09-27T08:47:29-04:00 kitchen-sink systemd-coredump[5695]: Failed to send coredump datagram: Broken pipe
+2026-09-27T08:47:29-04:00 kitchen-sink dbus-broker-launch[1292]: Activation request for 'org.freedesktop.nm_dispatcher' failed.
+2026-09-27T08:48:09-04:00 kitchen-sink kernel: virt/tdx: TDX not supported by the host platform
+2026-09-27T08:48:09-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP0._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:48:09-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)
+2026-09-27T08:48:09-04:00 kitchen-sink kernel: ACPI BIOS Error (bug): Failure creating named object [\_SB.PCI0.GPP2._PRW], AE_ALREADY_EXISTS (20260408/dswload2-326)
+2026-09-27T08:48:09-04:00 kitchen-sink kernel: ACPI Error: AE_ALREADY_EXISTS, During name lookup/catalog (20260408/psobject-220)

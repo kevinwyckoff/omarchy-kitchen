@@ -1,0 +1,17 @@
+# /etc/systemd/system/kitchen-update.timer
+# Four nightly slots for the gated update. A slot that finds the machine busy
+# exits and the next one retries; after a success (or a hold) the later slots
+# exit at once. install.sh does NOT enable this: turn it on only after the dry
+# run, the grant test and one supervised run (sudo systemctl enable --now kitchen-update.timer).
+[Unit]
+Description=kitchen-sink nightly update slots
+
+[Timer]
+# 02:30, 03:30, 04:30 and 05:30. ("02:30,03:30,..." is not valid calendar syntax.)
+OnCalendar=*-*-* 02,03,04,05:30:00
+RandomizedDelaySec=10min
+# No catch-up at boot: you are at the machine then, and updates wait for the night.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

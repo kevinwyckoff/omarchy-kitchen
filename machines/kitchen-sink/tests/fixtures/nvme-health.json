@@ -1,0 +1,42 @@
+{
+ "DATADRIVE0001": {
+  "available_spare": 100,
+  "crit_temp_minutes": 2,
+  "critical_warning": 0,
+  "ctrl": "nvme0",
+  "data_read_tb": 39.69,
+  "data_written_tb": 44.97,
+  "error_log_entries": 1,
+  "firmware": "B35500WD",
+  "media_errors": 0,
+  "model": "WDC WDS512G1X0C-00ENX0",
+  "percentage_used": 17,
+  "power_cycles": 3792,
+  "power_on_hours": 29508,
+  "spare_threshold": 4,
+  "state": "live",
+  "temperature_c": 34,
+  "unsafe_shutdowns": 1718,
+  "warn_temp_minutes": 210
+ },
+ "SYSDRIVE0001": {
+  "available_spare": 100,
+  "crit_temp_minutes": 0,
+  "critical_warning": 0,
+  "ctrl": "nvme1",
+  "data_read_tb": 9.38,
+  "data_written_tb": 5.29,
+  "error_log_entries": 454,
+  "firmware": "STNSC014",
+  "media_errors": 0,
+  "model": "Seagate FireCuda 520 SSD ZP500GM30002",
+  "percentage_used": 1,
+  "power_cycles": 1046,
+  "power_on_hours": 8903,
+  "spare_threshold": 5,
+  "state": "live",
+  "temperature_c": 34,
+  "unsafe_shutdowns": 127,
+  "warn_temp_minutes": 0
+ }
+}

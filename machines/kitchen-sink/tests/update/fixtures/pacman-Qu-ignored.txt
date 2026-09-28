@@ -1,0 +1,2 @@
+omarchy-dev 4.0.0.r6647.gcca0894-1 -> 4.0.0.r6663.g3faafba-1 [ignored]
+omarchy-settings-dev 4.0.0.r6647.gcca0894-1 -> 4.0.0.r6663.g3faafba-4 [ignored]

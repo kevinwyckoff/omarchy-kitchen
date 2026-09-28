@@ -1,0 +1,174 @@
+#!/bin/bash
+
+# notify: show a toast on kitchen-sink's desktop from a root service.
+#
+# Usage: notify --urgency low|normal|critical --title TEXT --body TEXT
+#               [--open FILE] [--wait SECONDS] [--app-name NAME] [--glyph GLYPH]
+#               [--user NAME]
+#
+#   --urgency   low, normal (the default) or critical; critical stays on screen
+#               until dismissed
+#   --title     the headline
+#   --body      the text under it
+#   --open      a click on the toast opens FILE with less in a floating terminal
+#   --wait      wait up to SECONDS for the user's session bus (default 0), for a
+#               run that can start at boot before autologin has finished
+#   --app-name  the sender's name (default kitchen-sink)
+#   --glyph     an icon glyph for the toast
+#   --user      the desktop user (default $KITCHEN_DESKTOP_USER or kevinwyckoff)
+#
+# Shared by kitchen-checkup and kitchen-update. It runs as root and drops to
+# the user with runuser to call Omarchy's own omarchy-notification-wait and
+# omarchy-notification-send on the user's session bus, the path proven from
+# root on kitchen-sink on 2026-09-28. Any app name but omarchy-action leaves Do
+# Not Disturb in charge: while DND is on, the shell files the toast in its
+# history instead of showing it.
+#
+# It never fails its caller: every outcome, toast or not, exits 0 and is logged
+# as one line on stderr.
+
+# No -e: a toast is best effort, and this must reach its log line and exit 0.
+set -uo pipefail
+
+urgency=normal
+title=""
+body=""
+open_file=""
+wait_secs=0
+app_name=kitchen-sink
+glyph=""
+user=${KITCHEN_DESKTOP_USER:-kevinwyckoff}
+
+# For the tests: where the session buses live, and the PATH the user's side
+# gets. Nothing sets these in production.
+runtime_root=${NOTIFY_RUNTIME_ROOT:-/run/user}
+user_path=${NOTIFY_USER_PATH:-/usr/local/bin:/usr/bin}
+
+# systemd reads a "<N>" prefix as the line's priority when stderr is the
+# journal, which JOURNAL_STREAM identifies by device:inode.
+log() { # priority message
+  if [[ -n ${JOURNAL_STREAM:-} && $(stat -L -c '%d:%i' "/proc/$$/fd/2" 2>/dev/null) == "$JOURNAL_STREAM" ]]; then
+    printf '<%d>notify: %s\n' "$1" "$2" >&2
+  else
+    printf 'notify: %s\n' "$2" >&2
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: notify --urgency low|normal|critical --title TEXT --body TEXT
+              [--open FILE] [--wait SECONDS] [--app-name NAME] [--glyph GLYPH] [--user NAME]
+USAGE
+}
+
+while (($# > 0)); do
+  opt=$1
+  case $opt in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --*=*)
+    # Accept --flag=value as well as --flag value.
+    set -- "${opt%%=*}" "${opt#*=}" "${@:2}"
+    continue
+    ;;
+  --urgency | --title | --body | --open | --wait | --app-name | --glyph | --user)
+    if (($# < 2)); then
+      log 4 "$opt needs a value; ignored"
+      break
+    fi
+    case $opt in
+    --urgency) urgency=$2 ;;
+    --title) title=$2 ;;
+    --body) body=$2 ;;
+    --open) open_file=$2 ;;
+    --wait) wait_secs=$2 ;;
+    --app-name) app_name=$2 ;;
+    --glyph) glyph=$2 ;;
+    --user) user=$2 ;;
+    esac
+    shift 2
+    ;;
+  *)
+    log 4 "unknown argument '$opt'; ignored"
+    shift
+    ;;
+  esac
+done
+
+case $urgency in
+low | normal | critical) ;;
+*)
+  log 4 "unknown urgency '$urgency'; using normal"
+  urgency=normal
+  ;;
+esac
+[[ $wait_secs =~ ^[0-9]+$ ]] || wait_secs=0
+[[ -n $title ]] || title="kitchen-sink"
+
+if ! uid=$(id -u "$user" 2>/dev/null); then
+  log 4 "no user '$user'; toast skipped: $title"
+  exit 0
+fi
+home=$(getent passwd "$user" | cut -d: -f6)
+bus=$runtime_root/$uid/bus
+
+# Only root can speak on another user's bus; the user can reach their own.
+if ((EUID != 0)) && [[ $(id -un) != "$user" ]]; then
+  log 4 "run as root or as $user; toast skipped: $title"
+  exit 0
+fi
+
+# The bus appears when the user logs in. A catch-up run at boot can start
+# before SDDM's autologin, so wait for it as long as the caller allows.
+deadline=$((SECONDS + wait_secs))
+while [[ ! -S $bus ]] && ((SECONDS < deadline)); do
+  sleep 2
+done
+if [[ ! -S $bus ]]; then
+  log 5 "$user has no session bus (not logged in); toast skipped: $title"
+  exit 0
+fi
+
+# The bus can exist a moment before the shell has claimed the notification
+# name, so give omarchy-notification-wait what is left of the wait, and at
+# least 10 seconds.
+server_wait=$((deadline - SECONDS))
+((server_wait < 10)) && server_wait=10
+
+send=(omarchy-notification-send --app-name "$app_name" -u "$urgency" -p)
+[[ -n $glyph ]] && send+=(-g "$glyph")
+send+=("$title" "$body")
+if [[ -n $open_file ]]; then
+  # The shell runs the --exec argv as given, but the floating-terminal launcher
+  # joins its arguments and hands them to bash -c, so quote the path for that.
+  send+=(--exec omarchy-launch-floating-terminal-with-presentation less -R "$(printf '%q' "$open_file")")
+fi
+
+# A clean environment with only what Omarchy's commands need: the user's bus,
+# their runtime dir, and OMARCHY_PATH, without which omarchy-shell refuses to
+# run and omarchy-notification-wait never succeeds.
+env_args=(env -i PATH="$user_path" HOME="$home" USER="$user" LOGNAME="$user" LANG=C.UTF-8
+  XDG_RUNTIME_DIR="$runtime_root/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" OMARCHY_PATH=/usr/share/omarchy)
+if ((EUID == 0)); then
+  as_user=(runuser -u "$user" -- "${env_args[@]}")
+else
+  as_user=("${env_args[@]}")
+fi
+
+# shellcheck disable=SC2016 # the inner script expands its own arguments
+out=$("${as_user[@]}" timeout $((server_wait + 30)) bash -c '
+  omarchy-notification-wait "$1" || exit 3
+  shift
+  exec "$@"
+' _ "$server_wait" "${send[@]}" 2>&1)
+rc=$?
+
+case $rc in
+0) log 6 "toast $(tail -n 1 <<<"$out") sent to $user ($urgency, $app_name): $title" ;;
+3) log 5 "the notification server did not answer within ${server_wait}s; toast skipped: $title" ;;
+124) log 4 "sending timed out; toast skipped: $title" ;;
+*) log 4 "omarchy-notification-send failed (exit $rc: $(tr '\n' ' ' <<<"$out")); toast skipped: $title" ;;
+esac
+exit 0

@@ -1,0 +1,476 @@
+#!/bin/bash
+
+# preflight: can tonight's pending updates be installed unattended?
+#
+# Part of kitchen-update (S3). READ-ONLY: runs as root and writes only under
+# the work dir it is given. kitchen-update seeded WORKDIR/db (a private copy of
+# the sync DBs) in S1; this re-syncs it, so the gap between this check and
+# omarchy update's own -Syu is seconds, not the ten minutes of the activity check.
+#
+#   preflight [--dry-run] WORKDIR
+#
+# --dry-run keeps evaluating after a result that would end a real preflight
+# early (network down, nothing to update), so every gate is printed.
+#
+# Left in WORKDIR for the postflight and the status file:
+#   pending.txt           checkupdates' list ("name old -> new")
+#   targets.txt           the package names pacman -Su would install
+#   targets-full.txt      "name version size repo" for each of them
+#   failed-units.before   the failed-unit baseline
+#   news.txt              news-check.py's output
+#   news-checked-at       when the news feed was read (the next last-success stamp)
+#
+# One line per gate: "ok    ", "info  ", "CARE  ", "HOLD  ", "RETRY ", then
+# "VERDICT GO|GO-WITH-CARE|HOLD|NOTHING-TO-DO|RETRY" last.
+#
+# Exit: 0 go | 10 go with care (boot chain in the set: strict postflight)
+#       20 hold (a human decides) | 30 nothing to do | 40 retry at the next slot
+
+set -uo pipefail
+# No `set -e`: a gate that cannot be evaluated must say so and hold, not end the script.
+
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+
+# ---- settings (override in /etc/kitchen-sink/update.conf) ---------------------
+DESKTOP_USER=kevinwyckoff
+LIB_DIR=/usr/local/lib/kitchen-sink
+STATE_DIR=/var/lib/kitchen-update
+PIN_PACKAGES="omarchy-dev omarchy-settings-dev"
+DRIFT_REGEX='^(hyprland.*|quickshell|uwsm|xdg-desktop-portal-hyprland)$'
+BOOT_CHAIN_POLICY=install
+NEWS_POLICY=hold-all
+STALE_DAYS=21
+ROOT_MIN_GIB=10
+ESP_MARGIN_MIB=64
+PACMAN_LOG=/var/log/pacman.log
+SB_MARKER=/var/lib/omarchy-secureboot/enabled
+SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
+NEWS_URL=https://archlinux.org/feeds/news/
+AUR_URL='https://aur.archlinux.org/rpc/?v=5&type=info&arg=base'
+KEYSERVER_URL=https://keys.openpgp.org/
+CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+
+MiB=$((1024 * 1024))
+GiB=$((1024 * MiB))
+
+# Package names whose update touches the kernel, its modules or the boot chain.
+# linux-firmware* belongs to the boot chain, and linux-api-headers is glibc's
+# build input, not a kernel.
+KERNEL_REGEX='^(linux(-[a-z0-9]+)*|nvidia(-[a-z0-9]+)*|lib32-nvidia-utils|dkms)$'
+KERNEL_EXCLUDE='^linux-(firmware(-[a-z]+)?|api-headers)$'
+BOOT_REGEX='^(limine(-[a-z-]+)?|mkinitcpio|systemd(-libs)?|cryptsetup|sbctl|amd-ucode|intel-ucode|linux-firmware(-[a-z]+)?|btrfs-progs|plymouth|efibootmgr|glibc)$'
+# Paths that fire 90-mkinitcpio-install.hook (both the packaged one and the
+# limine one in /etc/pacman.d/hooks), i.e. a UKI rebuild on the ESP.
+REBUILD_REGEX='^usr/lib/(initcpio/|firmware/|modprobe\.d/)|^usr/lib/modules/[^/]+/(vmlinuz|modules\.builtin)$|^usr/lib/modules/[^/]+/extramodules/|^usr/src/[^/]+/dkms\.conf$|^usr/lib/systemd/systemd(-udevd)?$|^usr/bin/(cryptsetup|lvm|mdadm|pdata_tools)$|^usr/lib/lib(cryptsetup|p11-kit|pcsclite)\.so$'
+
+load_conf() {
+  local owner mode
+  [[ -e $CONF ]] || return 0
+  read -r owner mode < <(stat -Lc '%u %a' -- "$CONF")
+  if [[ $owner != "0" ]] || (( 8#$mode & 022 )); then
+    echo "info  config: ignoring $CONF (it must be owned by root and not writable by others)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$CONF"
+}
+
+# ---- output and verdict ----------------------------------------------------------
+holds=0 retries=0 cares=0 nothing=0
+ok()    { echo "ok    $*"; }
+info()  { echo "info  $*"; }
+care()  { echo "CARE  $*"; cares=$((cares + 1)); }
+hold()  { echo "HOLD  $*"; holds=$((holds + 1)); }
+retry() { echo "RETRY $*"; retries=$((retries + 1)); }
+
+# A hold settles the night (a human decides), so it outranks a retry.
+finish() {
+  if (( holds )); then
+    echo "VERDICT HOLD"
+    exit 20
+  elif (( retries )); then
+    echo "VERDICT RETRY"
+    exit 40
+  elif (( nothing )); then
+    echo "VERDICT NOTHING-TO-DO"
+    exit 30
+  elif (( cares )); then
+    echo "VERDICT GO-WITH-CARE"
+    exit 10
+  else
+    echo "VERDICT GO"
+    exit 0
+  fi
+}
+
+# ---- parsing helpers (the unit tests call these with fixtures) --------------------
+
+# Names in "pacman -Qu" output that IgnorePkg holds back.
+ignored_names() { awk '/\[ignored\]$/ { print $1 }'; }
+
+# Target names (one per line in FILE) that match REGEX and not EXCLUDE.
+targets_matching() { grep -E -- "$1" "$2" | grep -vE -- "${3:-^$}" | paste -sd' ' -; }
+
+# How many of the target files ("pkg path" lines, as pacman -Fl prints them) fire a UKI rebuild.
+rebuild_triggers() { awk '{ print $2 }' | grep -cE -- "$REBUILD_REGEX"; }
+
+# Active boot files sbctl reports unsigned. The raw fallback loader and the
+# history copies of pre-Secure-Boot UKIs are unsigned by design.
+sbctl_unsigned() {
+  sed 's/\x1b\[[0-9;]*m//g' | grep -E '^(✗|‼)' | grep -vE 'EFI/BOOT/BOOTX64\.EFI|/limine_history/'
+}
+
+# 0 when "btrfs scrub status" says the last scrub (or no scrub yet) found no errors.
+scrub_clean() { grep -E '^Error summary:' | grep -q 'no errors found'; }
+
+# The time of the last "starting full system upgrade" in pacman.log, as ISO 8601.
+last_full_upgrade() {
+  grep 'starting full system upgrade' "$1" 2>/dev/null | tail -n 1 |
+    sed -E 's/^\[([^]]+)\].*/\1/; s/([+-][0-9]{2})([0-9]{2})$/\1:\2/'
+}
+
+# The newer of two ISO 8601 stamps (either may be empty).
+newest_stamp() {
+  local a=${1:-} b=${2:-}
+  if [[ -z $a ]]; then echo "$b"; return; fi
+  if [[ -z $b ]]; then echo "$a"; return; fi
+  if (( $(date -d "$a" +%s) >= $(date -d "$b" +%s) )); then echo "$a"; else echo "$b"; fi
+}
+
+# ---- the desktop user ----------------------------------------------------------
+uid="" gid="" home=""
+load_user() {
+  local entry
+  entry=$(getent passwd "$DESKTOP_USER") || return 1
+  IFS=: read -r _ _ uid gid _ home _ <<<"$entry"
+}
+
+as_user() {
+  setpriv --reuid="$uid" --regid="$gid" --init-groups -- env -i HOME="$home" USER="$DESKTOP_USER" \
+    LOGNAME="$DESKTOP_USER" PATH=/usr/bin XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+}
+
+# ---- gates -------------------------------------------------------------------------
+W="" DB="" dry=0
+
+gate_transaction() {
+  local lock_fd lock=/run/user/$uid/omarchy-update.lock
+  if [[ -e /var/lib/pacman/db.lck ]]; then
+    if pgrep -x 'pacman|yay|paru' >/dev/null; then
+      retry "transaction: pacman is running"
+    else
+      hold "transaction: /var/lib/pacman/db.lck exists with no pacman running: pacman died, maybe during its post-transaction hooks (DKMS, the UKI build and signing). Do not reboot; at the machine read the end of /var/log/pacman.log, remove the lock, reinstall the kernel packages (or run limine-mkinitcpio), then run omarchy secureboot status"
+    fi
+  elif pgrep -x 'pacman|yay|paru' >/dev/null; then
+    retry "transaction: a package manager is running"
+  else
+    ok "transaction: no pacman transaction in progress"
+  fi
+  if [[ -e $lock ]] && exec {lock_fd}<"$lock"; then
+    if ! flock -n "$lock_fd"; then retry "transaction: an omarchy update is running"; fi
+    exec {lock_fd}<&-
+  fi
+}
+
+# HEAD every endpoint tonight's run needs: each repo's DB on its first mirror,
+# the news feed, the keyserver omarchy-update-keyring uses, and the AUR when
+# foreign packages exist.
+gate_network() {
+  local repo server urls=() u failed=()
+  for repo in $(pacman-conf --repo-list 2>/dev/null); do
+    server=$(pacman-conf -r "$repo" Server 2>/dev/null | head -n 1)
+    [[ -n $server ]] && urls+=("$server/$repo.db")
+  done
+  urls+=("$NEWS_URL" "$KEYSERVER_URL")
+  [[ -z $(pacman -Qqm 2>/dev/null) ]] || urls+=("$AUR_URL")
+  for u in "${urls[@]}"; do
+    if [[ $u == "$AUR_URL" ]]; then
+      # The RPC answers HEAD with a redirect; GET its tiny reply, as omarchy-pkg-aur-accessible does.
+      curl -fsS --max-time 10 --retry 2 --retry-delay 5 -o /dev/null "$u" || failed+=("$u")
+    else
+      curl -fsSI --max-time 10 --retry 2 --retry-delay 5 -o /dev/null "$u" || failed+=("$u")
+    fi
+  done
+  if (( ${#failed[@]} )); then
+    retry "network: unreachable: ${failed[*]}"
+    return 1
+  fi
+  ok "network: ${#urls[@]} endpoints reachable (repos, Arch news, keyserver$([[ -n $(pacman -Qqm 2>/dev/null) ]] && echo ', AUR'))"
+}
+
+# Re-sync the private DB and list what is pending. 0 = updates, 2 = none, 1 = error.
+gate_pending() {
+  local rc
+  mkdir -p "$DB/sync"
+  CHECKUPDATES_DB=$DB timeout 300 checkupdates --nocolor >"$W/pending.txt" 2>"$W/pending.err"
+  rc=$?
+  case $rc in
+    0)
+      ok "pending: $(wc -l <"$W/pending.txt") repo updates"
+      ;;
+    2)
+      nothing=1
+      ok "pending: nothing to update"
+      ;;
+    *)
+      retry "pending: checkupdates failed (exit $rc): $(head -n 1 "$W/pending.err")"
+      return 1
+      ;;
+  esac
+  pacman -Qu --dbpath "$DB" --color never 2>/dev/null | ignored_names >"$W/ignored.txt"
+  [[ ! -s $W/ignored.txt ]] || info "pending: held back by IgnorePkg: $(paste -sd' ' "$W/ignored.txt")"
+  (( rc == 0 ))
+}
+
+# pacman's own dependency resolution, against the private DB, without touching
+# anything. It catches dependency breaks; package and file conflicts only show
+# at commit, where pacman aborts atomically with nothing installed.
+gate_dry_run() {
+  local rc
+  pacman -Su --print --print-format '%n %v %s %r' --noconfirm --dbpath "$DB" --logfile /dev/null \
+    >"$W/targets-full.txt" 2>"$W/print.err"
+  rc=$?
+  awk '{ print $1 }' "$W/targets-full.txt" >"$W/targets.txt"
+  if (( rc != 0 )); then
+    hold "dependencies: pacman -Su would fail: $(grep -v '^$' "$W/print.err" | tail -n 2 | paste -sd' ' -)"
+    return 1
+  fi
+  ok "dependencies: pacman -Su resolves $(wc -l <"$W/targets.txt") targets"
+}
+
+gate_files_db() {
+  # The .files DBs let us see what each target would write, without downloading
+  # a package. fakeroot keeps pacman from handing the download to its sandbox user.
+  if ! fakeroot -- pacman -Fy --disable-sandbox-filesystem --dbpath "$DB" --logfile /dev/null >/dev/null 2>"$W/files.err"; then
+    retry "files: could not fetch the .files DBs: $(head -n 1 "$W/files.err")"
+    return 1
+  fi
+}
+
+gate_pin_effect() {
+  local pkg leaked=()
+  for pkg in $PIN_PACKAGES; do
+    grep -qx -- "$pkg" "$W/targets.txt" && leaked+=("$pkg")
+  done
+  if (( ${#leaked[@]} )); then
+    hold "pin: pacman would install ${leaked[*]} from the repo: IgnorePkg is not holding the kitchen build"
+  fi
+  # Belt and braces for the pin: never let a candidate without the Secure Boot engine in.
+  if [[ -e $SB_MARKER ]] && grep -qx 'omarchy-dev' "$W/targets.txt"; then
+    if ! pacman -Flq --dbpath "$DB" omarchy-dev 2>/dev/null | grep -qx "${SB_ENGINE#/}"; then
+      hold "engine: the candidate omarchy-dev lacks the Secure Boot engine; installing it would leave Limine unsigned"
+    fi
+  fi
+  (( ${#leaked[@]} )) || ok "pin: none of $PIN_PACKAGES is in the transaction"
+}
+
+gate_drift() {
+  local hits
+  if [[ ! -s $W/ignored.txt ]]; then
+    ok "drift: the pin is not holding a newer build back"
+    return
+  fi
+  hits=$(targets_matching "$DRIFT_REGEX" "$W/targets.txt")
+  if [[ -n $hits ]]; then
+    hold "drift: the desktop stack would move ($hits) while the pin holds $(paste -sd' ' "$W/ignored.txt") back: update by hand, or rebase kitchen"
+  else
+    ok "drift: no desktop-stack package in the set"
+  fi
+}
+
+gate_aur() {
+  local out err rc
+  if [[ -z $(pacman -Qqm 2>/dev/null) ]]; then
+    ok "aur: no foreign packages"
+    return
+  fi
+  # yay refuses to run as root. rc 1 with no output means nothing to update.
+  out=$(as_user timeout 120 yay -Qua 2>"$W/aur.err")
+  rc=$?
+  err=$(grep -v '^$' "$W/aur.err" | head -n 1)
+  if (( rc == 0 )) && [[ -n $out ]]; then
+    hold "aur: updates pending ($(paste -sd',' <<<"$out")): AUR builds never run under the unattended grant; update by hand"
+  elif (( rc <= 1 )) && [[ -z $out ]]; then
+    ok "aur: foreign packages are current${err:+ (yay: $err)}"
+  else
+    retry "aur: could not check AUR updates (yay exit $rc${err:+: $err})"
+  fi
+}
+
+gate_news() {
+  local since last_success="" last_upgrade rc days
+  [[ ! -r $STATE_DIR/last-success ]] || last_success=$(<"$STATE_DIR/last-success")
+  last_upgrade=$(last_full_upgrade "$PACMAN_LOG")
+  since=$(newest_stamp "$last_success" "$last_upgrade")
+  date -Iseconds >"$W/news-checked-at"
+  if [[ -z $since ]]; then
+    hold "news: no last-success stamp and no full upgrade in $PACMAN_LOG to compare Arch news against"
+    return
+  fi
+
+  days=$(( ($(date +%s) - $(date -d "$since" +%s)) / 86400 ))
+  if (( days > STALE_DAYS )); then
+    hold "staleness: the last successful update was $days days ago (more than $STALE_DAYS): do this one attended"
+  else
+    ok "staleness: last successful update $days days ago"
+  fi
+
+  if ! curl -fsS --max-time 20 --retry 2 -o "$W/news.xml" "$NEWS_URL"; then
+    retry "news: could not fetch $NEWS_URL"
+    return
+  fi
+  python3 "$LIB_DIR/news-check.py" "$W/news.xml" --since "$since" --policy "$NEWS_POLICY" >"$W/news.txt" 2>&1
+  rc=$?
+  case $rc in
+    0) ok "news: no Arch news since $since" ;;
+    10) info "news: new Arch news since $since (not hold-worthy under NEWS_POLICY=$NEWS_POLICY): $(head -n 1 "$W/news.txt")" ;;
+    11) hold "news: Arch news since $since needs a human first: $(grep -m 1 '^HOLD' "$W/news.txt" | cut -c 6-) $(sed -n 2p "$W/news.txt" | tr -s ' ')" ;;
+    *) hold "news: could not read the Arch news feed: $(head -n 1 "$W/news.txt")" ;;
+  esac
+}
+
+gate_boot_chain() {
+  local kern boot rebuild
+  kern=$(targets_matching "$KERNEL_REGEX" "$W/targets.txt" "$KERNEL_EXCLUDE")
+  boot=$(targets_matching "$BOOT_REGEX" "$W/targets.txt")
+  xargs -r pacman -Fl --dbpath "$DB" <"$W/targets.txt" >"$W/target-files.txt" 2>/dev/null
+  rebuild=$(rebuild_triggers <"$W/target-files.txt")
+  # The hook also fires on the mkinitcpio package itself.
+  if grep -qxE 'mkinitcpio(-git)?' "$W/targets.txt"; then rebuild=$((rebuild + 1)); fi
+  echo "$rebuild" >"$W/rebuild-triggers"
+  local what=""
+  [[ -z $kern ]] || what+="kernel/driver: $kern; "
+  [[ -z $boot ]] || what+="boot chain: $boot; "
+  (( rebuild == 0 )) || what+="$rebuild files that rebuild the UKI; "
+  if [[ -z $what ]]; then
+    ok "boot-chain: nothing in the set touches the kernel or the boot chain"
+  elif [[ $BOOT_CHAIN_POLICY == "defer" ]]; then
+    hold "boot-chain: ${what%; } (BOOT_CHAIN_POLICY=defer: update attended)"
+  else
+    care "boot-chain: ${what%; }: installs only behind the strict postflight; a reboot needs the LUKS passphrase at the machine"
+  fi
+}
+
+gate_esp() {
+  local free size largest rebuild
+  rebuild=$(cat "$W/rebuild-triggers" 2>/dev/null || echo 0)
+  free=$(df --output=avail -B1 /boot | tail -n 1)
+  size=$(df --output=size -B1 /boot | tail -n 1)
+  largest=$(find /boot -type f -printf '%s\n' 2>/dev/null | sort -n | tail -n 1)
+  largest=${largest:-0}
+  if (( rebuild > 0 && free < largest + ESP_MARGIN_MIB * MiB )); then
+    hold "esp: $((free / MiB)) MiB free, but a UKI rebuild needs the largest boot file ($((largest / MiB)) MiB) plus $ESP_MARGIN_MIB MiB (limine-mkinitcpio can report success anyway)"
+  elif (( free < 32 * MiB )); then
+    hold "esp: nearly full ($((free / MiB)) MiB free)"
+  elif (( free < 2 * largest )); then
+    care "esp: $((free / MiB)) MiB free is less than two UKIs: the next snapshot's history copy may make limine-snapper-sync drop entries"
+  else
+    ok "esp: $((free / MiB)) MiB free of $((size / MiB)) MiB, largest boot file $((largest / MiB)) MiB"
+  fi
+}
+
+gate_root_fs() {
+  local need free unalloc clear=1
+  need=$(awk '{ s += $3 } END { printf "%d", s }' "$W/targets-full.txt" 2>/dev/null)
+  need=${need:-0}
+  free=$(df --output=avail -B1 / | tail -n 1)
+  if (( free < ROOT_MIN_GIB * GiB || free < 3 * need )); then
+    hold "root: / has $((free / GiB)) GiB free; needs max($ROOT_MIN_GIB GiB, 3 x the $((need / MiB)) MiB download)"
+    clear=0
+  fi
+  unalloc=$(btrfs filesystem usage -b / 2>/dev/null | awk '/Device unallocated/ { print $3 }')
+  if [[ -n $unalloc ]] && (( unalloc < 2 * GiB )); then
+    care "root: btrfs has only $((unalloc / MiB)) MiB unallocated (metadata ENOSPC risk); consider a balance"
+  fi
+  if ! btrfs device stats --check / >/dev/null 2>&1; then
+    hold "root: btrfs device stats report errors on / (or could not be read)"
+    clear=0
+  fi
+  if ! btrfs scrub status / 2>/dev/null | scrub_clean; then
+    hold "root: the last btrfs scrub of / found errors (or its status could not be read)"
+    clear=0
+  fi
+  if ! findmnt -no OPTIONS / | tr ',' '\n' | grep -qx rw; then
+    hold "root: / is not mounted read-write (btrfs forced it read-only?)"
+    clear=0
+  fi
+  if journalctl -k -b -p err -q --no-pager 2>/dev/null | grep -qiE 'btrfs|I/O error|nvme.*(timeout|reset)'; then
+    hold "root: btrfs, NVMe or I/O errors in the kernel log this boot"
+    clear=0
+  fi
+  (( ! clear )) || ok "root: $((free / GiB)) GiB free, btrfs stats and scrub clean, mounted rw, no storage errors this boot"
+}
+
+gate_snapshots() {
+  if snapper --csvout list-configs 2>/dev/null | grep -q '^root,'; then
+    ok "snapshots: snapper has a root config (omarchy update takes the pre-update snapshot)"
+  else
+    hold "snapshots: no snapper root config: omarchy update would carry on WITHOUT a snapshot"
+  fi
+  if ! systemctl is-active -q limine-snapper-sync.service 2>/dev/null; then
+    care "snapshots: limine-snapper-sync is not active: the pre-update snapshot will get no boot entry"
+  fi
+  if systemctl list-units --no-legend --plain --state=activating 'omarchy-secureboot-watch@*' 2>/dev/null | grep -q .; then
+    hold "secureboot: a Secure Boot watcher is still running"
+  fi
+  systemctl --failed --no-legend --plain 2>/dev/null | awk '{ print $1 }' | sort >"$W/failed-units.before"
+}
+
+main() {
+  while (( $# )); do
+    case $1 in
+      --dry-run) dry=1 ;;
+      -h | --help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; exit 0 ;;
+      -*) echo "preflight: unknown argument: $1" >&2; exit 64 ;;
+      *) W=$1 ;;
+    esac
+    shift
+  done
+  if [[ -z $W || ! -d $W ]]; then
+    echo "preflight: usage: preflight [--dry-run] WORKDIR" >&2
+    exit 64
+  fi
+  DB=$W/db
+  load_conf
+  if ! load_user; then
+    hold "user: $DESKTOP_USER does not exist"
+    finish
+  fi
+
+  gate_transaction
+  # Without the network nothing below that needs a mirror can be judged.
+  if ! gate_network && (( ! dry )); then finish; fi
+
+  local have_list=0
+  if gate_pending; then
+    have_list=1
+  elif (( ! dry )); then
+    # Nothing to do, or checkupdates failed: either way there is no set to judge.
+    finish
+  fi
+
+  if (( have_list )); then
+    gate_dry_run
+    if gate_files_db; then
+      gate_pin_effect
+      gate_boot_chain
+    elif (( dry )); then
+      info "boot-chain: skipped (no .files DBs)"
+    fi
+    gate_drift
+  else
+    info "package gates skipped (no pending list)"
+  fi
+  gate_aur
+  gate_news
+  gate_esp
+  gate_root_fs
+  gate_snapshots
+  finish
+}
+
+# Sourcing this file (the tests do) defines the helpers without running anything.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

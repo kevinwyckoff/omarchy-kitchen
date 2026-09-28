@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Run the tests for the kitchen-sink machine files.
+#
+# They need an Arch userland (bash 5, GNU coreutils, util-linux, systemd's
+# systemd-escape, jq and python3), and run as root for the end-to-end check-up
+# tests. From any Docker host, in machines/kitchen-sink:
+#
+#   docker run --rm -v "$PWD:/w:ro" -w /w archlinux:latest \
+#     bash -c 'pacman -Sy --noconfirm --needed jq python >/dev/null && tests/run'
+
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+export PYTHONDONTWRITEBYTECODE=1
+
+rc=0
+bash tests/test-checkup.sh || rc=1
+bash tests/test-notify.sh || rc=1
+python3 tests/test_nvme_health.py || rc=1
+
+if ((rc == 0)); then
+  echo "all tests passed"
+else
+  echo "TESTS FAILED" >&2
+fi
+exit $rc

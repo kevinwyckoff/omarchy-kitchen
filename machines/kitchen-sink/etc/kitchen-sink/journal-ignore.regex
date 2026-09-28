@@ -1,0 +1,37 @@
+# /etc/kitchen-sink/journal-ignore.regex: known-harmless journal errors.
+#
+# kitchen-checkup reads the journal lines of priority err and worse since its
+# last run, as "identifier: message", and drops each line that matches one of
+# the extended regexes below, one per line. Lines starting with # and blank
+# lines are skipped. Keep patterns narrow: a broad one hides real problems.
+# Sudo authentication failures are deliberately not listed, except the
+# updater's own tagged probes at the end.
+
+# systemd 262 cannot set up NvPCRs on the AMD fTPM (the three known failed units)
+NvPCR
+Failed to start (TPM NvPCR|Early TPM SRK Setup)
+
+# Firmware and kernel noise at every boot
+ACPI (BIOS )?Error
+virt/tdx: TDX not supported
+^kernel: *$
+
+# Login and session noise
+gkr-pam: couldn.t unlock the login keyring
+Activation request for .org\.freedesktop\.nm_dispatcher. failed
+Invalid user name .passim. in service file
+run_pending_traps: bad value in trap_list
+uwsm: PID [0-9]+ exited with RC 143
+mm_reap: child terminated by signal 15
+
+# At every shutdown; coredumpctl shows no real crash behind it
+Failed to send coredump datagram
+
+# The check-up and the updater report their own results
+^kitchen-checkup:
+^kitchen-update:
+
+# The updater's own sudo probes: its grant self-test and its revoke proof each
+# expect one refused `sudo -n` a night, which sudo logs at alert priority. They
+# carry a tag no other command uses; any other refused sudo still shows.
+^sudo: .* : a password is required ; .*COMMAND=/usr/bin/true kitchen-update-probe$

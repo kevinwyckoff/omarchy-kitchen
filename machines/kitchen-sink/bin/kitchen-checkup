@@ -1,0 +1,1268 @@
+#!/bin/bash
+
+# kitchen-checkup: kitchen-sink's daily read-only health check.
+#
+# kitchen-checkup.service runs it as root at 09:00, after any nightly
+# kitchen-update run. It changes nothing on the system. It reads state, writes a
+# report to /var/log/kitchen-checkup (<date>.txt, latest.txt and latest.json,
+# kept 90 days) and its own small state to /var/lib/kitchen-checkup, logs one
+# journal line per check at a matching priority, and toasts the desktop user
+# through /usr/local/lib/kitchen-sink/notify.
+#
+# Usage: kitchen-checkup [--no-notify] [--quiet] [--json]
+#   --no-notify  skip the desktop toast
+#   --quiet      print only the WARN and FAIL results
+#   --json       print the result as JSON (the same document as latest.json)
+#
+# Exit status: 0 all OK or INFO, 1 at least one WARN, 2 at least one FAIL,
+# 3 the check-up could not run or broke part way. The unit counts 1 and 2 as
+# success, because they are results, so only 3 leaves it failed.
+#
+# Settings: the defaults below, overridden by /etc/kitchen-sink/checkup.conf.
+
+# No -e: most checks run a command whose failure is the finding (btrfs stats
+# with errors, checkupdates without network), and one broken probe must not stop
+# the others from reporting. -u still catches typos; the EXIT trap turns an
+# abort into exit 3.
+set -uo pipefail
+
+# ---- settings -----------------------------------------------------------------
+
+DESKTOP_USER=kevinwyckoff
+REPORT_DIR=/var/log/kitchen-checkup
+STATE_DIR=/var/lib/kitchen-checkup
+CACHE_DIR=/var/cache/kitchen-checkup
+KEEP_REPORTS_DAYS=90
+
+NOTIFY=1
+NOTIFY_WHEN_OK=1
+NOTIFY_WAIT_SECS=180
+NOTIFY_CMD=/usr/local/lib/kitchen-sink/notify
+NVME_HELPER=/usr/local/lib/kitchen-sink/nvme-health.py
+JOURNAL_IGNORE=/etc/kitchen-sink/journal-ignore.regex
+
+SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
+PIN_PACKAGES="omarchy-dev omarchy-settings-dev"
+PIN_HOOK=.config/omarchy/hooks/pre-refresh-pacman.d/10-kitchen-pin
+
+KNOWN_FAILED_UNITS="systemd-pcrlogin@1000.service systemd-pcrproduct.service systemd-tpm2-setup-early.service"
+EXPECT_ACTIVE="sshd.service systemd-timesyncd.service ufw.service ollama.service"
+EXPECT_TIMERS="btrfs-scrub@-.timer btrfs-scrub@mnt-data.timer kitchen-checkup.timer kitchen-update.timer"
+
+DATA_MOUNT=/mnt/data
+DATA_SOURCE=/dev/mapper/omarchy_data
+BTRFS_MOUNTS="/ /mnt/data"
+# NVMe drives as serial:name pairs. The machine's own checkup.conf names them;
+# empty checks every drive found, named by its serial.
+NVME_SERIALS=""
+
+ROOT_WARN_GIB=40
+ROOT_FAIL_GIB=15
+BOOT_WARN_MIB=700
+BOOT_FAIL_MIB=350
+DATA_WARN_PCT=90
+NVME_USED_WARN=80
+NVME_TEMP_WARN=70
+SCRUB_WARN_DAYS=40
+UPDATE_WARN_DAYS=7
+UPDATE_FAIL_DAYS=21
+
+UPDATE_STATUS=/var/lib/kitchen-update/status.json
+UPDATE_LAST_SUCCESS=/var/lib/kitchen-update/last-success
+UPDATE_REBOOT_PENDING=/var/lib/kitchen-update/reboot-pending
+UPDATE_BOOT_CHECK=/var/lib/kitchen-update/boot-check
+UPDATE_BEHIND_WARN_NIGHTS=3
+UPDATE_UNIT=kitchen-update.service
+UPDATE_TIMER=kitchen-update.timer
+UPDATE_GRANT=/etc/sudoers.d/98-kitchen-update
+UPDATE_GROUP=kitchen-update
+# Where limine-mkinitcpio-hook puts each kernel's UKI; %s is the kernel's pkgbase.
+UKI_PATTERN=/boot/EFI/Linux/omarchy_%s.efi
+
+# System paths, kept in variables only so the tests can point them at fixtures.
+PACMAN_LOG=/var/log/pacman.log
+PACMAN_LOCK=/var/lib/pacman/db.lck
+MODULES_DIR=/usr/lib/modules
+EFI_SECUREBOOT_VAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+
+CONF=${KITCHEN_CHECKUP_CONF:-/etc/kitchen-sink/checkup.conf}
+
+# The toast's glyph (U+F21E, a heartbeat), as bytes so it survives LC_ALL=C.
+GLYPH=$'\xef\x88\x9e'
+
+# Built-in noise filter, used when $JOURNAL_IGNORE is missing. It must match the
+# patterns in etc/kitchen-sink/journal-ignore.regex; the tests compare the two.
+DEFAULT_IGNORE='NvPCR
+Failed to start (TPM NvPCR|Early TPM SRK Setup)
+ACPI (BIOS )?Error
+virt/tdx: TDX not supported
+^kernel: *$
+gkr-pam: couldn.t unlock the login keyring
+Activation request for .org\.freedesktop\.nm_dispatcher. failed
+Invalid user name .passim. in service file
+run_pending_traps: bad value in trap_list
+uwsm: PID [0-9]+ exited with RC 143
+mm_reap: child terminated by signal 15
+Failed to send coredump datagram
+^kitchen-checkup:
+^kitchen-update:
+^sudo: .* : a password is required ; .*COMMAND=/usr/bin/true kitchen-update-probe$'
+
+# ---- plumbing -----------------------------------------------------------------
+
+# Seams: the tests replace these with fixtures, so keep system access in them.
+run_timeout() { timeout "$@"; }
+user_uid() { id -u "$DESKTOP_USER" 2>/dev/null; }
+user_home() { getent passwd "$DESKTOP_USER" | cut -d: -f6; }
+boot_epoch() { awk '/^btime / {print $2}' /proc/stat; }
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+pacman_running() { pgrep -x 'pacman|yay|paru|makepkg' >/dev/null; }
+update_gid() { getent group "$UPDATE_GROUP" | cut -d: -f3; }
+
+# "PID NAME" for every live process whose supplementary groups include GID
+# (a zombie still lists them, but can do nothing). grep reads /proc because it
+# skips a process that exits mid-scan (gawk dies on it).
+gid_carriers() {
+  [[ $1 =~ ^[0-9]+$ ]] || return 0
+  grep -H -E '^(Name|State|Groups):' /proc/[0-9]*/status 2>/dev/null |
+    awk -v g="$1" '
+      {
+        split($0, f, ":"); pid = f[1]; sub(/^\/proc\//, "", pid); sub(/\/status$/, "", pid)
+        val = substr($0, length(f[1]) + length(f[2]) + 3); sub(/^[ \t]+/, "", val)
+      }
+      f[2] == "Name" { name[pid] = val }
+      f[2] == "State" { zombie[pid] = (val ~ /^Z/) }
+      f[2] == "Groups" { n = split(val, gs, /[ \t]+/); for (i = 1; i <= n; i++) if (gs[i] == g && !zombie[pid]) print pid, name[pid] }'
+}
+
+# The kernel release a UKI's .uname section names.
+uki_uname() {
+  local tmp out
+  tmp=$(mktemp) || return 1
+  objcopy -O binary --only-section=.uname "$1" "$tmp" 2>/dev/null && out=$(tr -d '\0' <"$tmp")
+  rm -f -- "$tmp"
+  [[ -n ${out:-} ]] && echo "$out"
+}
+
+nvidia_dkms_pkg() { pacman -Qq 2>/dev/null | grep -E '^nvidia(-open)?(-[0-9a-z]+)?-dkms$' | head -n 1; }
+dkms_module_built() { modinfo -k "$1" -F filename nvidia 2>/dev/null | grep -q '/updates/dkms/'; }
+
+user_session() {
+  local uid
+  uid=$(user_uid) && [[ -S /run/user/$uid/bus ]]
+}
+
+# Run a command as the desktop user against their systemd and D-Bus session.
+as_user() {
+  local uid home
+  uid=$(user_uid) || return 1
+  home=$(user_home)
+  runuser -u "$DESKTOP_USER" -- env -i PATH=/usr/bin HOME="$home" \
+    XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+
+# Executable paths of every running Hyprland, "(deleted)" once replaced on disk.
+hyprland_exes() {
+  local pid
+  for pid in $(pgrep -x Hyprland); do
+    readlink "/proc/$pid/exe"
+  done
+}
+
+# systemd reads a "<N>" prefix on a line as its priority, but only when stdout
+# really is the journal: JOURNAL_STREAM names that stream's device:inode.
+journal_stdout() {
+  [[ -n ${JOURNAL_STREAM:-} && $(stat -L -c '%d:%i' "/proc/$$/fd/1" 2>/dev/null) == "$JOURNAL_STREAM" ]]
+}
+
+epoch_of() { # date text -> seconds, or fail
+  local t
+  t=$(date -d "$1" +%s 2>/dev/null) && [[ $t =~ ^[0-9]+$ ]] && echo "$t"
+}
+
+# Nights passed between two times: how many 02:00s lie between them. The
+# updater's first slot is 02:30, so an update at 01:00 still counts for the
+# night before.
+nights_between() { # from-epoch to-epoch
+  local a b
+  a=$(date -d "@$(($1 - 7200))" +%F)
+  b=$(date -d "@$(($2 - 7200))" +%F)
+  echo $((($(date -d "$b" +%s) - $(date -d "$a" +%s) + 43200) / 86400))
+}
+
+plural() { # count word -> "1 word" or "2 words"
+  if (($1 == 1)); then echo "1 $2"; else echo "$1 $2s"; fi
+}
+
+levels=() checks=() messages=() details=""
+OUTPUT=terminal QUIET=0
+
+# Facts that several checks share, filled in by collect_updates,
+# load_update_status and check_secureboot.
+pending="" pending_rc=1 pending_count=-1 held_back=""
+us_present=0 us_state="" us_night="" us_reasons="" us_hint="" us_reboot="" us_log="" us_packages="" us_nights="" us_reboot_why="" us_warnings="" us_epoch=0
+sb_state=unknown
+# Set by check_boot_chain and check_transaction for check_reboot: a reason not
+# to reboot, and whether every installed kernel's UKI was checked and found right.
+boot_problem="" boot_verified=0
+
+record() { # level check message
+  levels+=("$1")
+  checks+=("$2")
+  messages+=("$3")
+  emit "$1" "$2" "$3"
+}
+
+emit() { # level check message
+  if ((QUIET)) && [[ $1 != "WARN" && $1 != "FAIL" ]]; then
+    return 0
+  fi
+  case $OUTPUT in
+  journal) printf '<%d>%s %s: %s\n' "$(priority "$1")" "$1" "$2" "$3" ;;
+  terminal) printf '%-4s  %-15s %s\n' "$1" "$2" "$3" ;;
+  esac
+}
+
+priority() {
+  case $1 in
+  FAIL) echo 3 ;;
+  WARN) echo 4 ;;
+  *) echo 6 ;;
+  esac
+}
+
+detail() { # heading text: a section appended to the report
+  details+=$'\n'"== $1"$'\n'"$2"$'\n'
+}
+
+# ---- facts shared by several checks -------------------------------------------
+
+# One checkupdates run feeds the pending count, the pin's held-back list and the
+# auto-update verdict. It syncs a private copy of the sync DBs, never the real
+# one, so running it is still read-only for pacman.
+collect_updates() {
+  local db=$CACHE_DIR/checkup-db
+  pending="" pending_rc=0 pending_count=-1 held_back=""
+  mkdir -p "$db"
+  pending=$(CHECKUPDATES_DB=$db run_timeout 120 checkupdates --nocolor 2>/dev/null)
+  pending_rc=$?
+  case $pending_rc in
+  0) pending_count=$(grep -c . <<<"$pending") ;;
+  2) pending_count=0 ;;
+  esac
+  # checkupdates drops the lines pacman tags [ignored]; ask the same fresh DB
+  # for exactly those to see what IgnorePkg is holding back.
+  if ((pending_count >= 0)); then
+    held_back=$(pacman -Qu --dbpath "$db" 2>/dev/null | grep -F '[ignored]')
+  fi
+}
+
+# The nightly updater's last result, from kitchen-update's status.json (its
+# write_status, schema 1): state (DONE, UP-TO-DATE, BUSY, DEFERRED, HELD or
+# FAILED), night, reasons, action, upgraded, reboot (none, needed or
+# recommended), reboot_reasons, log and nights_without_update. It is read defensively, so the
+# two scripts can evolve apart: reasons may be a string, packages a count,
+# reboot a bool or an object, and a missing field is just empty.
+STATUS_JQ='
+def text: if type == "array" then map(if type == "string" then . else tojson end) | join("; ")
+  elif type == "object" then tojson elif . == null then "" else tostring end;
+def clean: text | gsub("[\\s\u001f]+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+def reboot: if type == "object" then (.state // .level // (if .needed == true then "needed"
+    elif .recommended == true then "recommended" else "" end))
+  elif type == "boolean" then (if . then "needed" else "" end) else . end;
+[ (.state // .result // "" | clean | ascii_upcase | gsub("[ _]"; "-")),
+  (.night // .date // "" | clean),
+  (.reasons // .reason // "" | clean),
+  (.action // .hint // .todo // .next // "" | clean),
+  (.reboot // "" | reboot | clean | ascii_downcase),
+  (.log // "" | clean),
+  (.packages // .upgraded // "" | if type == "array" then length | tostring elif type == "number" then tostring else "" end),
+  (.nights_without_update // "" | tostring),
+  (.reboot_reasons // "" | clean),
+  (.warnings // "" | clean)
+] | join("\u001f")'
+
+load_update_status() {
+  local fields
+  us_present=0 us_state="" us_night="" us_reasons="" us_hint="" us_reboot="" us_log="" us_packages="" us_nights="" us_reboot_why="" us_warnings="" us_epoch=0
+  [[ -f $UPDATE_STATUS ]] || return 0
+  us_present=1
+  us_epoch=$(stat -c %Y "$UPDATE_STATUS")
+  if ! fields=$(jq -r "$STATUS_JQ" "$UPDATE_STATUS" 2>/dev/null) || [[ -z $fields ]]; then
+    us_state=UNREADABLE
+    return 0
+  fi
+  # A non-blank separator: with IFS=tab, read would merge empty fields.
+  IFS=$'\x1f' read -r us_state us_night us_reasons us_hint us_reboot us_log us_packages us_nights us_reboot_why us_warnings <<<"$fields"
+  [[ $us_state == "UPTODATE" ]] && us_state=UP-TO-DATE
+  return 0
+}
+
+# ---- checks -------------------------------------------------------------------
+
+check_secureboot() {
+  local fw out rc
+  fw=$(od -An -t u1 "$EFI_SECUREBOOT_VAR" 2>/dev/null | awk '{print $NF}')
+  fw=${fw:-unknown}
+  if [[ ! -x $SB_ENGINE ]]; then
+    sb_state=missing
+    record FAIL secureboot "the Secure Boot engine is missing ($SB_ENGINE), so omarchy-dev was probably replaced by a build without it (firmware SecureBoot=$fw). Do not reboot"
+    return
+  fi
+  # Call the engine directly: it needs root, and /usr/bin/omarchy-secureboot-status
+  # only wraps it in sudo. The timeout covers a held pacman or boot lock.
+  OMARCHY_PATH=/usr/share/omarchy run_timeout 180 "$SB_ENGINE" status --quiet >/dev/null 2>&1
+  rc=$?
+  if ((rc == 0)); then
+    sb_state=clean
+    record OK secureboot "status clean (firmware SecureBoot=$fw): loader sealed, boot files signed"
+  else
+    sb_state=failing
+    if ((rc == 124)); then
+      record FAIL secureboot "'omarchy secureboot status' did not answer within 180 s (firmware SecureBoot=$fw). Do not reboot until it is clean"
+      return
+    fi
+    out=$(OMARCHY_PATH=/usr/share/omarchy TERM=dumb run_timeout 180 "$SB_ENGINE" status 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    record FAIL secureboot "'omarchy secureboot status' needs attention (firmware SecureBoot=$fw). Do not reboot until it is clean"
+    detail "omarchy secureboot status" "$out"
+  fi
+}
+
+# The kitchen build carries the Secure Boot engine; edge's omarchy-dev does not,
+# yet can sort newer. IgnorePkg is what keeps an update from swapping them.
+check_pin() {
+  local version ignored pkg missing=() offered hook newer
+  if ! version=$(pacman -Q omarchy-dev 2>/dev/null); then
+    record INFO pin "omarchy-dev is not installed, so there is no kitchen build to pin"
+    return
+  fi
+  version=${version#* }
+  if [[ $(pacman -Qqo "$SB_ENGINE" 2>/dev/null) != "omarchy-dev" ]]; then
+    record INFO pin "omarchy-dev $version carries no Secure Boot engine, so it is not the kitchen build and the pin guards nothing"
+    return
+  fi
+
+  ignored=$(pacman-conf IgnorePkg 2>/dev/null)
+  for pkg in $PIN_PACKAGES; do
+    grep -qxF -- "$pkg" <<<"$ignored" || missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    offered=$(grep -E '^omarchy(-settings)?-dev ' <<<"$pending" | awk '{print $1 " " $4}' | paste -sd, - | sed 's/,/, /g')
+    record FAIL pin "IgnorePkg in /etc/pacman.conf lacks ${missing[*]}: the next update replaces the kitchen build ($version) and removes its Secure Boot engine${offered:+ (the repo offers $offered)}. Put 'IgnorePkg = $PIN_PACKAGES' back under [options] before any update"
+  else
+    record OK pin "IgnorePkg holds $PIN_PACKAGES (kitchen build $version)"
+  fi
+
+  # omarchy-refresh-pacman rewrites pacman.conf; this hook puts the pin back.
+  hook=$(user_home)/$PIN_HOOK
+  if [[ ! -f $hook ]]; then
+    record WARN pin-hook "$hook is missing: the next 'omarchy refresh pacman' or channel change drops the pin silently"
+  fi
+
+  if [[ -n $held_back ]]; then
+    newer=$(awk '{print $1 " " $4}' <<<"$held_back" | paste -sd, - | sed 's/,/, /g')
+    record INFO pin "held back by IgnorePkg: $newer. Move to a newer Omarchy by rebasing kitchen and installing that build"
+  fi
+}
+
+# The grant is the rule plus every process that carries the group: sudo trusts
+# the gid, and a process the update started through the user manager (uwsm
+# app, systemd-run --user --scope) leaves the unit's cgroup and outlives it. So
+# outside a run, the rule must be gone and nothing may carry the gid.
+check_grant() {
+  local state running=0 gid carriers="" n text
+  # A oneshot is "activating" for the whole run, so is-active is not enough.
+  state=$(systemctl show -P ActiveState "$UPDATE_UNIT" 2>/dev/null)
+  case $state in
+  active | activating | deactivating | reloading) running=1 ;;
+  esac
+  gid=$(update_gid)
+  [[ -z $gid ]] || carriers=$(gid_carriers "$gid")
+  if ((running)); then
+    if [[ -e $UPDATE_GRANT || -n $carriers ]]; then
+      record INFO grant "the nightly sudo grant is in use while $UPDATE_UNIT is running ($state)"
+    else
+      record OK grant "no kitchen-update sudo grant ($UPDATE_UNIT is running, $state)"
+    fi
+    return
+  fi
+  if [[ -n $carriers ]]; then
+    n=$(grep -c . <<<"$carriers")
+    if ((n == 1)); then text="1 process outside a nightly run still carries"; else text="$n processes outside a nightly run still carry"; fi
+    text+=" the $UPDATE_GROUP group (gid $gid): $(head -n 5 <<<"$carriers" | paste -sd, - | sed 's/,/, /g'). They escaped the update's unit, and sudo trusts that gid"
+    if [[ -e $UPDATE_GRANT ]]; then
+      text="leftover sudo grant: $UPDATE_GRANT exists while $UPDATE_UNIT is ${state:-not loaded}, and $text, so they can run anything as root now"
+    else
+      text+=": the next night's rule would give them root"
+    fi
+    record FAIL grant "$text. Kill them and remove any rule now: sudo kitchen-update --revoke"
+    detail "processes carrying the $UPDATE_GROUP group" "$(while read -r pid _; do printf '%s %s\n' "$pid" "$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | cut -c1-120)"; done <<<"$carriers")"
+  elif [[ -e $UPDATE_GRANT ]]; then
+    record FAIL grant "leftover sudo grant: $UPDATE_GRANT exists while $UPDATE_UNIT is ${state:-not loaded}, so the kitchen-update group can still run anything as root. Remove it now: sudo kitchen-update --revoke (or sudo rm $UPDATE_GRANT)"
+  else
+    record OK grant "no leftover kitchen-update sudo grant, and no process carries its group"
+  fi
+}
+
+# Each installed kernel must have its UKI on the ESP, built for that kernel,
+# and with nvidia DKMS installed, its nvidia module. The updater's postflight
+# checks the same after a night; this also catches a boot chain broken since,
+# or by an update at the desk. A failed night's boot-check record stands until
+# the updater's own checks pass again (the next slot, or kitchen-update --boot-check).
+check_boot_chain() {
+  local k dir kv pkgbase uki uname dkms problems=() kernels=() night why action
+  boot_verified=0
+  dkms=$(nvidia_dkms_pkg)
+  for k in "$MODULES_DIR"/*/vmlinuz; do
+    [[ -f $k ]] || continue
+    pacman -Qqo "$k" >/dev/null 2>&1 || continue
+    dir=${k%/vmlinuz}
+    kv=${dir##*/}
+    kernels+=("$kv")
+    pkgbase=$(cat "$dir/pkgbase" 2>/dev/null)
+    if [[ -z $pkgbase ]]; then
+      problems+=("kernel $kv has no pkgbase file, so its UKI cannot be found")
+      continue
+    fi
+    # shellcheck disable=SC2059 # the pattern is the format, by design
+    printf -v uki "$UKI_PATTERN" "$pkgbase"
+    if [[ ! -f $uki ]]; then
+      problems+=("$uki is missing for kernel $kv")
+    elif ! uname=$(uki_uname "$uki") || [[ $uname != "$kv" ]]; then
+      problems+=("$uki carries '${uname:-nothing}', not kernel $kv (a stale or failed UKI)")
+    fi
+    if [[ -n $dkms ]] && ! dkms_module_built "$kv"; then
+      problems+=("no $dkms module for kernel $kv (a black screen on the nvidia card)")
+    fi
+  done
+
+  if [[ -r $UPDATE_BOOT_CHECK ]]; then
+    night=$(jq -r '.night // "an earlier night"' "$UPDATE_BOOT_CHECK" 2>/dev/null)
+    why=$(jq -r '(.reasons // []) | if type == "array" then join("; ") else tostring end' "$UPDATE_BOOT_CHECK" 2>/dev/null)
+    action=$(jq -r '.action // empty' "$UPDATE_BOOT_CHECK" 2>/dev/null)
+    boot_problem="the boot chain has failed the updater's checks since $night"
+    # The updater's action starts with "do NOT reboot" and names the remedy.
+    action=${action:-"do NOT reboot until the updater's boot checks pass (sudo kitchen-update --boot-check)"}
+    if ((${#problems[@]})); then
+      record FAIL boot-chain "the nightly update of $night left a boot chain that failed its checks: ${why:-see the log}. ${action^}. It still fails: $(printf '%s; ' "${problems[@]}" | sed 's/; $//')"
+    else
+      record FAIL boot-chain "the nightly update of $night left a boot chain that failed its checks: ${why:-see the log}. ${action^}. (Each kernel's UKI and nvidia module look right now; sudo kitchen-update --boot-check re-runs the full checks and clears this.)"
+    fi
+  elif ((${#problems[@]})); then
+    boot_problem="the boot files are wrong: ${problems[0]}"
+    record FAIL boot-chain "$(printf '%s; ' "${problems[@]}" | sed 's/; $//'). Do NOT reboot: at the machine, rebuild with sudo limine-mkinitcpio${dkms:+ (sudo dkms autoinstall first for the nvidia module)}, then check omarchy secureboot status"
+  elif ((${#kernels[@]})); then
+    boot_verified=1
+    record OK boot-chain "the UKI on the ESP matches ${kernels[*]}${dkms:+, and the $dkms module is built for it}"
+  else
+    record WARN boot-chain "no package-owned kernel found in $MODULES_DIR, so the boot files could not be checked"
+  fi
+}
+
+unit_enabled() { # unit -> enabled, disabled, not-found, ...
+  local state
+  state=$(systemctl is-enabled "$1" 2>/dev/null)
+  echo "${state:-not-found}"
+}
+
+# The history of settled nights lets "nights without an update" start from the
+# last night that had nothing to do, not just from the last update.
+remember_night() {
+  local file=$STATE_DIR/update-nights last
+  last=$(tail -n 1 "$file" 2>/dev/null)
+  [[ ${last%% *} == "$us_epoch" ]] && return 0
+  { tail -n 59 "$file" 2>/dev/null; echo "$us_epoch $us_state"; } >"$file.new" && mv "$file.new" "$file"
+}
+
+nights_behind() {
+  local settled=0 t line
+  if [[ -f $UPDATE_LAST_SUCCESS ]]; then
+    settled=$(stat -c %Y "$UPDATE_LAST_SUCCESS")
+  fi
+  line=$(grep '\[PACMAN\] starting full system upgrade' "$PACMAN_LOG" 2>/dev/null | tail -n 1)
+  if [[ -n $line ]] && t=$(epoch_of "$(pacman_log_time "$line")") && ((t > settled)); then
+    settled=$t
+  fi
+  t=$(awk '$2 == "UP-TO-DATE" || $2 == "DONE" {e = $1} END {print e + 0}' "$STATE_DIR/update-nights" 2>/dev/null)
+  ((${t:-0} > settled)) && settled=$t
+  if ((settled == 0)); then
+    echo 0
+  else
+    nights_between "$settled" "$now"
+  fi
+}
+
+check_autoupdate() {
+  local timer level text why behind stale=0
+  timer=$(unit_enabled "$UPDATE_TIMER")
+  if ((!us_present)); then
+    case $timer in
+    not-found) record INFO auto-update "updater not installed (no $UPDATE_STATUS)" ;;
+    enabled) record INFO auto-update "updater enabled but it has not recorded a night yet" ;;
+    *) record INFO auto-update "updater not enabled ($UPDATE_TIMER is $timer) and no night recorded" ;;
+    esac
+    return
+  fi
+
+  [[ $us_state == "UNREADABLE" ]] || remember_night
+  # The updater counts the nights that ended without an update while updates
+  # were pending; trust its count while it is current, else work it out from
+  # the last update and the nights this check-up saw settled.
+  if [[ $us_nights =~ ^[0-9]+$ ]] && ((now - us_epoch <= 86400)); then
+    behind=$us_nights
+  else
+    behind=$(nights_behind)
+  fi
+  why=${us_reasons:+: $us_reasons}
+  case $us_state in
+  DONE)
+    level=OK text="DONE${us_packages:+, $(plural "$us_packages" package) updated}"
+    [[ $us_reboot == "needed" || $us_reboot == "recommended" ]] && text+=", reboot $us_reboot"
+    text+=$why
+    ;;
+  RUNNING)
+    # Written just before the update starts, and replaced by its result.
+    case $(systemctl show -P ActiveState "$UPDATE_UNIT" 2>/dev/null) in
+    active | activating | deactivating | reloading)
+      level=INFO text="an update is running now (since $(date -d "@$us_epoch" '+%H:%M'))"
+      ;;
+    *)
+      level=FAIL text="the update of ${us_night:-an earlier night} started at $(date -d "@$us_epoch" '+%a %F %H:%M') and never recorded how it ended (stopped, killed, a crash or a power cut): the system may be half-updated. Do not reboot yet: read ${us_log:-/var/log/kitchen-update/}, check the end of /var/log/pacman.log and 'omarchy secureboot status' at the machine"
+      ;;
+    esac
+    ;;
+  UP-TO-DATE)
+    level=OK text="nothing to update"
+    ;;
+  BUSY | DEFERRED)
+    level=INFO text="$us_state$why; the next slot retries"
+    ;;
+  HELD)
+    level=WARN text="HELD$why. ${us_hint^}"
+    [[ -n $us_hint ]] || text+="Run 'omarchy update' yourself at the machine; that clears the hold"
+    ;;
+  FAILED)
+    # The updater's action names the remedy for what failed; a clean Secure
+    # Boot status alone does not make a reboot safe (a missing nvidia module or
+    # a stale UKI leaves it clean).
+    level=FAIL text="the update FAILED$why. Do not reboot yet: ${us_hint:-read ${us_log:-/var/log/kitchen-update/} first}"
+    ;;
+  UNREADABLE)
+    record WARN auto-update "cannot read $UPDATE_STATUS"
+    return
+    ;;
+  *)
+    level=WARN text="unknown state '$us_state'$why"
+    ;;
+  esac
+
+  # The updater writes status.json every night it runs, so an older file means
+  # no run last night: the timer is off, or the machine was off.
+  if ((now - us_epoch > 86400)); then
+    stale=1
+    text="no run last night ($UPDATE_TIMER $timer); last run ${us_night:-$(date -d "@$us_epoch" '+%a %F')}: $text"
+    [[ $level == "OK" ]] && level=INFO
+  else
+    text="last night: $text"
+  fi
+
+  if [[ $level == "OK" || $level == "INFO" ]] && ((pending_count > 0 && behind >= UPDATE_BEHIND_WARN_NIGHTS)); then
+    level=WARN
+    text+="; no update for $behind nights with $pending_count pending"
+    ((stale)) || text+=". Something keeps every night busy (an open SSH session, a long job); see the reasons, or run 'omarchy update' yourself"
+  fi
+
+  # What the updater flagged for a look (no pre-update snapshot, processes it
+  # had to kill) makes a good night a WARN.
+  if [[ -n $us_warnings ]]; then
+    [[ $level == "OK" || $level == "INFO" ]] && level=WARN
+    text+=". Look at: $us_warnings"
+  fi
+
+  record "$level" auto-update "$text"
+  if [[ $level != "OK" ]]; then
+    detail "$UPDATE_STATUS" "$(jq . "$UPDATE_STATUS" 2>/dev/null || cat "$UPDATE_STATUS")"
+  fi
+}
+
+# The updater's own record of a reboot it asked for: reboot-pending holds
+# {since, level, reasons, boot_id} from that night until the machine boots
+# again, so its date survives the nights after it. Sets rp_level, rp_since
+# (epoch, 0 if unreadable) and rp_why; fails when there is no record for this boot.
+load_reboot_pending() {
+  local fields
+  rp_level="" rp_since=0 rp_why=""
+  [[ -r $UPDATE_REBOOT_PENDING ]] || return 1
+  fields=$(jq -r --arg b "$(boot_id)" 'select(.boot_id == $b and $b != "")
+    | [(.level // "" | tostring), (.since // "" | tostring), (.reasons // [] | if type == "array" then map(tostring) | join("; ") else tostring end)]
+    | map(gsub("[\\s\u001f]+"; " ")) | join("\u001f")' "$UPDATE_REBOOT_PENDING" 2>/dev/null)
+  [[ -n $fields ]] || return 1
+  IFS=$'\x1f' read -r rp_level rp_since rp_why <<<"$fields"
+  # date -d "" is today's midnight, so an empty since must not reach it.
+  if [[ -z $rp_since ]] || ! rp_since=$(epoch_of "$rp_since"); then
+    rp_since=0
+  fi
+  [[ $rp_level == "needed" || $rp_level == "recommended" ]]
+}
+
+pacman_log_time() { # "[2026-09-27T11:18:36-0400] ..." -> 2026-09-27T11:18:36-0400
+  local ts=${1#\[}
+  echo "${ts%%\]*}"
+}
+
+pkg_changed_at() { # package -> epoch of its last install or upgrade, from pacman.log
+  local ts
+  ts=$(awk -v p="$1" '$2 == "[ALPM]" && $3 ~ /^(installed|upgraded|reinstalled|downgraded)$/ && $4 == p {ts = $1} END {print ts}' "$PACMAN_LOG" 2>/dev/null)
+  [[ -n $ts ]] && epoch_of "$(pacman_log_time "$ts")"
+}
+
+# Omarchy's own three tests (bin/omarchy-update-restart), plus the updater's
+# "recommended" when it changed the boot chain.
+check_reboot() {
+  local running kernel release owner installed=() owners=() match=0 reasons=() since=() t home exe sb_note first booted
+  local up_level="" up_since=0 up_why="" up_when=""
+  running=$(uname -r)
+  booted=$(boot_epoch)
+  [[ $booted =~ ^[0-9]+$ ]] || booted=0
+  for kernel in "$MODULES_DIR"/*/vmlinuz; do
+    [[ -f $kernel ]] || continue
+    owner=$(pacman -Qqo "$kernel" 2>/dev/null) || continue
+    release=${kernel%/vmlinuz}
+    release=${release##*/}
+    installed+=("$release")
+    owners+=("$owner")
+    [[ $release == "$running" ]] && match=1
+  done
+  if ((!match)); then
+    reasons+=("kernel $running is running, ${installed[*]:-none} installed")
+    for owner in "${owners[@]}"; do
+      t=$(pkg_changed_at "$owner") && since+=("$t")
+    done
+  fi
+
+  home=$(user_home)
+  if [[ -n $home && -f $home/.local/state/omarchy/reboot-required ]]; then
+    reasons+=("Omarchy flagged reboot-required")
+    since+=("$(stat -c %Y "$home/.local/state/omarchy/reboot-required")")
+  fi
+
+  while read -r exe; do
+    if [[ $exe == *"(deleted)"* ]]; then
+      reasons+=("Hyprland was replaced while running")
+      t=$(pkg_changed_at hyprland) && since+=("$t")
+      break
+    fi
+  done < <(hyprland_exes)
+
+  # "Safe" needs more than a clean Secure Boot status: a missing nvidia module,
+  # a stale UKI or pacman cut off in its hooks all leave that status clean.
+  case ${sb_state:-unknown} in
+  unknown) sb_note="" ;;
+  clean)
+    if [[ -n $boot_problem ]]; then
+      sb_note="do NOT reboot: $boot_problem (see boot-chain and transaction above)"
+    elif ((boot_verified)); then
+      sb_note="Secure Boot status is clean and the UKI matches every installed kernel, so rebooting at the machine is safe"
+    else
+      sb_note="Secure Boot status is clean"
+    fi
+    ;;
+  *) sb_note="Secure Boot needs attention: do NOT reboot until 'omarchy secureboot status' is clean" ;;
+  esac
+
+  # What the updater asked for: its reboot-pending record for this boot, else
+  # the last status, if it was written after this boot.
+  if load_reboot_pending; then
+    up_level=$rp_level up_since=$rp_since up_why=$rp_why
+  elif ((us_epoch > booted)); then
+    up_level=$us_reboot up_since=$us_epoch up_why=$us_reboot_why
+  fi
+  ((up_since > 0)) && up_when=" since $(date -d "@$up_since" '+%a %F %H:%M')"
+
+  if ((${#reasons[@]})); then
+    first=""
+    if ((${#since[@]})); then
+      first=$(printf '%s\n' "${since[@]}" | sort -n | head -n 1)
+      first=" since $(date -d "@$first" '+%a %F %H:%M')"
+    fi
+    record WARN reboot "reboot pending$first: $(printf '%s; ' "${reasons[@]}" | sed 's/; $//')${sb_note:+. $sb_note}"
+  elif [[ $up_level == "needed" ]]; then
+    # The updater saw a reason the three tests above no longer show.
+    record WARN reboot "reboot pending$up_when: the last update says a reboot is needed${up_why:+ ($up_why)}${sb_note:+. $sb_note}"
+  elif [[ $up_level == "recommended" ]]; then
+    record INFO reboot "the last update recommends a reboot${up_why:+ ($up_why)}; reboot at the machine to test the new boot chain${sb_note:+. $sb_note}"
+  else
+    record OK reboot "no reboot pending"
+  fi
+}
+
+check_failed_units() {
+  local unit bad=() known=() user_failed
+  while read -r unit _; do
+    [[ -n $unit ]] || continue
+    if [[ " $KNOWN_FAILED_UNITS " == *" $unit "* ]]; then
+      known+=("$unit")
+    else
+      bad+=("$unit")
+    fi
+  done < <(systemctl list-units --failed --plain --no-legend --full 2>/dev/null)
+  if user_session; then
+    user_failed=$(as_user systemctl --user list-units --failed --plain --no-legend --full 2>/dev/null | awk 'NF {print "user:" $1}')
+    [[ -n $user_failed ]] && mapfile -t -O "${#bad[@]}" bad <<<"$user_failed"
+  fi
+  if ((${#bad[@]})); then
+    record FAIL units "${#bad[@]} failed: ${bad[*]}"
+  else
+    record OK units "no unexpected failed units (${#known[@]} known NvPCR failures ignored)"
+  fi
+}
+
+check_services() {
+  local s down=()
+  for s in $EXPECT_ACTIVE; do
+    systemctl is-active --quiet "$s" || down+=("$s")
+  done
+  if ((${#down[@]})); then
+    record WARN services "not active: ${down[*]}"
+  else
+    record OK services "active: $EXPECT_ACTIVE"
+  fi
+}
+
+check_space() {
+  local root_free boot_free data_pct
+  # btrfs's estimate accounts for metadata and profiles; df is the fallback.
+  root_free=$(btrfs filesystem usage -b / 2>/dev/null | awk '/Free \(estimated\)/ {print $3; exit}')
+  [[ $root_free =~ ^[0-9]+$ ]] || root_free=$(df -B1 --output=avail / 2>/dev/null | tail -n 1 | tr -dc 0-9)
+  if [[ ! $root_free =~ ^[0-9]+$ ]]; then
+    record WARN space "cannot read the free space on /"
+  else
+    root_free=$((root_free / 1024 ** 3))
+    if ((root_free < ROOT_FAIL_GIB)); then
+      record FAIL space "/ has ${root_free} GiB free"
+    elif ((root_free < ROOT_WARN_GIB)); then
+      record WARN space "/ has ${root_free} GiB free"
+    else
+      record OK space "/ has ${root_free} GiB free"
+    fi
+  fi
+
+  # A kernel update writes a new UKI (about 271 MiB) next to the old one.
+  boot_free=$(df -B1 --output=avail /boot 2>/dev/null | tail -n 1 | tr -dc 0-9)
+  if [[ ! $boot_free =~ ^[0-9]+$ ]]; then
+    record WARN esp "cannot read the free space on /boot"
+  else
+    boot_free=$((boot_free / 1024 ** 2))
+    if ((boot_free < BOOT_FAIL_MIB)); then
+      record FAIL esp "/boot has ${boot_free} MiB free: a new UKI may not fit"
+    elif ((boot_free < BOOT_WARN_MIB)); then
+      record WARN esp "/boot has ${boot_free} MiB free"
+    else
+      record OK esp "/boot has ${boot_free} MiB free"
+    fi
+  fi
+
+  if mountpoint -q "$DATA_MOUNT"; then
+    data_pct=$(df --output=pcent "$DATA_MOUNT" 2>/dev/null | tail -n 1 | tr -dc 0-9)
+    if [[ ! $data_pct =~ ^[0-9]+$ ]]; then
+      record WARN data-space "cannot read the use of $DATA_MOUNT"
+    elif ((data_pct >= DATA_WARN_PCT)); then
+      record WARN data-space "$DATA_MOUNT is ${data_pct}% full"
+    else
+      record OK data-space "$DATA_MOUNT is ${data_pct}% full"
+    fi
+  fi
+}
+
+check_data_mount() {
+  local src opts
+  src=$(findmnt -no SOURCE "$DATA_MOUNT" 2>/dev/null)
+  opts=$(findmnt -no OPTIONS "$DATA_MOUNT" 2>/dev/null)
+  if [[ -z $src ]]; then
+    record FAIL data-mount "$DATA_MOUNT is not mounted (the LUKS keyfile unlock or the nofail mount failed)"
+  elif [[ $src != "$DATA_SOURCE" ]]; then
+    record FAIL data-mount "$DATA_MOUNT comes from $src, expected $DATA_SOURCE"
+  elif [[ ,$opts, != *",rw,"* ]]; then
+    record FAIL data-mount "$DATA_MOUNT is mounted read-only ($opts)"
+  else
+    record OK data-mount "$DATA_MOUNT mounted rw from $DATA_SOURCE"
+  fi
+}
+
+# One drive's verdict as "LEVEL<tab>text". Counters are compared with the last
+# run's ($prev); a drive seen for the first time is its own baseline, and so is
+# one whose last read failed.
+# shellcheck disable=SC2016 # a jq program, not shell
+NVME_JQ='
+.[$s] as $e
+| if $e == null then "FAIL\tdrive not found (is it still connected?)"
+  elif ($e | has("error")) then "FAIL\tSMART read failed: \($e.error)"
+  else
+    ($prev[$s] | if . == null or has("error") then $e else . end) as $p
+    | def d(k): ($e[k] // 0) - ($p[k] // 0);
+    [ (if $e.critical_warning != 0 then "critical_warning=\($e.critical_warning)" else empty end),
+      (if $e.available_spare < $e.spare_threshold then "spare \($e.available_spare)% below its \($e.spare_threshold)% threshold" else empty end),
+      (if d("media_errors") > 0 then "+\(d("media_errors")) media errors" else empty end)
+    ] as $fail
+    | [ (if $e.percentage_used >= $used then "\($e.percentage_used)% of rated life used" else empty end),
+        (if $e.temperature_c >= $temp then "\($e.temperature_c)C" else empty end),
+        (if d("crit_temp_minutes") > 0 then "+\(d("crit_temp_minutes")) min above critical temperature" else empty end),
+        (if $e.media_errors > 0 and d("media_errors") == 0 then "\($e.media_errors) media errors (unchanged)" else empty end)
+      ] as $warn
+    | "\($e.percentage_used)% used, spare \($e.available_spare)%, \($e.temperature_c)C, media errors \($e.media_errors), error log +\(d("error_log_entries")), unsafe shutdowns +\(d("unsafe_shutdowns"))" as $info
+    | if ($fail | length) > 0 then "FAIL\t\($fail | join("; ")) (\($info))"
+      elif ($warn | length) > 0 then "WARN\t\($warn | join("; ")) (\($info))"
+      elif d("error_log_entries") > 0 then "INFO\t\($info)"
+      else "OK\t\($info)" end
+  end'
+
+check_nvme() {
+  local json prev pair serial role verdict serials state=$STATE_DIR/nvme.json
+  # The helper exits 1 when one drive fails to answer but still prints the rest.
+  json=$(run_timeout 30 python3 "$NVME_HELPER" 2>/dev/null)
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$json"; then
+    record FAIL nvme "SMART read failed: $NVME_HELPER printed no drive data"
+    return
+  fi
+  prev=$(cat "$state" 2>/dev/null)
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$prev" || prev='{}'
+  serials=$NVME_SERIALS
+  [[ -n $serials ]] || serials=$(jq -r 'keys[] | "\(.):\(.)"' <<<"$json")
+  for pair in $serials; do
+    serial=${pair%%:*} role=${pair#*:}
+    verdict=$(jq -r --arg s "$serial" --argjson prev "$prev" \
+      --argjson used "$NVME_USED_WARN" --argjson temp "$NVME_TEMP_WARN" "$NVME_JQ" <<<"$json")
+    record "${verdict%%$'\t'*}" "nvme-$role" "$serial: ${verdict#*$'\t'}"
+  done
+  # Keep the last good reading of a drive that failed to answer this time, so
+  # its counters still compare against something real next run.
+  jq -s '.[0] * (.[1] | with_entries(select(.value | has("error") | not)))' \
+    <(printf '%s\n' "$prev") <(printf '%s\n' "$json") >"$state.new" && mv "$state.new" "$state"
+}
+
+check_btrfs() {
+  local fs out
+  for fs in $BTRFS_MOUNTS; do
+    # An unmounted /mnt/data is data-mount's finding.
+    mountpoint -q "$fs" || continue
+    if out=$(btrfs device stats --check "$fs" 2>&1); then
+      record OK "btrfs $fs" "device error counters all zero"
+    else
+      record FAIL "btrfs $fs" "device errors: $(grep -v ' 0$' <<<"$out" | tr -s ' \n' ' ' | sed 's/ $//')"
+    fi
+    check_scrub "$fs" "$(btrfs scrub status "$fs" 2>&1)"
+  done
+}
+
+check_scrub() { # mountpoint "btrfs scrub status" output
+  local fs=$1 out=$2 summary status started t age counts timer
+  timer="btrfs-scrub@$(systemd-escape -p "$fs").timer"
+  summary=$(sed -n 's/^Error summary:[[:space:]]*//p' <<<"$out")
+  status=$(sed -n 's/^Status:[[:space:]]*//p' <<<"$out")
+  # "Scrub started:    Mon Sep 28 12:34:49 2026": the date has colons too.
+  started=$(sed -n 's/^Scrub started:[[:space:]]*//p' <<<"$out")
+  if [[ -z $summary ]]; then
+    record WARN "scrub $fs" "cannot read the scrub status: $(head -n 1 <<<"$out")"
+  elif [[ $summary != "no errors found" ]]; then
+    counts=$(sed -n 's/^[[:space:]]*\(Corrected\|Uncorrectable\|Unverified\):[[:space:]]*\([0-9]*\).*/\1 \2/p' <<<"$out" | paste -sd, - | sed 's/,/, /g')
+    record FAIL "scrub $fs" "the last scrub found errors: $summary${counts:+ ($counts)}"
+  elif [[ $status == "running" ]] || grep -q '^ETA:' <<<"$out"; then
+    record INFO "scrub $fs" "a scrub is running now"
+  elif [[ -z $started ]]; then
+    # A timer enabled today has simply not had its first month yet.
+    if [[ $(unit_enabled "$timer") == "enabled" ]]; then
+      record INFO "scrub $fs" "not scrubbed yet; $timer is enabled and scrubs monthly"
+    else
+      record INFO "scrub $fs" "never scrubbed (enable $timer)"
+    fi
+  elif ! t=$(epoch_of "$started"); then
+    record WARN "scrub $fs" "cannot read the last scrub's date: $started"
+  else
+    age=$(((now - t) / 86400))
+    if ((age > SCRUB_WARN_DAYS)); then
+      record WARN "scrub $fs" "last scrub $age days ago ($status); is $timer enabled?"
+    elif [[ $status != "finished" ]]; then
+      record INFO "scrub $fs" "the last scrub, $age day(s) ago, was $status before the end; the next monthly run starts over"
+    else
+      record OK "scrub $fs" "last scrub $age day(s) ago, no errors"
+    fi
+  fi
+}
+
+check_time() {
+  local synced
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+  if [[ $synced == "yes" ]]; then
+    record OK time "NTP synchronized"
+  else
+    record WARN time "clock not NTP-synchronized (NTPSynchronized=${synced:-unknown})"
+  fi
+}
+
+check_last_update() {
+  local line ts t age
+  line=$(grep '\[PACMAN\] starting full system upgrade' "$PACMAN_LOG" 2>/dev/null | tail -n 1)
+  if [[ -z $line ]]; then
+    record WARN last-update "no full system upgrade in $PACMAN_LOG"
+    return
+  fi
+  ts=$(pacman_log_time "$line")
+  if ! t=$(epoch_of "$ts"); then
+    record WARN last-update "cannot read the date of the last full upgrade ($ts)"
+    return
+  fi
+  age=$(((now - t) / 86400))
+  if ((age >= UPDATE_FAIL_DAYS)); then
+    record FAIL last-update "last full upgrade $age days ago ($ts)"
+  elif ((age >= UPDATE_WARN_DAYS)); then
+    record WARN last-update "last full upgrade $age days ago ($ts)"
+  else
+    record OK last-update "last full upgrade $age day(s) ago ($ts)"
+  fi
+}
+
+# libalpm logs "transaction started" and then exactly one of completed, failed
+# or interrupted. A start with nothing after it means pacman died part way.
+# But "completed" comes BEFORE the post-transaction hooks (DKMS, the UKI build
+# and its signing, about a minute against a second for the transaction), so a
+# pacman killed there leaves a complete-looking log and only its lock behind.
+check_transaction() {
+  local last ts during
+  last=$(grep -E '\[ALPM\] transaction (started|completed|failed|interrupted)$' "$PACMAN_LOG" 2>/dev/null | tail -n 1)
+  ts=$(pacman_log_time "$last")
+  case $last in
+  *"transaction started")
+    if pacman_running; then
+      record INFO transaction "a package transaction is running now (started $ts)"
+    else
+      boot_problem="a package transaction never finished"
+      record FAIL transaction "the package transaction started $ts never finished. Before rebooting, finish it at the machine with 'omarchy update' and check 'omarchy secureboot status'"
+    fi
+    ;;
+  *"transaction interrupted")
+    boot_problem="a package transaction was interrupted"
+    record FAIL transaction "the package transaction at $ts was interrupted. Before rebooting, finish it at the machine with 'omarchy update' and check 'omarchy secureboot status'"
+    ;;
+  *"transaction failed")
+    record WARN transaction "the last package transaction ($ts) failed; see $PACMAN_LOG for what it left behind"
+    ;;
+  esac
+
+  # A lock with no package manager behind it: pacman died, and the nightly
+  # run refuses to start. Where it died decides what is unfinished.
+  if [[ -e $PACMAN_LOCK ]] && ! pacman_running; then
+    during=$(awk '
+      /\[ALPM\] transaction (started|completed|failed|interrupted)$/ { last = $NF; hooks = 0; next }
+      /\[PACMAN\] Running / { last = "new"; hooks = 0; next }
+      last == "completed" && /\[ALPM\] running .*\.hook.\.\.\.$/ { hooks = 1 }
+      END { print (last == "completed" && hooks) ? "hooks" : "other" }' "$PACMAN_LOG" 2>/dev/null)
+    if [[ $during == "hooks" ]]; then
+      boot_problem="pacman died during its post-transaction hooks"
+      record FAIL pacman-lock "pacman died during its post-transaction hooks (after its transaction at $ts completed): DKMS, the UKI build and signing may be unfinished. Do NOT reboot. At the machine: remove $PACMAN_LOCK, reinstall the kernel packages (or run limine-mkinitcpio), then run omarchy secureboot status"
+    else
+      boot_problem=${boot_problem:-"pacman died and left its lock"}
+      record FAIL pacman-lock "$PACMAN_LOCK exists with no package manager running: pacman died (a crash or a power cut?) and updates refuse to start. Do NOT reboot until the end of $PACMAN_LOG is understood; then remove the lock at the machine and run omarchy update"
+    fi
+  fi
+}
+
+check_pending() {
+  local pacnew
+  case $pending_rc in
+  0)
+    record INFO updates "$pending_count pending"
+    detail "pending updates" "$pending"
+    ;;
+  2) record OK updates "no pending updates" ;;
+  *) record WARN updates "checkupdates failed (exit $pending_rc; network or mirror down?)" ;;
+  esac
+  if [[ -n $held_back ]]; then
+    detail "held back by IgnorePkg" "$held_back"
+  fi
+
+  pacnew=$(pacdiff -o 2>/dev/null)
+  if [[ -n $pacnew ]]; then
+    record INFO pacnew "$(plural "$(grep -c . <<<"$pacnew")" file) to merge (.pacnew/.pacsave; pacdiff -o)"
+    detail ".pacnew and .pacsave files" "$pacnew"
+  fi
+}
+
+# Error lines, "identifier: message", minus the patterns in $JOURNAL_IGNORE.
+# Comment and blank lines are dropped first: a blank pattern would match, and
+# so hide, every line.
+check_journal() {
+  local since raw patterns filtered count cores
+  since=$(cat "$STATE_DIR/last-run" 2>/dev/null)
+  since=${since:--24h}
+  raw=$(journalctl -q -p err --since "$since" -o short-iso --no-pager 2>/dev/null |
+    sed -E 's/^[^ ]+ [^ ]+ //; s/\[[0-9]+\]:/:/')
+  if [[ -r $JOURNAL_IGNORE ]]; then
+    patterns=$(grep -vE '^[[:space:]]*(#|$)' "$JOURNAL_IGNORE")
+  else
+    patterns=$DEFAULT_IGNORE
+  fi
+  filtered=$raw
+  if [[ -n $patterns ]]; then
+    filtered=$(grep -vE -f <(printf '%s\n' "$patterns") <<<"$raw" 2>/dev/null)
+    # grep says 2 for a broken pattern and prints nothing: that must not read
+    # as a clean journal, so fall back to the unfiltered lines.
+    if (($? > 1)); then
+      record WARN journal-filter "$JOURNAL_IGNORE has an invalid pattern, so no journal line was filtered"
+      filtered=$raw
+    fi
+  fi
+  count=$(grep -c . <<<"$filtered")
+  if ((count > 0)); then
+    record WARN journal "$count unexpected error lines since $since ($(grep -c . <<<"$raw") before the noise filter)"
+    detail "journal errors after the noise filter (count, message)" "$(sort <<<"$filtered" | uniq -c | sort -rn | head -n 40)"
+  else
+    record OK journal "no unexpected errors since $since ($(grep -c . <<<"$raw") known-noise lines)"
+  fi
+
+  # coredumpctl's text table ends in SIZE, so read its JSON for the program.
+  cores=$(coredumpctl --json=short --no-pager list --since "$since" 2>/dev/null |
+    jq -r '.[] | .exe // "?" | split("/") | last' 2>/dev/null | sort | uniq -c |
+    awk '{print $2 " x" $1}' | paste -sd, - | sed 's/,/, /g')
+  if [[ -n $cores ]]; then
+    record WARN coredumps "crashes since $since: $cores (coredumpctl list)"
+  fi
+}
+
+check_timers() {
+  local t state off=() absent=() text=""
+  for t in $EXPECT_TIMERS; do
+    state=$(unit_enabled "$t")
+    case $state in
+    enabled | enabled-runtime | static | indirect | generated | alias | linked | linked-runtime) ;;
+    not-found) absent+=("$t") ;;
+    *) off+=("$t") ;;
+    esac
+  done
+  ((${#off[@]})) && text="not enabled: ${off[*]}"
+  ((${#absent[@]})) && text+="${text:+; }not installed: ${absent[*]}"
+  if [[ -n $text ]]; then
+    record INFO timers "$text"
+  else
+    record OK timers "scrub, update and check-up timers enabled"
+  fi
+}
+
+run_checks() {
+  sb_state=unknown boot_problem="" boot_verified=0
+  collect_updates
+  load_update_status
+  # The boot chain first: check_reboot says whether a reboot is safe from
+  # what these three found.
+  check_secureboot
+  check_boot_chain
+  check_transaction
+  check_pin
+  check_grant
+  check_autoupdate
+  check_reboot
+  check_failed_units
+  check_services
+  check_space
+  check_data_mount
+  check_nvme
+  check_btrfs
+  check_time
+  check_last_update
+  check_pending
+  check_journal
+  check_timers
+}
+
+# ---- report -------------------------------------------------------------------
+
+tally() {
+  local level
+  nfail=0 nwarn=0 ninfo=0 nok=0
+  for level in "${levels[@]}"; do
+    case $level in
+    FAIL) nfail=$((nfail + 1)) ;;
+    WARN) nwarn=$((nwarn + 1)) ;;
+    INFO) ninfo=$((ninfo + 1)) ;;
+    *) nok=$((nok + 1)) ;;
+    esac
+  done
+  if ((nfail)); then
+    status=FAIL
+  elif ((nwarn)); then
+    status=WARN
+  else
+    status=OK
+  fi
+}
+
+result_json() {
+  local i args=()
+  for i in "${!levels[@]}"; do
+    args+=("${levels[$i]}" "${checks[$i]}" "${messages[$i]}")
+  done
+  jq -n --arg status "$status" --arg time "$(date -d "@$now" -Is)" --arg host "$(uname -n)" \
+    --arg report "$report" --arg omarchy "$(pacman -Q omarchy-dev 2>/dev/null)" --arg kernel "$(uname -r)" \
+    --argjson fail "$nfail" --argjson warn "$nwarn" --argjson info "$ninfo" --argjson ok "$nok" \
+    '{status: $status, time: $time, host: $host, report: $report, omarchy: $omarchy, kernel: $kernel,
+      counts: {fail: $fail, warn: $warn, info: $info, ok: $ok},
+      checks: [$ARGS.positional as $a | range(0; $a | length; 3) as $i
+        | {level: $a[$i], check: $a[$i + 1], message: $a[$i + 2]}]}' \
+    --args "${args[@]}"
+}
+
+write_report() {
+  local i
+  mkdir -p "$REPORT_DIR" "$STATE_DIR"
+  chmod 0755 "$REPORT_DIR"
+  {
+    printf 'kitchen-sink check-up, %s\n' "$(date -d "@$now" '+%F %T %Z')"
+    printf 'up %s; %s; kernel %s\n' "$(uptime -p 2>/dev/null | sed 's/^up //')" \
+      "$(pacman -Q omarchy-dev 2>/dev/null || echo 'omarchy-dev not installed')" "$(uname -r)"
+    printf 'Result: %s (%d fail, %d warn, %d info, %d ok)\n\n' "$status" "$nfail" "$nwarn" "$ninfo" "$nok"
+    for i in "${!levels[@]}"; do
+      printf '%-4s  %-15s %s\n' "${levels[$i]}" "${checks[$i]}" "${messages[$i]}"
+    done
+    printf '%s' "$details"
+  } >"$report.new" && mv "$report.new" "$report"
+  chmod 0644 "$report"
+  ln -sfn "${report##*/}" "$REPORT_DIR/latest.txt"
+  result_json >"$REPORT_DIR/latest.json.new" && mv "$REPORT_DIR/latest.json.new" "$REPORT_DIR/latest.json"
+  chmod 0644 "$REPORT_DIR/latest.json"
+  find "$REPORT_DIR" -maxdepth 1 -name '20*.txt' -mtime +"$KEEP_REPORTS_DAYS" -delete
+  date -d "@$now" -Is >"$STATE_DIR/last-run"
+}
+
+# The toast: every FAIL, then every WARN, up to six lines; on a clean day, a
+# one-line summary. Clicking it opens today's report.
+send_toast() {
+  local urgency title body i level
+  case $status in
+  OK) urgency=low title="kitchen-sink check-up: all good" ;;
+  WARN) urgency=normal title="kitchen-sink check-up: $(plural "$nwarn" warning)" ;;
+  FAIL)
+    urgency=critical title="kitchen-sink check-up: $(plural "$nfail" problem)"
+    ((nwarn)) && title+=", $(plural "$nwarn" warning)"
+    ;;
+  esac
+  body=$(for level in FAIL WARN; do
+    for i in "${!levels[@]}"; do
+      [[ ${levels[$i]} == "$level" ]] && printf '%s: %s\n' "${checks[$i]}" "${messages[$i]}"
+    done
+  done | head -n 6)
+  if [[ -z $body ]]; then
+    body="$((nok + ninfo)) checks passed"
+    case $pending_count in
+    -1) ;;
+    0) body+="; no updates pending" ;;
+    *) body+="; $pending_count updates pending" ;;
+    esac
+  fi
+  if [[ ! -x $NOTIFY_CMD ]]; then
+    echo "kitchen-checkup: $NOTIFY_CMD is missing, so no toast" >&2
+    return 0
+  fi
+  "$NOTIFY_CMD" --urgency "$urgency" --title "$title" --body "$body" --open "$report" \
+    --wait "$NOTIFY_WAIT_SECS" --user "$DESKTOP_USER" --app-name kitchen-sink-checkup --glyph "$GLYPH"
+}
+
+# ---- main ---------------------------------------------------------------------
+
+usage() {
+  cat <<'USAGE'
+Usage: kitchen-checkup [--no-notify] [--quiet] [--json]
+  --no-notify  skip the desktop toast
+  --quiet      print only the WARN and FAIL results
+  --json       print the result as JSON (the same document as latest.json)
+USAGE
+}
+
+# Source the settings file, but only one that only root can change: this runs
+# as root, and sourcing runs whatever is in the file.
+load_config() {
+  local mode owner
+  [[ -f $CONF ]] || return 0
+  if ((EUID == 0)); then
+    read -r mode owner < <(stat -c '%a %u' "$CONF")
+    if ((owner != 0 || 8#$mode & 8#022)); then
+      record WARN config "ignored $CONF: it must be owned by root and not writable by others (mode $mode, uid $owner)"
+      return 0
+    fi
+  fi
+  # shellcheck source=/dev/null
+  source "$CONF"
+}
+
+on_exit() {
+  local rc=$?
+  ((finished)) && return
+  printf '%skitchen-checkup stopped before finishing (exit %d); the report was not written\n' \
+    "$([[ $OUTPUT == "journal" ]] && echo '<3>')" "$rc" >&2
+  exit 3
+}
+
+main() {
+  local arg no_notify=0 want_json=0 quiet=0
+  for arg in "$@"; do
+    case $arg in
+    --no-notify) no_notify=1 ;;
+    --json) want_json=1 ;;
+    --quiet) quiet=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "kitchen-checkup: unknown option $arg" >&2
+      usage >&2
+      exit 3
+      ;;
+    esac
+  done
+  if ((EUID != 0)); then
+    echo "kitchen-checkup: run as root (sudo kitchen-checkup)" >&2
+    exit 3
+  fi
+
+  # Fixed parsing: dates, btrfs and pacman output in the C locale, from a known PATH.
+  export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+  if ((want_json)); then
+    OUTPUT=json
+  elif journal_stdout; then
+    OUTPUT=journal
+  fi
+  QUIET=$quiet
+  finished=0
+  trap on_exit EXIT
+
+  load_config
+  ((no_notify)) && NOTIFY=0
+  now=$(date +%s)
+  report=$REPORT_DIR/$(date -d "@$now" +%F).txt
+  mkdir -p "$STATE_DIR" "$CACHE_DIR"
+
+  run_checks
+  tally
+  write_report
+
+  case $OUTPUT in
+  json) cat "$REPORT_DIR/latest.json" ;;
+  journal) printf '<%d>Result: %s (%d fail, %d warn), report %s\n' "$(priority "$status")" "$status" "$nfail" "$nwarn" "$report" ;;
+  *) printf '\nResult: %s (%d fail, %d warn); report %s\n' "$status" "$nfail" "$nwarn" "$report" ;;
+  esac
+
+  if ((NOTIFY)) && { [[ $status != "OK" ]] || ((NOTIFY_WHEN_OK)); }; then
+    send_toast
+  fi
+
+  finished=1
+  case $status in
+  OK) exit 0 ;;
+  WARN) exit 1 ;;
+  *) exit 2 ;;
+  esac
+}
+
+# Sourced by the tests for its functions; run otherwise.
+if [[ ${BASH_SOURCE[0]:-$0} == "$0" ]]; then
+  main "$@"
+fi
