@@ -1,0 +1,78 @@
+# /etc/systemd/system/kitchen-thermal.service
+# kitchen-sink's thermal events: Super I/O (nct6799), NVMe AENs, the GPU (NVML)
+# and the kernel log, turned into journal lines, Omarchy hooks
+# (`omarchy-hook thermal ...`) and a few toasts. See
+# /usr/local/lib/kitchen-sink/kitchen-thermald.py and /etc/kitchen-sink/thermal.conf.
+#   systemctl status kitchen-thermal       what each source is doing (STATUS=)
+#   journalctl -t kitchen-thermal          every event, with KITCHEN_* fields
+#   kitchen-thermald.py --dump-state       /run/kitchen-thermal/state.json
+#   sudo kitchen-thermald.py --test-event cpu-hot start level=warn temp=91
+#                                          a test event, which this service delivers
+#                                          (the request file and SIGUSR1)
+[Unit]
+Description=kitchen-sink thermal events (Super I/O, NVMe, GPU)
+# nct6775 comes from modules-load.d; the daemon also copes with it arriving later.
+After=systemd-modules-load.service systemd-udevd.service local-fs.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/lib/kitchen-sink/kitchen-thermald.py
+# Re-reads thermal.conf and checkup.conf, then re-arms the NVMe drives.
+ExecReload=/bin/kill -HUP $MAINPID
+# Coverage stops when the daemon does, so it always comes back.
+Restart=always
+RestartSec=5
+SyslogIdentifier=kitchen-thermal
+# /run/kitchen-thermal/state.json, world-readable for the check-up. Kept across
+# a restart so a restarted daemon does not announce a degraded source twice.
+RuntimeDirectory=kitchen-thermal
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=96M
+TasksMax=64
+
+# Root, for two things only: the NVMe admin ioctls (Identify, Get/Set Features
+# 0Bh) need CAP_SYS_ADMIN, and writing the nvme hwmon temp1_max/temp1_min
+# (root-owned sysfs files) and starting hooks in the desktop user's manager
+# (systemd-run --user --machine=USER@.host, which PID1 allows root) need uid 0.
+# Nothing else is kept: no setuid (toasts run as the user, in their manager),
+# no network, no module loading, no kernel log device (journalctl reads the
+# journal files, which root owns). Without CAP_DAC_READ_SEARCH root cannot
+# enter the user's /run/user/UID either, and ProtectHome hides it: the daemon
+# asks PID 1 (systemctl is-active user@UID.service) whether the user's manager
+# is up.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+# The file system: read-only but /sys (the NVMe thresholds), /dev (/dev/nvme*,
+# /dev/nvidia*) and the runtime directory. So no ProtectKernelTunables (it
+# makes /sys read-only) and no PrivateDevices. CAP_SYS_ADMIN could undo all of
+# that with mount(2) (systemd.exec(5) warns so), so the system call filter
+# refuses the mount calls: a compromised daemon, or a library it loads
+# (libnvidia-ml), cannot remount / writable or unmount the hidden /run/user.
+# /sys and /dev stay writable by root's DAC; that is what the first two need.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount
+SystemCallErrorNumber=EPERM
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

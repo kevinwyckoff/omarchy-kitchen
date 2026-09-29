@@ -64,6 +64,18 @@ DATA_WARN_PCT=90
 NVME_USED_WARN=80
 NVME_TEMP_WARN=70
 SCRUB_WARN_DAYS=40
+
+# Thermal events: the kitchen-thermald daemon, its state file and its settings.
+# NVME_ARM and the NVMe levels are the daemon's own, read from thermal.conf.
+THERMAL_UNIT=kitchen-thermal.service
+THERMAL_STATE=/run/kitchen-thermal/state.json
+THERMAL_CONF=/etc/kitchen-sink/thermal.conf
+THERMAL_DKMS=nct6775-notify-dkms
+# Its upstream.sha256: checked-through, the newest kernel release whose driver
+# files its refresh.sh found identical to the vendored ones.
+THERMAL_DKMS_DOC=/usr/share/doc/nct6775-notify-dkms
+THERMAL_NVME_DEFAULTS="system:70:80:65 data:65:75:60"
+
 UPDATE_WARN_DAYS=7
 UPDATE_FAIL_DAYS=21
 
@@ -83,6 +95,7 @@ UKI_PATTERN=/boot/EFI/Linux/omarchy_%s.efi
 PACMAN_LOG=/var/log/pacman.log
 PACMAN_LOCK=/var/lib/pacman/db.lck
 MODULES_DIR=/usr/lib/modules
+NCT_SYSFS=/sys/module/nct6775_core
 EFI_SECUREBOOT_VAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
 
 CONF=${KITCHEN_CHECKUP_CONF:-/etc/kitchen-sink/checkup.conf}
@@ -147,6 +160,19 @@ uki_uname() {
 nvidia_dkms_pkg() { pacman -Qq 2>/dev/null | grep -E '^nvidia(-open)?(-[0-9a-z]+)?-dkms$' | head -n 1; }
 dkms_module_built() { modinfo -k "$1" -F filename nvidia 2>/dev/null | grep -q '/updates/dkms/'; }
 
+# The thermal events' facts: the nct6775-core module a kernel would load, the
+# DKMS package that patches it, the NVMe probe (experiment X0) and the daemon's
+# journal entries of the last 24 hours.
+nct_module_file() { modinfo -k "$1" -F filename nct6775_core 2>/dev/null; }
+thermal_pkg() { pacman -Q "$THERMAL_DKMS" 2>/dev/null; }
+nvme_probe() { run_timeout 30 python3 "$NVME_HELPER" --probe 2>/dev/null; }
+thermal_journal() {
+  journalctl -q -o json --no-pager --since -24h SYSLOG_IDENTIFIER=kitchen-thermal \
+    --output-fields=KITCHEN_EVENT,KITCHEN_STATE,KITCHEN_HOOK,KITCHEN_HOOK_RESULT,KITCHEN_TEST,MESSAGE 2>/dev/null
+}
+# omarchy-hook's own output, which systemd-run --user leaves in the user's journal.
+hook_journal() { journalctl -q -o cat --no-pager --since -24h SYSLOG_IDENTIFIER=omarchy-hook 2>/dev/null; }
+
 user_session() {
   local uid
   uid=$(user_uid) && [[ -S /run/user/$uid/bus ]]
@@ -205,6 +231,10 @@ sb_state=unknown
 # Set by check_boot_chain and check_transaction for check_reboot: a reason not
 # to reboot, and whether every installed kernel's UKI was checked and found right.
 boot_problem="" boot_verified=0
+# Filled by load_nvme_arm for check_nvme and check_nvme_arm: the drives
+# thermal.conf's NVME_ARM names, as serial:role, and the probe's JSON. check_nvme
+# keeps its SMART reading in nvme_json.
+arm_loaded=0 arm_pairs="" nvme_probe_json="" nvme_json=""
 
 record() { # level check message
   levels+=("$1")
@@ -296,6 +326,75 @@ load_update_status() {
   IFS=$'\x1f' read -r us_state us_night us_reasons us_hint us_reboot us_log us_packages us_nights us_reboot_why us_warnings <<<"$fields"
   [[ $us_state == "UPTODATE" ]] && us_state=UP-TO-DATE
   return 0
+}
+
+# One setting from thermal.conf, the daemon's KEY=value file. It is not
+# sourced here (it is not ours): the last uncommented assignment wins, and a
+# trailing comment and one pair of quotes around the value are dropped.
+conf_value() { # file key
+  local v
+  v=$(sed -nE "s/^[[:space:]]*$2=//p" "$1" 2>/dev/null | tail -n 1)
+  v=${v%%[[:space:]]#*}
+  v=${v%"${v##*[![:space:]]}"}
+  if [[ $v =~ ^\"(.*)\"$ || $v =~ ^\'(.*)\'$ ]]; then
+    v=${BASH_REMATCH[1]}
+  fi
+  printf '%s' "$v"
+}
+
+# The drives NVME_ARM names, each resolved through NVME_SERIALS to
+# "serial:role" (an entry may be a role or a serial), and experiment X0's probe
+# of every drive, which says whether each is armed (FID 0Bh bit 1) and what its
+# thresholds are. The probe runs only when a drive is to be armed.
+load_nvme_arm() {
+  local entry pair found
+  ((arm_loaded)) && return 0
+  arm_loaded=1 arm_pairs="" nvme_probe_json=""
+  for entry in $(conf_value "$THERMAL_CONF" NVME_ARM); do
+    found="$entry:$entry"
+    for pair in $NVME_SERIALS; do
+      if [[ ${pair#*:} == "$entry" || ${pair%%:*} == "$entry" ]]; then
+        found=$pair
+        break
+      fi
+    done
+    arm_pairs+="$found "
+  done
+  arm_pairs=${arm_pairs% }
+  [[ -n $arm_pairs ]] || return 0
+  nvme_probe_json=$(nvme_probe)
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$nvme_probe_json" || nvme_probe_json=""
+}
+
+# {serial: {armed, over_c, limit_c}} for the NVME_ARM drives the probe read;
+# limit_c is the drive's own over-temperature threshold (its default, else WCTEMP).
+arm_json() {
+  local pair serials=()
+  for pair in $arm_pairs; do
+    serials+=("${pair%%:*}")
+  done
+  if [[ -z $nvme_probe_json ]] || ((${#serials[@]} == 0)); then
+    echo '{}'
+    return
+  fi
+  jq -c '($ARGS.positional) as $s | with_entries(select(.key as $k | $s | index($k)))
+    | map_values({armed: (.armed == true), over_c: .temp_over.current_c, limit_c: (.temp_over.default_c // .wctemp_c)})' \
+    --args "${serials[@]}" <<<"$nvme_probe_json"
+}
+
+# An NVMe role's temperature levels, "warn crit clear" in C: thermal.conf's
+# NVME_<role>_WARN, _CRIT and _CLEAR, else the daemon's defaults.
+nvme_levels() { # role
+  local k d="" defaults=() level v out=()
+  for k in $THERMAL_NVME_DEFAULTS; do
+    [[ ${k%%:*} == "$1" ]] && d=${k#*:}
+  done
+  IFS=: read -r -a defaults <<<"$d"
+  for level in WARN CRIT CLEAR; do
+    v=$(conf_value "$THERMAL_CONF" "NVME_$1_$level")
+    out+=("${v:-${defaults[${#out[@]}]:-?}}")
+  done
+  echo "${out[*]}"
 }
 
 # ---- checks -------------------------------------------------------------------
@@ -792,21 +891,39 @@ check_data_mount() {
 # One drive's verdict as "LEVEL<tab>text". Counters are compared with the last
 # run's ($prev); a drive seen for the first time is its own baseline, and so is
 # one whose last read failed.
+# critical_warning bit 1 (temperature) alone, on a drive the thermal daemon
+# arms ($arm, from arm_json) and below the drive's own limit, is the daemon's
+# lowered threshold at work, not an overheating drive: WARN, not FAIL.
+# The other way round, bit 1 cannot say that an armed drive is hot: once one
+# passes its own limit (WCTEMP) the daemon moves the over threshold out of
+# reach (65535 K) so that no more AENs come, and bit 1 clears. For an armed
+# drive the temperature itself decides (FAIL at or above the limit), and so do
+# the minutes the drive counts above its limit (warn_temp_minutes).
 # shellcheck disable=SC2016 # a jq program, not shell
 NVME_JQ='
 .[$s] as $e
+| $arm[$s] as $a
 | if $e == null then "FAIL\tdrive not found (is it still connected?)"
   elif ($e | has("error")) then "FAIL\tSMART read failed: \($e.error)"
   else
     ($prev[$s] | if . == null or has("error") then $e else . end) as $p
     | def d(k): ($e[k] // 0) - ($p[k] // 0);
-    [ (if $e.critical_warning != 0 then "critical_warning=\($e.critical_warning)" else empty end),
+    ($a != null and $e.critical_warning == 2 and $a.limit_c != null and $e.temperature_c < $a.limit_c
+      and ($a.armed or ($a.over_c // $a.limit_c) < $a.limit_c)) as $ours
+    | ($a != null and $a.armed and $a.limit_c != null) as $armed
+    | [ (if $e.critical_warning != 0 and ($ours | not) then "critical_warning=\($e.critical_warning)" else empty end),
+      (if $armed and $e.critical_warning == 0 and $e.temperature_c >= $a.limit_c
+       then "\($e.temperature_c)C, at or above the drive limit \($a.limit_c)C (armed: bit 1 of critical_warning does not show it)" else empty end),
+      (if $armed and d("warn_temp_minutes") > 0
+       then "+\(d("warn_temp_minutes")) min at or above the drive limit \($a.limit_c)C since the last check-up" else empty end),
       (if $e.available_spare < $e.spare_threshold then "spare \($e.available_spare)% below its \($e.spare_threshold)% threshold" else empty end),
       (if d("media_errors") > 0 then "+\(d("media_errors")) media errors" else empty end)
     ] as $fail
-    | [ (if $e.percentage_used >= $used then "\($e.percentage_used)% of rated life used" else empty end),
+    | [ (if $ours then "critical_warning=2 (temperature): past a threshold the thermal daemon set (over \($a.over_c)C; the drive limit is \($a.limit_c)C)" else empty end),
+        (if $e.percentage_used >= $used then "\($e.percentage_used)% of rated life used" else empty end),
         (if $e.temperature_c >= $temp then "\($e.temperature_c)C" else empty end),
         (if d("crit_temp_minutes") > 0 then "+\(d("crit_temp_minutes")) min above critical temperature" else empty end),
+        (if ($armed | not) and d("warn_temp_minutes") > 0 then "+\(d("warn_temp_minutes")) min above warning temperature" else empty end),
         (if $e.media_errors > 0 and d("media_errors") == 0 then "\($e.media_errors) media errors (unchanged)" else empty end)
       ] as $warn
     | "\($e.percentage_used)% used, spare \($e.available_spare)%, \($e.temperature_c)C, media errors \($e.media_errors), error log +\(d("error_log_entries")), unsafe shutdowns +\(d("unsafe_shutdowns"))" as $info
@@ -817,20 +934,23 @@ NVME_JQ='
   end'
 
 check_nvme() {
-  local json prev pair serial role verdict serials state=$STATE_DIR/nvme.json
+  local json prev pair serial role verdict serials arm state=$STATE_DIR/nvme.json
   # The helper exits 1 when one drive fails to answer but still prints the rest.
   json=$(run_timeout 30 python3 "$NVME_HELPER" 2>/dev/null)
   if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$json"; then
     record FAIL nvme "SMART read failed: $NVME_HELPER printed no drive data"
     return
   fi
+  nvme_json=$json
+  load_nvme_arm
+  arm=$(arm_json)
   prev=$(cat "$state" 2>/dev/null)
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$prev" || prev='{}'
   serials=$NVME_SERIALS
   [[ -n $serials ]] || serials=$(jq -r 'keys[] | "\(.):\(.)"' <<<"$json")
   for pair in $serials; do
     serial=${pair%%:*} role=${pair#*:}
-    verdict=$(jq -r --arg s "$serial" --argjson prev "$prev" \
+    verdict=$(jq -r --arg s "$serial" --argjson prev "$prev" --argjson arm "$arm" \
       --argjson used "$NVME_USED_WARN" --argjson temp "$NVME_TEMP_WARN" "$NVME_JQ" <<<"$json")
     record "${verdict%%$'\t'*}" "nvme-$role" "$serial: ${verdict#*$'\t'}"
   done
@@ -838,6 +958,279 @@ check_nvme() {
   # its counters still compare against something real next run.
   jq -s '.[0] * (.[1] | with_entries(select(.value | has("error") | not)))' \
     <(printf '%s\n' "$prev") <(printf '%s\n' "$json") >"$state.new" && mv "$state.new" "$state"
+}
+
+# ---- thermal events ------------------------------------------------------------
+
+# kitchen-thermald's own view, /run/kitchen-thermal/state.json, version 1 (the
+# design called the key "schema"; either is read): {"version": 1, "pid": N,
+# "sources": {"nct6775": {"mode": "event|degraded|off", "reason": ..., "cpu":
+# {"level": ...}, "fans": {"fan2": {"stalled": ...}}}, "nvme": {..., "drives":
+# {"system": {"level": ...}}}, "nvml": {..., "gpu": {"hot": ..., "throttling":
+# [...]}}, "kmsg": {...}, "uevent": {...}}, "last_events": [...]}. Read
+# defensively, like status.json: a source may be a bare mode string, and a
+# top-level "levels" map is read too. Levels other than normal are listed.
+# shellcheck disable=SC2016 # a jq program, not shell
+THERMAL_JQ='
+def clean: tostring | gsub("[\\s\u001f]+"; " ");
+def lvl: if type == "object" then (.level // .state // "") else (. // "") end | clean;
+def down: if type == "array" then (if (.[0] // "event") != "event" then "1" else "" end)
+  elif . == true or (type == "string" and . != "") then "1" else "" end;
+if (.schema // .version // 0) != 1 then ["SCHEMA", (.schema // .version // "none" | clean)] | join("\u001f")
+else
+  (["STATE", (.pid // "" | clean)] | join("\u001f")),
+  (.sources // {} | to_entries[]
+    | ["SOURCE", .key, (.value | if type == "object" then (.mode // "?") else . end | clean),
+       (.value | if type == "object" then (.reason // "") else "" end | clean),
+       (.value | if type == "object" then (.announced | down) else "" end)] | join("\u001f")),
+  ([ (.levels // {} | to_entries[] | [.key, (.value | lvl)]),
+     (.sources.nct6775.cpu? // {} | ["cpu", lvl]),
+     (.sources.nvme.drives? // {} | to_entries[] | ["nvme-\(.key)", (.value | lvl)]),
+     (.sources.nvml.gpu? // {} | select(.hot == true) | ["gpu", "hot"]),
+     (.sources.nvml.gpu? // {} | select((.throttling // []) | length > 0) | ["gpu", "throttling \(.throttling | join("+"))"]),
+     (.sources.nct6775.fans? // {} | to_entries[] | select(.value.stalled == true) | [.key, "stalled"])
+   ][] | select(.[1] != "" and (.[1] | ascii_downcase | IN("normal", "ok", "clear", "cool", "idle", "none") | not))
+   | ["LEVEL", .[0], .[1]] | join("\u001f"))
+end'
+
+check_thermal() {
+  local lines kind name mode why down event=() degraded=() off=() lost=() odd=() unusual=() level text pid
+  if [[ $(systemctl show -P LoadState "$THERMAL_UNIT" 2>/dev/null) != "loaded" ]]; then
+    record WARN thermal "$THERMAL_UNIT is not installed, so there are no thermal events, hooks or toasts (install.sh installs it)"
+    return
+  fi
+  mode=$(systemctl show -P ActiveState "$THERMAL_UNIT" 2>/dev/null)
+  if [[ $mode != "active" ]]; then
+    record WARN thermal "$THERMAL_UNIT is ${mode:-in an unknown state} ($(unit_enabled "$THERMAL_UNIT")): no thermal events, hooks or toasts until it runs. See journalctl -u ${THERMAL_UNIT%.service} -b, then sudo systemctl enable --now $THERMAL_UNIT"
+    return
+  fi
+  if ! lines=$(jq -r "$THERMAL_JQ" "$THERMAL_STATE" 2>/dev/null) || [[ -z $lines ]]; then
+    record WARN thermal "$THERMAL_UNIT is active, but $THERMAL_STATE is missing or unreadable, so which sources send events is unknown"
+    return
+  fi
+  while IFS=$'\x1f' read -r kind name mode why down; do
+    case $kind in
+    SCHEMA)
+      record WARN thermal "$THERMAL_STATE has version '$name', not 1: this check-up cannot read it (the daemon and the check-up are from different versions?)"
+      return
+      ;;
+    STATE) pid=$name ;;
+    SOURCE)
+      case $mode in
+      event) event+=("$name") ;;
+      degraded) degraded+=("$name${why:+ ($why)}") ;;
+      off)
+        # Off because it broke (a lost GPU, journalctl failing, the chip gone)
+        # rather than absent: the daemon announced it degraded and it has not
+        # come back.
+        if [[ -n $down ]]; then
+          lost+=("$name${why:+ ($why)}")
+        else
+          off+=("$name${why:+ ($why)}")
+        fi
+        ;;
+      *) odd+=("$name '$mode'") ;;
+      esac
+      ;;
+    LEVEL) unusual+=("$name $mode") ;;
+    esac
+  done <<<"$lines"
+  # The file outlives a restart (RuntimeDirectoryPreserve), so make sure it is
+  # the running daemon's own.
+  mode=$(systemctl show -P MainPID "$THERMAL_UNIT" 2>/dev/null)
+  if [[ $pid =~ ^[0-9]+$ && $mode =~ ^[1-9][0-9]*$ && $pid != "$mode" ]]; then
+    record WARN thermal "$THERMAL_UNIT is active (pid $mode), but $THERMAL_STATE was written by pid $pid: the daemon is not updating it, so which sources send events is unknown"
+    return
+  fi
+
+  text="active"
+  ((${#event[@]})) && text+="; events from ${event[*]}"
+  ((${#degraded[@]})) && text+="; DEGRADED, polled instead: $(printf '%s, ' "${degraded[@]}" | sed 's/, $//')"
+  ((${#lost[@]})) && text+="; DOWN since it was announced degraded: $(printf '%s, ' "${lost[@]}" | sed 's/, $//')"
+  ((${#odd[@]})) && text+="; unknown mode: ${odd[*]}"
+  ((${#off[@]})) && text+="; off: $(printf '%s, ' "${off[@]}" | sed 's/, $//')"
+  ((${#unusual[@]})) && text+="; now: $(printf '%s, ' "${unusual[@]}" | sed 's/, $//')"
+  if ((${#degraded[@]} + ${#lost[@]} + ${#odd[@]})); then
+    level=WARN
+  elif ((${#event[@]} == 0)); then
+    level=WARN text+="; no source sends events"
+  elif ((${#off[@]})); then
+    level=INFO
+  else
+    level=OK
+  fi
+  record "$level" thermal "$text"
+}
+
+# The Super I/O's events need the patched nct6775 (nct6775-notify-dkms, built
+# into updates/dkms for the 7.2 kernels). Its notify_interval parameter is how
+# the loaded module shows it is the patched one.
+# The newest release the package's vendored driver was checked against, or nothing
+thermal_checked_release() {
+  local f=$THERMAL_DKMS_DOC/upstream.sha256 r
+  [[ -r $f ]] || return 0
+  r=$(sed -nE 's/^# checked-through: *([0-9]+(\.[0-9]+)+).*/\1/p' "$f" | tail -n 1)
+  [[ -n $r ]] || r=$(sed -nE 's/^# version: *([0-9]+(\.[0-9]+)+).*/\1/p' "$f" | tail -n 1)
+  printf '%s' "$r"
+}
+
+# Whether release $1 (7.2.9, or 7.2.9-1-omarchy) is newer than release $2
+release_newer() {
+  local a=${1%%-*} b=${2%%-*}
+  [[ -n $a && -n $b && $a != "$b" && $(printf '%s\n' "$a" "$b" | sort -V | tail -n 1) == "$a" ]]
+}
+
+check_nct6775() {
+  local kv file pkg interval checked
+  kv=$(uname -r)
+  file=$(nct_module_file "$kv")
+  pkg=$(thermal_pkg)
+  if [[ -r $NCT_SYSFS/parameters/notify_interval ]]; then
+    interval=$(<"$NCT_SYSFS/parameters/notify_interval")
+    checked=$(thermal_checked_release)
+    if [[ $interval == "0" ]]; then
+      record WARN nct6775 "the patched nct6775 is loaded, but notify_interval=0 switches its notifications off, so the daemon polls the Super I/O (set it in /etc/modprobe.d or /sys/module/nct6775_core/parameters)"
+    elif release_newer "$kv" "$checked"; then
+      # DKMS builds the vendored sources for every 7.2 kernel; a stable fix
+      # to the driver in a later 7.2 release would be hidden.
+      record INFO nct6775 "the patched nct6775 is loaded (${pkg:-$THERMAL_DKMS}): notify_interval=${interval} ms. Its driver sources were last checked against Linux $checked, and this kernel is ${kv%%-*}: a stable fix to drivers/hwmon/nct6775* since then is hidden by it. Check with pkg/nct6775-notify-dkms/refresh.sh ${kv%%-*} --record (README, The patched nct6775)"
+    else
+      record OK nct6775 "the patched nct6775 is loaded (${pkg:-$THERMAL_DKMS}, ${file:-module file unknown}): notify_interval=${interval} ms"
+    fi
+  elif [[ ! -d $NCT_SYSFS ]]; then
+    record WARN nct6775 "nct6775 is not loaded: no board temperatures, fans or Super I/O events (is /etc/modules-load.d/nct6775.conf still there?)"
+  elif [[ $file == */updates/dkms/* ]]; then
+    record WARN nct6775 "the in-tree nct6775 is loaded, without notify_interval, although ${pkg:-the patched one} is built for $kv: Super I/O events are off until it is reloaded. sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775 (the fans stay under the chip's SmartFan control meanwhile), or reboot"
+  elif [[ -z $pkg ]]; then
+    record WARN nct6775 "$THERMAL_DKMS is not installed, and the in-tree nct6775 has no notify_interval: no Super I/O events, the daemon polls the chip instead. Build and install the package (README, Thermal events)"
+  else
+    record WARN nct6775 "$pkg is installed but built no module for $kv (outside its BUILD_EXCLUSIVE_KERNEL range, or its build failed: dkms status): no Super I/O events, the daemon polls the chip instead"
+  fi
+}
+
+# Each drive NVME_ARM names: the X0 probe must find it armed (FID 0Bh bit 1),
+# case A (the stock kernel keeps an AER outstanding), and with an
+# over-temperature threshold the daemon set.
+check_nvme_arm() {
+  local pair serial role fields verdict armed aec oaes over limit under err warn crit clear temp check text
+  load_nvme_arm
+  if [[ -z $arm_pairs ]]; then
+    [[ -r $THERMAL_CONF ]] &&
+      record INFO nvme-arm "NVME_ARM in $THERMAL_CONF names no drive, so no NVMe temperature events. Arm only a drive whose probe says case A: sudo python3 $NVME_HELPER --probe"
+    return
+  fi
+  if [[ -z $nvme_probe_json ]]; then
+    record WARN nvme-arm "the probe ($NVME_HELPER --probe) printed no drive data, so whether $arm_pairs are armed is unknown"
+    return
+  fi
+  for pair in $arm_pairs; do
+    serial=${pair%%:*} role=${pair#*:} check=nvme-arm-${pair#*:}
+    fields=$(jq -r --arg s "$serial" 'if has($s) then .[$s]
+      | [(.verdict // ""), (.armed | tostring), (.aen_config.current_hex // "unread"), (.oaes_hex // "?"),
+         (.temp_over.current_c // "" | tostring), (.temp_over.default_c // .wctemp_c // "" | tostring),
+         (.temp_under.current_c // "" | tostring), ([.error // empty] + (.errors // []) | join("; "))]
+      | map(tostring | gsub("[\\s\u001f]+"; " ")) | join("\u001f") else "MISSING" end' <<<"$nvme_probe_json")
+    if [[ $fields == "MISSING" ]]; then
+      if [[ $serial == "$role" ]]; then
+        record WARN "$check" "NVME_ARM names '$role', which is neither a role in NVME_SERIALS ($CONF) nor the serial of a drive found"
+      else
+        record WARN "$check" "$serial: drive not found by the probe (is it still connected?)"
+      fi
+      continue
+    fi
+    IFS=$'\x1f' read -r verdict armed aec oaes over limit under err <<<"$fields"
+    read -r warn crit clear <<<"$(nvme_levels "$role")"
+    temp=""
+    [[ -z $nvme_json ]] || temp=$(jq -r --arg s "$serial" '.[$s].temperature_c // empty' <<<"$nvme_json" 2>/dev/null)
+    case $verdict in
+    "case A") ;;
+    "case B")
+      record WARN "$check" "$serial: case B (OAES $oaes has no notice the kernel enables), so the stock kernel keeps no Asynchronous Event Request outstanding and arming it gives no events. Take it out of NVME_ARM; its events need the rebuilt nvme-core"
+      continue
+      ;;
+    *)
+      record WARN "$check" "$serial: the probe could not read it${err:+: $err}"
+      continue
+      ;;
+    esac
+    if [[ $armed != "true" ]]; then
+      record WARN "$check" "$serial: not armed: FID 0Bh is $aec, without bit 1 (temperature), so the drive sends no temperature event. The daemon sets it after every controller start; is $THERMAL_UNIT running? journalctl -t kitchen-thermal"
+      continue
+    fi
+    # The daemon's thresholds by level: normal over WARN; warm over CRIT and
+    # under CLEAR; hot over the drive's own limit, or 0xFFFF K (65262C, no
+    # over event) once past it, and under CRIT minus its hysteresis.
+    if [[ $over == "65262" ]]; then
+      text="$serial: armed (FID 0Bh $aec, case A): no over-temperature event while this hot"
+    else
+      text="$serial: armed (FID 0Bh $aec, case A): events above ${over}C"
+    fi
+    [[ $under =~ ^-?[0-9]+$ ]] && ((under > -273)) && text+=" and below ${under}C"
+    text+="; levels $warn/${crit}C, clear ${clear}C; the drive limit ${limit}C"
+    if [[ $over != "$warn" && $over != "$crit" && $over != "$limit" && $over != "65262" ]]; then
+      record WARN "$check" "$text. But ${over}C is not a threshold the daemon sets (${warn}C, ${crit}C or the drive's ${limit}C): was it changed by hand?"
+    elif [[ $over == "$limit" && $over != "$warn" && $over != "$crit" && $temp =~ ^[0-9]+$ && $warn =~ ^[0-9]+$ ]] && ((temp < warn)); then
+      record WARN "$check" "$text. At ${temp}C the daemon should have lowered it to ${warn}C: it still has the drive's own"
+    else
+      record OK "$check" "$text"
+    fi
+  done
+}
+
+# The daemon's journal of the last 24 hours: how many events it saw, and how
+# many hooks failed. An entry with KITCHEN_EVENT is an event (its closing "end"
+# or "restored" is counted with the start); a hook's outcome is an entry of its
+# own, KITCHEN_HOOK_RESULT=ok|failed|timeout|skipped, and an event whose hook
+# could not even be queued says KITCHEN_HOOK=queue-full, or no-user when the
+# hook user does not exist (a setting to fix, so a failure too). Hooks skipped
+# because nobody was logged in (KITCHEN_HOOK=no-user-manager, or a queued one
+# whose user logged out: skipped) are counted apart; when every hook of the
+# day was skipped that way the row says so at INFO, since a service that
+# cannot see the user's manager looks exactly like this. --test-event entries
+# (KITCHEN_TEST=1) are a deploy check, not the machine's: left out.
+# The daemon only sees omarchy-hook's exit status, and omarchy-hook runs each
+# hook with `bash "$hook" || echo "Hook failed: $hook"` and exits 0, so a hook
+# script that fails is "ok" to the daemon. Its "Hook failed:" line, in the
+# user's journal, is counted here too.
+# shellcheck disable=SC2016 # a jq program, not shell
+THERMAL_EVENTS_JQ='
+def s: if type == "string" then . else "" end;
+[.[] | select((.KITCHEN_TEST | s) == "")] as $all
+| [$all[] | select((.KITCHEN_EVENT | s) != "" and ((.KITCHEN_STATE | s) | IN("end", "restored") | not))] as $ev
+| [$all[] | select((.KITCHEN_HOOK_RESULT | s | IN("failed", "timeout")) or (.KITCHEN_HOOK | s | IN("queue-full", "no-user")))] as $hf
+| [$all[] | select((.KITCHEN_HOOK | s) == "no-user-manager" or (.KITCHEN_HOOK_RESULT | s) == "skipped")] as $skip
+| [$all[] | select((.KITCHEN_HOOK_RESULT | s) == "ok")] as $ran
+| [($ev | length), ($hf | length),
+   ($ev | group_by(.KITCHEN_EVENT) | map("\(.[0].KITCHEN_EVENT) x\(length)") | sort_by(.) | join(", ")),
+   ($hf | map(if (.KITCHEN_HOOK | s) == "no-user" then "no hook for \(.KITCHEN_EVENT | s): the hook user does not exist (HOOK_USER in thermal.conf, else DESKTOP_USER)"
+              else (.MESSAGE | s) end | gsub("[\\s\u001f]+"; " ")) | map(select(. != "")) | .[0:2] | join("; ")),
+   ($skip | length), ($ran | length)]
+| map(tostring) | join("\u001f")'
+
+check_thermal_events() {
+  local out n failed what why scripts skipped ran note=""
+  [[ $(systemctl show -P LoadState "$THERMAL_UNIT" 2>/dev/null) == "loaded" ]] || return 0
+  out=$(thermal_journal | jq -rs "$THERMAL_EVENTS_JQ" 2>/dev/null)
+  IFS=$'\x1f' read -r n failed what why skipped ran <<<"$out"
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  [[ $failed =~ ^[0-9]+$ ]] || failed=0
+  [[ $skipped =~ ^[0-9]+$ ]] || skipped=0
+  [[ $ran =~ ^[0-9]+$ ]] || ran=0
+  ((skipped)) && note="; $(plural "$skipped" "hook") skipped: nobody logged in"
+  scripts=$(hook_journal | grep -E '^Hook failed: .*/hooks/thermal(\.d/.+)?$')
+  if [[ -n $scripts ]]; then
+    failed=$((failed + $(grep -c . <<<"$scripts")))
+    why="$(head -n 1 <<<"$scripts")${why:+; $why}"
+  fi
+  if ((failed)); then
+    record WARN thermal-events "24 h: $(plural "$n" event)${what:+ ($what)}; $(plural "$failed" "hook failure")${why:+: $why}$note. See journalctl -t kitchen-thermal --since -24h"
+  elif ((skipped && !ran)); then
+    record INFO thermal-events "24 h: $(plural "$n" event)${what:+ ($what)}, and not one hook ran$note (no user manager was running each time). If you were logged in, the service cannot see your session; check it with sudo /usr/local/lib/kitchen-sink/kitchen-thermald.py --test-event cpu-hot start level=warn temp=91"
+  elif ((n)); then
+    record OK thermal-events "24 h: $(plural "$n" event) ($what), no hook failures$note"
+  else
+    record OK thermal-events "24 h: no thermal events"
+  fi
 }
 
 check_btrfs() {
@@ -1049,6 +1442,7 @@ check_timers() {
 
 run_checks() {
   sb_state=unknown boot_problem="" boot_verified=0
+  arm_loaded=0 arm_pairs="" nvme_probe_json="" nvme_json=""
   collect_updates
   load_update_status
   # The boot chain first: check_reboot says whether a reboot is safe from
@@ -1065,6 +1459,10 @@ run_checks() {
   check_space
   check_data_mount
   check_nvme
+  check_thermal
+  check_nct6775
+  check_nvme_arm
+  check_thermal_events
   check_btrfs
   check_time
   check_last_update

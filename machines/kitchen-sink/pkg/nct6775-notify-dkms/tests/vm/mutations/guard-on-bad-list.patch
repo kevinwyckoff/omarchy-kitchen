@@ -1,0 +1,40 @@
+Test mutation, guard on: every read-to-clear register is added to the dump
+lists (the hardware monitor's seven, configuration space's ten) and 0x044 is
+made word-sized (so reading it would read 0x045). The dump must show them all
+as denied and the fake chip must see none of them read.
+---
+--- a/drivers/hwmon/nct6775-core.c
++++ b/drivers/hwmon/nct6775-core.c
+@@ -1262,7 +1262,8 @@
+ 	case nct6797:
+ 	case nct6798:
+ 	case nct6799:
+-		return reg == 0x150 || reg == 0x153 || reg == 0x155 ||
++		return reg == 0x044 || /* test mutation */
++		  reg == 0x150 || reg == 0x153 || reg == 0x155 ||
+ 		  (reg & 0xfff0) == 0x4c0 ||
+ 		  reg == 0x402 ||
+ 		  (reg >= 0x409 && reg < 0x419 && (reg & 1)) ||
+--- a/drivers/hwmon/nct6775-platform.c
++++ b/drivers/hwmon/nct6775-platform.c
+@@ -987,6 +987,8 @@
+ 	0xc1a, 0xc1b, 0xc1c, 0xc1d, 0xc1e, 0xc1f,	/* SMIOVT3-8 over-temperature */
+ 	0xc20, 0xc21, 0xc22, 0xc23, 0xc24, 0xc25,	/* SMIOVT3-8 hysteresis */
+ 	0xc26, 0xc27, 0xc28, 0xc29, 0xc2a, 0xc2b,	/* SMIOVT3-8 source select */
++	/* test mutation: every read-to-clear register slipped into the list */
++	0x041, 0x042, 0x045, 0x450, 0x567, 0xc02, 0xc03,
+ };
+ 
+ /*
+@@ -1023,6 +1025,11 @@
+ 	{ NCT6775_LD_ACPI, 0xe7, 0xe7 },
+ 	{ NCT6775_LD_ACPI, 0xf2, 0xf7 },	/* PME enables and status */
+ 	{ NCT6775_LD_VID, 0xe2, 0xe2 },	/* OVT#_2/SMI#_2 pin mode */
++	/* test mutation: every read-to-clear configuration register slipped in */
++	{ 0x07, 0xe3, 0xe3 }, { 0x07, 0xe7, 0xe7 }, { 0x07, 0xf7, 0xf7 },
++	{ 0x08, 0xe3, 0xe3 }, { 0x08, 0xf3, 0xf3 },
++	{ 0x09, 0xe3, 0xe3 }, { 0x09, 0xe7, 0xe8 }, { 0x09, 0xf7, 0xf7 },
++	{ NCT6775_LD_ACPI, 0xe3, 0xe3 },
+ };
+ 
+ #define NCT6775_DUMP_SIO_MAX	96	/* room for the registers listed above (70) */

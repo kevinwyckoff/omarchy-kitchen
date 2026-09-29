@@ -1,0 +1,45 @@
+Test mutation, guard off (negative control): the same list additions with
+both denylist checks disabled. The fake chip must see read-to-clear reads in
+both spaces, which proves the VM test can detect them.
+---
+--- a/drivers/hwmon/nct6775-platform.c
++++ b/drivers/hwmon/nct6775-platform.c
+@@ -987,6 +987,8 @@
+ 	0xc1a, 0xc1b, 0xc1c, 0xc1d, 0xc1e, 0xc1f,	/* SMIOVT3-8 over-temperature */
+ 	0xc20, 0xc21, 0xc22, 0xc23, 0xc24, 0xc25,	/* SMIOVT3-8 hysteresis */
+ 	0xc26, 0xc27, 0xc28, 0xc29, 0xc2a, 0xc2b,	/* SMIOVT3-8 source select */
++	/* test mutation: every read-to-clear register slipped into the list */
++	0x041, 0x042, 0x045, 0x450, 0x567, 0xc02, 0xc03,
+ };
+ 
+ /*
+@@ -1023,6 +1025,11 @@
+ 	{ NCT6775_LD_ACPI, 0xe7, 0xe7 },
+ 	{ NCT6775_LD_ACPI, 0xf2, 0xf7 },	/* PME enables and status */
+ 	{ NCT6775_LD_VID, 0xe2, 0xe2 },	/* OVT#_2/SMI#_2 pin mode */
++	/* test mutation: every read-to-clear configuration register slipped in */
++	{ 0x07, 0xe3, 0xe3 }, { 0x07, 0xe7, 0xe7 }, { 0x07, 0xf7, 0xf7 },
++	{ 0x08, 0xe3, 0xe3 }, { 0x08, 0xf3, 0xf3 },
++	{ 0x09, 0xe3, 0xe3 }, { 0x09, 0xe7, 0xe8 }, { 0x09, 0xf7, 0xf7 },
++	{ NCT6775_LD_ACPI, 0xe3, 0xe3 },
+ };
+ 
+ #define NCT6775_DUMP_SIO_MAX	96	/* room for the registers listed above (70) */
+@@ -1031,6 +1038,8 @@
+ {
+ 	int i;
+ 
++	return false;	/* test mutation: guard off */
++
+ 	for (i = 0; i < ARRAY_SIZE(nct6775_dump_never_read); i++)
+ 		if (reg == nct6775_dump_never_read[i])
+ 			return true;
+@@ -1042,6 +1051,8 @@
+ {
+ 	int i;
+ 
++	return false;	/* test mutation: guard off */
++
+ 	for (i = 0; i < ARRAY_SIZE(nct6775_dump_sio_never_read); i++)
+ 		if (ld == nct6775_dump_sio_never_read[i].ld &&
+ 		    reg == nct6775_dump_sio_never_read[i].reg)

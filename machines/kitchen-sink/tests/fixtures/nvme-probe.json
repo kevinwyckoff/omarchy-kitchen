@@ -1,0 +1,90 @@
+{
+ "DATADRIVE0001": {
+  "aen_config": {
+   "capabilities": 4,
+   "changeable": true,
+   "current": 0,
+   "current_hex": "0x00000000",
+   "default": 0,
+   "saveable": false
+  },
+  "aerl": 7,
+  "armed": false,
+  "cctemp_c": 88,
+  "cctemp_k": 361,
+  "ctrl": "nvme0",
+  "errors": [],
+  "firmware": "B35500WD",
+  "kernel_aen_config": 0,
+  "model": "WDC WDS512G1X0C-00ENX0",
+  "notes": [],
+  "oaes": 0,
+  "oaes_hex": "0x00000000",
+  "oaes_notices": [],
+  "oncs": 22,
+  "select_supported": true,
+  "state": "live",
+  "temp_over": {
+   "current_c": 85,
+   "current_k": 358,
+   "default_c": 85,
+   "default_k": 358
+  },
+  "temp_under": {
+   "current_c": -273,
+   "current_k": 0,
+   "default_c": -273,
+   "default_k": 0
+  },
+  "verdict": "case B",
+  "version": "1.2.0",
+  "wctemp_c": 85,
+  "wctemp_k": 358,
+  "why": "OAES 0x00000000 has none of bits 8, 9, 11 and 31 (the kernel's NVME_AEN_SUPPORTED), so the stock 7.2.5 nvme_enable_aen returns before queuing async_event_work: the kernel never submits an Asynchronous Event Request to this controller and no event can arrive, whatever FID 0Bh holds. Temperature events need the rebuilt nvme-core"
+ },
+ "SYSDRIVE0001": {
+  "aen_config": {
+   "capabilities": 4,
+   "changeable": true,
+   "current": 512,
+   "current_hex": "0x00000200",
+   "default": 0,
+   "saveable": false
+  },
+  "aerl": 3,
+  "armed": false,
+  "cctemp_c": 95,
+  "cctemp_k": 368,
+  "ctrl": "nvme1",
+  "errors": [],
+  "firmware": "STNSC014",
+  "kernel_aen_config": 512,
+  "model": "Seagate FireCuda 520 SSD ZP500GM30002",
+  "notes": [],
+  "oaes": 512,
+  "oaes_hex": "0x00000200",
+  "oaes_notices": [
+   "firmware-activation"
+  ],
+  "oncs": 93,
+  "select_supported": true,
+  "state": "live",
+  "temp_over": {
+   "current_c": 90,
+   "current_k": 363,
+   "default_c": 90,
+   "default_k": 363
+  },
+  "temp_under": {
+   "current_c": -60,
+   "current_k": 213,
+   "default_c": -60,
+   "default_k": 213
+  },
+  "verdict": "case A",
+  "version": "1.3.0",
+  "wctemp_c": 90,
+  "wctemp_k": 363,
+  "why": "OAES 0x00000200 has firmware-activation notices, so the stock 7.2.5 kernel writes FID 0Bh = 0x200 at every controller start (nvme_enable_aen) and keeps one Asynchronous Event Request outstanding while the controller is live. Setting FID 0Bh bit 1 again after each start (NVME_EVENT=connected) is enough for temperature events; no kernel rebuild"
+ }
+}

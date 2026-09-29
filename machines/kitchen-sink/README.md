@@ -1,10 +1,11 @@
-# kitchen-sink: daily check-up and nightly updater
+# kitchen-sink: daily check-up, nightly updater and thermal events
 
-kitchen-sink is an Omarchy 4 desktop on the home LAN: Secure Boot on with our own keys, the kitchen build of `omarchy-dev` pinned with IgnorePkg, an encrypted btrfs root and an encrypted btrfs data drive at /mnt/data. This directory looks after it with three things:
+kitchen-sink is an Omarchy 4 desktop on the home LAN: Secure Boot on with our own keys, the kitchen build of `omarchy-dev` pinned with IgnorePkg, an encrypted btrfs root and an encrypted btrfs data drive at /mnt/data. This directory looks after it with four things:
 
-- **A daily check-up** at 09:00. It only reads: Secure Boot, the pin, failed units, disk space, NVMe health, btrfs errors and scrubs, pending updates, the journal, and how last night's update went. It writes a report, logs to the journal and shows a toast.
+- **A daily check-up** at 09:00. It only reads: Secure Boot, the pin, failed units, disk space, NVMe health, btrfs errors and scrubs, pending updates, the journal, the thermal events, and how last night's update went. It writes a report, logs to the journal and shows a toast.
 - **Monthly btrfs scrubs** of / and /mnt/data, using the timers that come with btrfs-progs.
 - **A gated nightly `omarchy update`**, tried at 02:30, 03:30, 04:30 and 05:30. It runs Omarchy's own `omarchy-update -y` only when nobody is using the machine and every safety and compatibility check passes, then checks that the machine will still boot. It never reboots. **It is installed switched off**, and stays off until it has been proven on this machine (see [Turning on the nightly updater](#turning-on-the-nightly-updater)).
+- **Thermal events**: `kitchen-thermal.service` turns what the fans, the board and CPU sensors, the system NVMe drive and the GTX 1650 signal into journal lines, `omarchy-hook thermal` hooks and a few toasts. No program polls the sensors, except where there is no other way, and then it says so (see [Thermal events](#thermal-events)).
 
 Nothing leaves the machine: the reports, logs and state stay in /var/log and /var/lib.
 
@@ -26,24 +27,30 @@ What `install.sh` does:
 - It installs the two programs to /usr/local/sbin and their helpers to /usr/local/lib/kitchen-sink (root:root 0755), and the units, the settings and the sysusers and tmpfiles snippets under /etc (root:root 0644).
 - It creates the empty `kitchen-update` group and /run/kitchen-update.
 - It enables and starts `kitchen-checkup.timer`, `btrfs-scrub@-.timer` and `btrfs-scrub@mnt-data.timer`.
+- It enables and starts `kitchen-thermal.service`, and restarts it when a reinstall changed its program, unit or settings.
+- It puts the sample thermal hooks in `~/.config/omarchy/hooks/thermal.d/` (the hook user's, `kevinwyckoff` unless thermal.conf's HOOK_USER says otherwise), writing them as that user. It never touches a hook of yours there.
+- It says whether the patched nct6775 driver (`nct6775-notify-dkms`, a package of its own) is installed and loaded, and prints what to run if not. It never installs or loads a driver itself.
 - It does **not** enable `kitchen-update.timer`. If you have enabled it since, it stays enabled.
 - It prints every file it installed, updated or left unchanged, and what to run next.
 
-Running it again is safe; it changes only what differs. If you edited a file in /etc/kitchen-sink, yours is kept and the shipped version is written next to it as `<name>.new`; the installer prints the `diff -u` command to merge them. A file you never edited is simply updated: the installer remembers what it shipped in /var/lib/kitchen-sink/configs.sha256, the way pacman tells an edited config from an old one. It refuses to run while the check-up or an update is running.
+Running it again is safe; it changes only what differs. If you edited a file in /etc/kitchen-sink, yours is kept and the shipped version is written next to it as `<name>.new`; the installer prints the `diff -u` command to merge them. Delete the `.new` once merged: like pacman's `.pacnew`, each shipped version is offered once, so later runs keep your file quietly until a newer one ships. A file you never edited is simply updated: the installer remembers what it shipped in /var/lib/kitchen-sink/configs.sha256, the way pacman tells an edited config from an old one. It refuses to run while the check-up or an update is running.
 
 | Installed | What it is |
 | --- | --- |
 | /usr/local/sbin/kitchen-checkup | the daily check-up |
 | /usr/local/sbin/kitchen-update | the nightly updater (also `--dry-run`, `--grant-test`, `--revoke`, `--boot-check`) |
-| /usr/local/lib/kitchen-sink/ | `notify` (the toast), `safe-to-update` (is anyone using the machine?), `preflight` and `postflight` (before and after the update), and the Python helpers `nvme-health.py`, `evwatch.py`, `news-check.py` |
+| /usr/local/lib/kitchen-sink/ | `notify` (the toast), `safe-to-update` (is anyone using the machine?), `preflight` and `postflight` (before and after the update), `kitchen-thermald.py` (the thermal event daemon), and the Python helpers `nvme-health.py`, `evwatch.py`, `news-check.py` |
 | /etc/kitchen-sink/checkup.conf | the check-up's thresholds, every default shown commented out |
 | /etc/kitchen-sink/journal-ignore.regex | journal errors known to be harmless |
 | /etc/kitchen-sink/update.conf | the updater's settings and policies |
-| /etc/systemd/system/kitchen-{checkup,update}.{service,timer} | the units |
+| /etc/kitchen-sink/thermal.conf | the thermal daemon's levels, which NVMe drives to arm, hooks and toasts |
+| /etc/systemd/system/kitchen-{checkup,update}.{service,timer} | the check-up's and the updater's units |
+| /etc/systemd/system/kitchen-thermal.service | the thermal daemon |
+| ~kevinwyckoff/.config/omarchy/hooks/thermal.d/*.sample | the sample thermal hooks, the user's own files |
 | /etc/sysusers.d/kitchen-update.conf | the `kitchen-update` group, which never has members |
 | /etc/tmpfiles.d/kitchen-update.conf | removes a leftover sudo grant at boot |
 
-Both programs source their config file as root, so they ignore one that is not owned by root or that others can write to; the check-up says so in its report.
+Both programs source their config file as root, so they ignore one that is not owned by root or that others can write to; the check-up says so in its report. The thermal daemon reads thermal.conf without running it, under the same rule.
 
 ## The daily check-up
 
@@ -59,7 +66,7 @@ Each check ends in one of four levels:
 | --- | --- |
 | OK | fine |
 | INFO | worth knowing, nothing to do (updates pending, a newer Omarchy held back by the pin, a scrub running) |
-| WARN | look at it soon (low space, a reboot pending, the update held, no update for 3 nights, unexpected journal errors) |
+| WARN | look at it soon (low space, a reboot pending, the update held, no update for 3 nights, unexpected journal errors, thermal events off or degraded, a thermal hook that failed) |
 | FAIL | act now, and do not reboot until it is understood (Secure Boot not clean, a UKI or nvidia module that does not match the installed kernel, pacman cut off with its lock left, the pin missing, the update failed or was cut off, a leftover sudo grant or a process still carrying its group, drive or filesystem errors) |
 
 The report lists every check; the toast shows the failures first, then the warnings.
@@ -166,16 +173,137 @@ When the run ends, the rule is deleted and the updater checks that sudo refuses 
 
 **The trade-off:** during the run, everything the update runs as you gets root without a password. That includes Omarchy's own scripts, your post-update hooks in `~/.config/omarchy/hooks/`, and mise tool installs. An `omarchy update` at the desk gives them the same power through your cached sudo. The difference is that nobody is watching. If something malicious ever ran as your user, it could plant a hook and get root the next night, without the password prompt that would otherwise stop it. No third-party build script runs under the grant: pending AUR updates hold the night, and the grant is removed the moment Omarchy's AUR phase starts (see [While it runs](#while-it-runs)). If that trade is not acceptable, keep the timer off and update by hand; the check-up alone needs no grant at all.
 
+## Thermal events
+
+`kitchen-thermal.service` runs `kitchen-thermald.py` as root. It waits in one `poll()` for what the hardware and the kernel already signal: kernel uevents, wake-ups on the Super I/O's sysfs files, NVML events from the GPU, and the kernel log. It turns each into an event:
+
+- a journal line (`journalctl -t kitchen-thermal`), with `KITCHEN_EVENT`, `KITCHEN_STATE` and one `KITCHEN_<KEY>` field per key;
+- a hook, `omarchy-hook thermal <event> <state> key=value...`, run as you in your own session;
+- for a short list, a toast.
+
+Its own view is in `/run/kitchen-thermal/state.json` (`kitchen-thermald.py --dump-state` prints it): each source's mode (`event`, `degraded` or `off`) and why, the CPU and NVMe levels, and the last events. `systemctl status kitchen-thermal` shows the same in one line.
+
+The daemon never writes a Super I/O limit, pwm or SmartFan setting (`tempN_max`, `max_hyst` and `crit`, `in*_max`, `pwm*`, `pwm*_enable`, `fanN_min`). The fans stay under the chip's SmartFan control. Its only writes are the temperature thresholds and the AEN setting of the NVMe drives named in `NVME_ARM`. Those are volatile: the drive forgets them at a reset, and the daemon puts the drive's own thresholds back when it stops, or when a reload takes the drive out of `NVME_ARM`.
+
+The unit keeps root only for the NVMe ioctls and writes, and for starting hooks in your manager. It keeps no capability but `CAP_SYS_ADMIN`, sees the file system read-only except /sys, /dev and its runtime directory, cannot see /home or /run/user, and a system call filter refuses mount calls, so that `CAP_SYS_ADMIN` cannot undo the rest. Whether your manager is up, it asks PID 1 (`systemctl is-active user@<uid>.service`), which answers inside the sandbox.
+
+### What is and isn't a hardware interrupt
+
+| Source | How an event arrives | An interrupt? |
+| --- | --- | --- |
+| System NVMe (FireCuda 520) | The drive compares its own temperature with the thresholds the daemon set. It completes an Asynchronous Event Request (an MSI-X interrupt), and the kernel sends the uevent `NVME_AEN=0x020101` | **Yes**, from the drive |
+| Data NVMe (WDC) | Nothing: the stock kernel keeps no Asynchronous Event Request outstanding on it (case B, below) | No events. The check-up still reads its temperature every morning |
+| GTX 1650 | NVML events from the GPU firmware: Xid errors, the GPU lost, recovery, P-state and clock changes | **Yes**, for those. There is no GPU temperature event at all: `gpu-hot` and `gpu-throttle` are read at each wake-up. While the GPU is busy or still hot, the wait also times out every 15 s (5 s while throttling); at idle it never does |
+| Super I/O NCT6799D: board temperatures, fans, pwm, and the CPU's own temperature over SB-TSI (TSI0) | The patched nct6775 samples the chip **inside the kernel** every `notify_interval` (1 s). It sends a uevent for an alarm, and wakes `poll()` when a pwm, fan or temperature moves | **No**. The kernel polls; no program polls the chip. About 1 s of delay. Once a minute the daemon re-reads the driver's four parameters, since switching notification off at runtime signals nothing |
+| The same, without the patched nct6775 (a kernel outside its range) | The daemon reads the same files every 10 s and reports `thermal-monitor degraded` | **No**: a program polls, and says so |
+| Kernel log | NVRM Xid, "fallen off the bus" and amdgpu critical-temperature lines, followed through the journal | A backstop for the GPU events |
+| CPU `k10temp`, DIMM `spd5118`, the Radeon iGPU | Not watched. They have no event source; the CPU is covered through the Super I/O's TSI0 | - |
+
+The NCT6799D can route a real hardware-monitor interrupt to an ISA IRQ, but nothing on this board sets it up. Trying it means changing Super I/O and chipset settings that also drive SMI# and the over-temperature shutdown pin, so it has not been tried. The patched driver only adds a read-only register dump for looking (`nct6775.dump=1`, in debugfs). On this board it shows no IRQ assigned (logical device 0B CR70 is 0) and the shared pin in SMI# mode, so the firmware owns it.
+
+### The events
+
+| Event | States | Keys | When |
+| --- | --- | --- | --- |
+| `cpu-hot` | start, change, end | `level=warn\|crit temp threshold sensor` (`held=60` once crit has held 60 s) | TSI0 at 90 °C (warn) or 95 °C (crit) for 10 s. It clears 5 °C below. A 7700X boosts to 95 °C by design, so only a crit that holds for 60 s toasts |
+| `board-hot` | start, end | `sensor=tempN label temp max hyst` | The chip's own limit alarms, with the limits the BIOS set. temp7 (a CPU stand-in at 80/75 °C) goes to the journal only |
+| `fan-ramp` | change | `pwm=pwmN pct dir=up\|down rpm src` | Once per 10 % of pwm, at most once every 5 s per fan |
+| `fan-stall` | start, end | `fan=fanN pwm pct rpm` | A fan at 0 rpm for 5 s while its pwm is at least 20 % |
+| `nvme-hot` | start, change, end | `drive=system level=warn\|crit temp` | The system drive at 70 °C (warn) or 80 °C (crit), cleared below 65 °C (the data drive's levels are 65/75/60, if it ever gets events) |
+| `nvme-health` | info | `drive kind=reliability\|spare` | Only if `NVME_AEN_MASK` asks for them |
+| `gpu-throttle` | start, change, end | `reason temp pstate` | A throttle counter moved. It ends after 30 s without one |
+| `gpu-hot` | start, end | `temp` | 85 °C; it clears 5 °C below |
+| `gpu-xid` | info | `code kind=xid\|unavailable\|recovery\|lost\|ctf gpu=nvidia\|amdgpu` | From NVML, or the kernel log when NVML cannot say. `ctf` is amdgpu's critical-temperature line, just before it shuts the machine down |
+| `thermal-monitor` | degraded, restored | `source reason` | A source stopped sending events (it falls back to polling), or came back |
+
+Toasts go through the same `notify` as the check-up's, so Do Not Disturb holds them. By default only these toast: `fan-stall`, `nvme-hot` crit, `cpu-hot` crit held 60 s, `gpu-xid`, and `thermal-monitor` degraded. Each toasts at most once per 10 minutes per event and sensor. Everything else goes to the journal and the hooks.
+
+### Writing a hook
+
+A hook is a bash file in `~/.config/omarchy/hooks/thermal.d/` (or a single `~/.config/omarchy/hooks/thermal`). `omarchy-hook` runs each file in that directory in name order, skipping `*.sample`. The two samples show the pattern: `10-toast.sample` adds toasts for events the daemon does not toast, and `20-log.sample` keeps your own event log. To use one, copy it without `.sample`.
+
+- It is called with `<event> <state> key=value...`, for example `cpu-hot start level=warn temp=91 threshold=90 sensor=tsi0`. The whole event is also in `$KITCHEN_THERMAL_EVENT` as JSON.
+- It runs as you, in your own systemd user manager (`systemd-run --user`), so notifications, `$HOME` and your Wayland session work as in any Omarchy hook. With nobody logged in (no `user@<uid>.service` running), hooks are skipped, and said so in the journal (`KITCHEN_HOOK=no-user-manager`); the check-up counts them.
+- It gets at most 60 s. Hooks run one at a time and never hold up the daemon.
+- At most 30 hooks run a minute, and 12 per event and sensor; the rest are only journalled. A hook that saw a `start` always sees its `end`.
+- To try a hook without waiting for heat: `sudo /usr/local/lib/kitchen-sink/kitchen-thermald.py --test-event cpu-hot start level=warn temp=91`. With the service running, the running daemon delivers it, from inside its sandbox, through the real journal (at notice priority at most, so the check-up does not count it as an error), hook and toast, marked as a test, and the command waits for the hook's and toast's results (`delivered by kitchen-thermal.service`). That is the check after a deploy. Without the service, or with `--local` before `--test-event`, the shell delivers it itself and says so: that tries a hook, but proves nothing about the service, whose sandbox the shell does not have.
+- A hook that fails shows in the morning check-up as a WARN, with its name. The daemon logs a hook that timed out; `omarchy-hook` itself logs `Hook failed: <file>` for a script that exits non-zero. Read them with `journalctl -t kitchen-thermal -t omarchy-hook --since -24h`.
+
+A hook may do anything you can do: renice a build, pause a download, change a fan curve. The daemon itself never touches the fans.
+
+### Vetoing and tuning
+
+- **Levels, drives, toasts, hooks:** `/etc/kitchen-sink/thermal.conf` lists every setting with its default, commented out. Change a line, then `sudo systemctl reload kitchen-thermal`: it re-reads the file and arms the NVMe drives again. The ones worth knowing:
+  - `CPU_WARN`, `CPU_CRIT`, `CPU_HYST` and `CPU_DWELL_SECS`;
+  - `NVME_ARM` and `NVME_<role>_WARN`, `_CRIT`, `_CLEAR`. They must be in order, CLEAR < WARN < CRIT, within 0 to 120 °C, and `NVME_HOT_HYST` 1 to 30: out of order they would program a threshold that fires at once, so the daemon warns and leaves a drive with that role unarmed;
+  - `GPU_HOT` and `GPU_IDLE_HEARTBEAT` (0: never wake an idle GPU);
+  - `FAN_WATCH` (the fans that must spin);
+  - `NOTIFY_EVENTS` (empty: no toasts at all);
+  - `HOOKS=0` (no hooks) and `HOOK_RATE_PER_MIN`.
+- **One hook:** rename it back to `<name>.sample`.
+- **Everything, until the next boot:** `sudo systemctl stop kitchen-thermal`. **For good:** `sudo systemctl disable --now kitchen-thermal`. The check-up then reports a WARN every morning, since nothing watches the temperatures.
+- **The driver's sampling:** the package's defaults are in `/usr/lib/modprobe.d/nct6775-notify.conf`: `notify_interval=1000` ms, `notify_pwm_delta=3` and `notify_temp_delta=1000` (1 °C, so the CPU's reading wakes the daemon). The driver's own default is 0, off, so that file is what switches it on. Copy it to /etc/modprobe.d to change them for good. To change them now, write to `/sys/module/nct6775_core/parameters/`; the driver takes a new `notify_interval` at once and clamps it to 250-10000 ms. `notify_interval=0` turns the driver's notifications off; within a minute (or at once with `sudo systemctl reload kitchen-thermal`) the daemon notices, polls, and says it is degraded.
+
+### The NVMe drives
+
+The stock 7.2.5 kernel switches off the drives' SMART events, the temperature one included, at every controller start. Whether the daemon can switch them back on without a rebuilt kernel depends on the drive's controller.
+
+At each start the kernel sets the Asynchronous Event Configuration (feature 0Bh) to the notices it knows (OAES bits 8, 9, 11 and 31). It keeps one Asynchronous Event Request outstanding only if the controller advertises at least one of them. Otherwise it returns before submitting any request, and no event of any kind can arrive.
+
+- **Case A**: at least one of those bits is set. The daemon only has to set bit 1 (temperature) of feature 0Bh again after each controller start. No rebuild.
+- **Case B**: none of them. Events need a rebuilt nvme-core, the root disk's driver. That is not done: a bad build leaves the machine unbootable.
+
+`sudo python3 /usr/local/lib/kitchen-sink/nvme-health.py --probe` says which case each drive is. It sends only Identify and Get Features, and refuses any other command before opening the drive. On kitchen-sink it said (2026-09-29, kernel 7.2.5-4):
+
+| Drive | OAES | Feature 0Bh | Over / under threshold, drive default | Case |
+| --- | --- | --- | --- | --- |
+| system, FireCuda 520 (NVMe 1.3) | 0x200 (firmware-activation notices) | 0x200, exactly what the kernel wrote | 90 °C (its WCTEMP) / -60 °C | **A**: arm it |
+| data, WDC WDS512G1X0C (NVMe 1.2) | 0 | 0: the kernel never wrote it | 85 °C (its WCTEMP) / off | **B**: no events |
+
+So on this machine thermal.conf should say `NVME_ARM="system"`. With a drive armed, its critical-warning bit 1 (temperature) goes up whenever the drive passes a threshold the daemon lowered. The check-up treats that bit as a WARN, not a FAIL, for an armed drive still below its own limit, and a FAIL together with any other warning bit. Past its own limit (WCTEMP) the daemon moves the drive's over threshold out of reach, so no more events come, and bit 1 clears. For an armed drive the check-up therefore goes by the temperature: a FAIL at or above the drive's limit, or when the drive counted minutes above it (`warn_temp_minutes`) since the last check-up.
+
+### The patched nct6775
+
+The Super I/O's events need the stock nct6775 driver with a patch that samples the chip inside the kernel and signals changes. `pkg/nct6775-notify-dkms` builds it as a DKMS package for the 7.2 kernels (`BUILD_EXCLUSIVE_KERNEL="^7\.2\."`). The package installs it into `/usr/lib/modules/<kernel>/updates/dkms`, where it takes precedence over the in-tree copy.
+
+- It is not in the UKI, so the signed boot chain does not change. Like nvidia's, the module carries no trusted signature, which is fine while signatures are not enforced.
+- It is installed apart from `install.sh`, with `pacman -U`. Build it with `makepkg` in that directory (it checks the vendored sources against the release first), for example on kitchen-sink in the copy `install.sh` ran from. Then:
+
+  ```bash
+  sudo pacman -U nct6775-notify-dkms-*.pkg.tar.zst
+  sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775
+  ```
+
+  The reload takes the sensors away for a moment and may renumber hwmonN. The fans stay under SmartFan control meanwhile. A reboot does the same.
+- **Undo:** `sudo pacman -R nct6775-notify-dkms`, then the same reload. The in-tree driver comes back.
+- **Kernel updates:** DKMS rebuilds the module for every new 7.2 kernel before the UKI is built. On a kernel outside its range (7.3, say) it is skipped without an error: the machine boots the in-tree driver, and the daemon polls and reports `thermal-monitor degraded`. `pkg/nct6775-notify-dkms/refresh.sh` moves the package to a new kernel release.
+- **Stable fixes:** every 7.2 kernel gets the vendored 7.2.5 sources, which would hide a stable fix to the driver in a later 7.2 release. The package records the newest release whose driver files `refresh.sh` found identical (`checked-through`, 7.2.8 now). A kernel newer than that is an `info` line in the preflight and in the check-up's `nct6775` row: run `refresh.sh <release> --record` (or `--update` if the files changed).
+
+The nightly updater and the check-up follow it:
+
+- **Preflight:** a pending kernel outside the package's range is an `info` line saying events will be off after the reboot, and so is one in range but newer than the release the package was checked against. Neither holds the update.
+- **Postflight:** a failed `nct6775-notify` DKMS build is a WARN, not a FAIL (`DKMS_WARN_ONLY` in update.conf); nvidia's stays a FAIL. A new check, `thermal`, says for each installed kernel whether the patched module is built for it, and warns "events off for <kernel>" when not.
+- **Check-up:**
+  - `thermal`: the daemon is running, and each source's mode (a degraded source is a WARN, and so is one the daemon announced degraded that is still off: a lost GPU, a kernel-log follower that keeps failing, a Super I/O gone for good);
+  - `nct6775`: the patched driver is the one loaded, with `notify_interval` (a WARN otherwise, with what to run; an INFO on a kernel newer than its sources were checked against);
+  - `nvme-arm-<role>`: for each drive in `NVME_ARM`, read by the probe, that it is case A, armed (feature 0Bh bit 1), and has a threshold the daemon set;
+  - `thermal-events`: the last 24 hours' events and hook failures, and the hooks skipped because nobody was logged in (an INFO when not one hook ran all day, which is also what a service that cannot see your session would look like).
+
+### Upstream
+
+The nct6775 patches are local patches, carried in `pkg/nct6775-notify-dkms` (so would a future nvme one be). They are to be offered upstream, with the notification off by default, together with the other held upstream PRs, only once this work is done. Nothing has been sent. If upstream takes them, the package can go.
+
 ## Uninstall
 
 ```bash
-sudo bash /tmp/kitchen-sink/uninstall.sh [--purge] [--disable-scrubs]
+sudo bash /tmp/kitchen-sink/uninstall.sh [--purge] [--disable-scrubs] [--purge-driver]
 ```
 
-It turns both timers off, revokes any sudo grant and checks that it is gone (and kills any process still carrying the grant's group), then removes the programs, the units, /etc/kitchen-sink, the sysusers and tmpfiles snippets, the `kitchen-update` group, the check-up's package database cache and the installer's record in /var/lib/kitchen-sink. Running it again is safe. It refuses while an update is running.
+It turns both timers and the thermal daemon off, revokes any sudo grant and checks that it is gone (and kills any process still carrying the grant's group). Then it removes the programs, the units, /etc/kitchen-sink, the sysusers and tmpfiles snippets, the `kitchen-update` group, the check-up's package database cache and the installer's record in /var/lib/kitchen-sink. It also removes the sample thermal hooks, as their user; your own hooks in that directory stay. Running it again is safe. It refuses while an update is running.
 
 - `--purge` also deletes the reports, logs and state in /var/log/kitchen-{checkup,update} and /var/lib/kitchen-{checkup,update}. Without it they stay.
 - `--disable-scrubs` also turns off the monthly scrubs. They come with btrfs-progs and are worth keeping on their own, so they stay on by default.
+- `--purge-driver` also removes `nct6775-notify-dkms` with `pacman -R`. It was installed on its own, so it stays by default. The patched module already loaded stays until `sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775` or a reboot.
 
 It keeps the IgnorePkg pin in /etc/pacman.conf and the pre-refresh-pacman hook: they protect manual updates too, for as long as the kitchen build is installed.
 
@@ -188,7 +316,9 @@ tests/all                    # everything
 tests/all checkup install    # some parts
 ```
 
-- `checkup`: the check-up's suites (`tests/run`), fed with real output from kitchen-sink, run as root and as an ordinary user.
+- `checkup`: the check-up's suites (`tests/run`), fed with real output from kitchen-sink, run as root and as an ordinary user. They include `nvme-health.py`'s probe: its allowlist of admin commands (every other opcode, log page, Identify CNS and feature is refused before the device is opened), the case A/B verdict, and a fake drive that reproduces kitchen-sink's real probe.
 - `update`: the updater's suites (`tests/update/run.sh`), each in its own container, with real sudo for the grant lifecycle (including a process that carries the group) and end-to-end nights against a faked desktop: DONE, FAILED, the boot-check record and its re-check, an escaped process, an AUR update under the guard, a missing snapshot, a stop mid-update, and a RUNNING left behind. The lint suite checks that the unit's timeouts cover the run's own limits.
-- `install`: `install.sh` and `uninstall.sh` in a container booted with systemd. It covers owners and modes, running again, kept configs, the timers, both units run for real, the unit's timeouts under kitchen-sink's 5 s stop default, the shutdown inhibitor, a process that escapes into the user manager through `systemd-run --user --scope` (the check-up's FAIL, the next slot's kill), the check-up reading the updater's night, the grant test, the journal filter for its sudo probes, a leftover grant, and a clean removal that keeps the pin.
+- `install`: `install.sh` and `uninstall.sh` in a container booted with systemd. It covers owners and modes, running again, kept configs, the timers, both units run for real, the thermal daemon started, restarted when its files change and read by the check-up, its hooks delivered from inside the real unit's sandbox with the user's manager up (a real event's, and a `--test-event` the running service delivers), the sample hooks written as their user, the unit's timeouts under kitchen-sink's 5 s stop default, the shutdown inhibitor, a process that escapes into the user manager through `systemd-run --user --scope` (the check-up's FAIL, the next slot's kill), the check-up reading the updater's night, the grant test, the journal filter for its sudo probes, a leftover grant, and a clean removal that keeps the pin.
 - `lint`: shellcheck over every shell script.
+- `thermal`: the thermal daemon (`tests/thermal/run`) against a fake sysfs with kitchen-sink's real nct6799 attributes, fake uevents, poll() wake-ups, NVMe admin commands and NVML (also through a fake libnvidia-ml in C), as root and as an ordinary user, and `systemd-analyze verify` on its unit. Besides levels, pairing, rate limits and delivery, it covers the device reloaded under the daemon with its uevents lost (at another hwmonN, and at the same one with stale descriptors), `notify_interval` switched off at runtime, a reload while degraded, `--once` changing nothing on a drive it would arm, NVMe levels out of order, a drive taken out of `NVME_ARM`, a GPU cooling at P8, kernel-log lines faked by device names, and `--test-event` handed to the running daemon.
+- The patched nct6775 has its own suite, `pkg/nct6775-notify-dkms/tests/run.sh` (its README, Tests).

@@ -6,7 +6,10 @@
 # every command a check calls with a function that answers from tests/fixtures,
 # runs one check at a time and compares the level and message it recorded.
 # The fixtures are real output from kitchen-sink and from btrfs-progs 7.1,
-# except the kitchen-update status files, which follow the design's fields.
+# except the kitchen-update status files, which follow the design's fields, and
+# the thermal daemon's state.json and journal entries (fixtures/thermal), which
+# follow lib/kitchen-thermald.py's state() (version 1) and its KITCHEN_* journal
+# fields. nvme-probe.json is kitchen-sink's real X0 probe, serials replaced.
 
 # The stubs read STUB_* variables through indirect expansion, and the settings
 # test re-sources the script in a subshell for its pristine defaults.
@@ -47,6 +50,11 @@ gid_carriers() { [[ $1 == "$STUB_GID" ]] && printf '%s' "$STUB_CARRIERS"; }
 uki_uname() { [[ -f $1 ]] && [[ -n $STUB_UKI_UNAME ]] && echo "$STUB_UKI_UNAME"; }
 nvidia_dkms_pkg() { echo "$STUB_NVIDIA"; }
 dkms_module_built() { [[ " $STUB_DKMS_BUILT " == *" $1 "* ]]; }
+nct_module_file() { [[ -n $STUB_NCT_FILE ]] && echo "$STUB_NCT_FILE"; }
+thermal_pkg() { [[ -n $STUB_THERMAL_PKG ]] && echo "$STUB_THERMAL_PKG"; }
+nvme_probe() { cat "$T/nvme-probe.json"; }
+thermal_journal() { cat "$STUB_THERMAL_JOURNAL"; }
+hook_journal() { printf '%s' "$STUB_HOOK_JOURNAL"; }
 
 uname() {
   case $1 in
@@ -100,7 +108,10 @@ systemctl() {
     echo "$state"
     [[ $state == "enabled" ]]
     ;;
+  "show -P ActiveState $THERMAL_UNIT") echo "$STUB_THERMAL_ACTIVE" ;;
   "show -P ActiveState "*) echo "$STUB_UPDATE_STATE" ;;
+  "show -P LoadState $THERMAL_UNIT") echo "$STUB_THERMAL_LOAD" ;;
+  "show -P MainPID $THERMAL_UNIT") echo "$STUB_THERMAL_PID" ;;
   *) echo "unexpected systemctl $*" >&2 && return 99 ;;
   esac
 }
@@ -166,18 +177,34 @@ chmod +x "$T/omarchy-secureboot"
 # An NVMe helper that prints $T/nvme-now.json.
 printf 'import sys\nsys.stdout.write(open("%s").read())\n' "$T/nvme-now.json" >"$T/nvme-stub.py"
 
-# A healthy kitchen-sink on 2026-09-28 at 09:03, with the pin in place.
+# A healthy kitchen-sink on 2026-09-28 at 09:03, with the pin in place, and
+# the thermal events running: the patched nct6775 loaded, every source sending
+# events, and the system drive (the only case A drive, by X0) armed with its
+# threshold lowered to its 70C level.
 reset() {
   levels=() checks=() messages=() details=""
   pending="" pending_rc=1 pending_count=-1 held_back=""
   us_present=0 us_state="" us_night="" us_reasons="" us_hint="" us_reboot="" us_log="" us_packages="" us_nights="" us_reboot_why="" us_epoch=0
-  rm -rf "${T:?}/home" "$T/state" "$T/cache" "$T/log" "${T:?}/etc" "$T/modules"
-  mkdir -p "$T/home/${PIN_HOOK%/*}" "$T/state" "$T/cache" "$T/etc" "$T/modules/7.2.5-4-omarchy" "$T/boot"
+  arm_loaded=0 arm_pairs="" nvme_probe_json="" nvme_json=""
+  rm -rf "${T:?}/home" "$T/state" "$T/cache" "$T/log" "${T:?}/etc" "$T/modules" "$T/nct6775_core"
+  mkdir -p "$T/home/${PIN_HOOK%/*}" "$T/state" "$T/cache" "$T/etc" "$T/modules/7.2.5-4-omarchy" "$T/boot" "$T/nct6775_core/parameters"
   touch "$T/home/$PIN_HOOK" "$T/modules/7.2.5-4-omarchy/vmlinuz" "$T/boot/omarchy_linux-omarchy.efi"
   echo linux-omarchy >"$T/modules/7.2.5-4-omarchy/pkgbase"
   printf '\x06\x00\x00\x00\x01' >"$T/efivar"
   echo 0 >"$T/sb-rc"
   cp "$F/nvme-health.json" "$T/nvme-now.json"
+  echo 1000 >"$T/nct6775_core/parameters/notify_interval"
+  cp "$F/thermal/state-event.json" "$T/thermal-state.json"
+  mkdir -p "$T/doc"
+  printf '# version: 7.2.5\n# checked-through: 7.2.8\n' >"$T/doc/upstream.sha256"
+  printf '# the daemon'"'"'s settings\nNVME_ARM=system\n' >"$T/thermal.conf"
+  jq '.SYSDRIVE0001 |= (.armed = true | .aen_config.current = 514 | .aen_config.current_hex = "0x00000202"
+    | .temp_over.current_k = 343 | .temp_over.current_c = 70)' "$F/nvme-probe.json" >"$T/nvme-probe.json"
+  NVME_SERIALS="SYSDRIVE0001:system DATADRIVE0001:data"
+  THERMAL_STATE=$T/thermal-state.json THERMAL_CONF=$T/thermal.conf NCT_SYSFS=$T/nct6775_core THERMAL_DKMS_DOC=$T/doc
+  STUB_THERMAL_LOAD=loaded STUB_THERMAL_ACTIVE=active STUB_THERMAL_PID=1234 STUB_THERMAL_PKG="nct6775-notify-dkms 7.2.5.1-1"
+  STUB_NCT_FILE=/lib/modules/7.2.5-4-omarchy/updates/dkms/nct6775-core.ko.zst
+  STUB_THERMAL_JOURNAL=$F/thermal/journal-day.json STUB_HOOK_JOURNAL=""
 
   now=$(date -d '2026-09-28T09:03:00-04:00' +%s)
   REPORT_DIR=$T/log STATE_DIR=$T/state CACHE_DIR=$T/cache
@@ -846,6 +873,303 @@ echo 'Traceback (most recent call last):' >"$T/nvme-now.json"
 check_nvme
 expect "nvme helper broken" nvme FAIL "no drive data"
 
+# critical_warning bit 1 (temperature) on the armed system drive, warm past the
+# 70C threshold the daemon lowered but far below its own 90C: WARN, not FAIL.
+reset
+jq '."SYSDRIVE0001".critical_warning = 2 | ."SYSDRIVE0001".temperature_c = 72' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme bit 1 on an armed drive" nvme-system WARN "critical_warning=2 (temperature): past a threshold the thermal daemon set (over 70C; the drive limit is 90C)" "72C"
+
+# An armed drive past its own limit, as the daemon leaves it: the over
+# threshold moved out of reach (65535 K, 65262C), so bit 1 is clear. The
+# temperature itself is the FAIL.
+reset
+jq '.SYSDRIVE0001.temp_over.current_k = 65535 | .SYSDRIVE0001.temp_over.current_c = 65262
+  | .SYSDRIVE0001.temp_under.current_c = 75' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+jq '."SYSDRIVE0001".critical_warning = 0 | ."SYSDRIVE0001".temperature_c = 91' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme armed drive above its limit" nvme-system FAIL "91C, at or above the drive limit 90C (armed: bit 1 of critical_warning does not show it)"
+
+# ... and afterwards, cooled down: the minutes it counted above its limit
+reset
+cp "$F/nvme-health.json" "$STATE_DIR/nvme.json"
+jq '."SYSDRIVE0001".warn_temp_minutes += 3' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme armed drive was above its limit" nvme-system FAIL "+3 min at or above the drive limit 90C since the last check-up"
+
+# The same minutes on a drive nobody arms: its own bit 1 said so at the time
+reset
+cp "$F/nvme-health.json" "$STATE_DIR/nvme.json"
+jq '."DATADRIVE0001".warn_temp_minutes += 3' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme unarmed drive above warning temperature" nvme-data WARN "+3 min above warning temperature"
+
+# Bit 1 past the limit on a drive the daemon does not hold is a hot drive
+reset
+jq '.SYSDRIVE0001.armed = false | .SYSDRIVE0001.temp_over.current_c = 90' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+jq '."SYSDRIVE0001".critical_warning = 2 | ."SYSDRIVE0001".temperature_c = 91' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme bit 1 above the drive limit" nvme-system FAIL "critical_warning=2"
+
+# Bit 1 with any other bit, or on a drive nobody arms, stays a FAIL.
+reset
+jq '."SYSDRIVE0001".critical_warning = 6 | ."SYSDRIVE0001".temperature_c = 72' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme bit 1 plus reliability" nvme-system FAIL "critical_warning=6"
+reset
+printf 'NVME_ARM=""\n' >"$T/thermal.conf"
+jq '."SYSDRIVE0001".critical_warning = 2 | ."SYSDRIVE0001".temperature_c = 72' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme bit 1, drive not armed" nvme-system FAIL "critical_warning=2"
+expect_eq "nvme: no probe without a drive to arm" "$nvme_probe_json" ""
+reset
+jq '."DATADRIVE0001".critical_warning = 2 | ."DATADRIVE0001".temperature_c = 66' "$F/nvme-health.json" >"$T/nvme-now.json"
+check_nvme
+expect "nvme bit 1 on the unarmed data drive" nvme-data FAIL "critical_warning=2"
+
+# ---- thermal events ------------------------------------------------------------
+
+reset
+check_thermal
+expect "thermal all events" thermal OK "active; events from uevent nct6775 nvme nvml kmsg"
+
+reset
+jq '.sources.nct6775 |= (.mode = "degraded" | .reason = "the loaded nct6775 has no change notification (stock driver); polling every 10 s" | .cpu.level = "warn")' \
+  "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal degraded" thermal WARN "DEGRADED, polled instead: nct6775 (the loaded nct6775 has no change notification (stock driver); polling every 10 s)" "now: cpu warn"
+
+reset
+jq '.sources.nvml = {"mode": "off", "reason": "no NVIDIA GPU"} | .sources.kmsg = "off"' "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal a source off" thermal INFO "off: nvml (no NVIDIA GPU), kmsg"
+
+# Off because it broke, announced as degraded and not restored: a WARN
+reset
+jq '.sources.nvml = {"mode": "off", "reason": "the GPU is lost (fallen off the bus)", "announced": "the GPU is lost (fallen off the bus)"}' \
+  "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal nvml lost" thermal WARN "DOWN since it was announced degraded: nvml (the GPU is lost (fallen off the bus))"
+reset
+jq '.sources.kmsg = {"mode": "off", "reason": "journalctl exited (1) after 0 s; restarting in 20 s", "announced": true}
+  | .sources.nct6775 |= (.mode = "off" | .reason = "no nct6799 hwmon device (nct6775 not loaded?)" | .announced = ["off", .reason])' \
+  "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal kmsg and nct6775 down" thermal WARN "DOWN since it was announced degraded: nct6775 (no nct6799 hwmon device" "kmsg (journalctl exited"
+
+# What is not normal right now is listed: a warm drive, a hot GPU, a stalled fan
+reset
+jq '.sources.nvme.drives.system.level = "warn" | .sources.nvml.gpu.hot = true | .sources.nvml.gpu.throttling = ["sw-thermal"]
+  | .sources.nct6775.fans.fan5.stalled = true' "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal levels" thermal OK "now: nvme-system warn, gpu hot, gpu throttling sw-thermal, fan5 stalled"
+
+# The design's name for the version key, and its top-level levels, read too
+reset
+jq 'del(.version) | .schema = 1 | .levels = {"cpu": "crit"} | del(.sources.nct6775.cpu)' "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal schema key" thermal OK "now: cpu crit"
+
+reset
+STUB_THERMAL_PID=4321
+check_thermal
+expect "thermal stale state" thermal WARN "active (pid 4321), but $T/thermal-state.json was written by pid 1234"
+
+reset
+jq '.sources = {}' "$F/thermal/state-event.json" >"$T/thermal-state.json"
+check_thermal
+expect "thermal no sources" thermal WARN "no source sends events"
+
+reset
+STUB_THERMAL_ACTIVE=failed
+check_thermal
+expect "thermal daemon down" thermal WARN "kitchen-thermal.service is failed (enabled)" "sudo systemctl enable --now kitchen-thermal.service"
+
+reset
+STUB_THERMAL_LOAD=not-found
+check_thermal
+expect "thermal not installed" thermal WARN "not installed"
+check_thermal_events
+expect_none "thermal events: none without the daemon" thermal-events
+
+reset
+rm "$T/thermal-state.json"
+check_thermal
+expect "thermal no state" thermal WARN "missing or unreadable"
+
+reset
+echo '{"version": 2, "sources": {}}' >"$T/thermal-state.json"
+check_thermal
+expect "thermal version" thermal WARN "version '2', not 1"
+
+# The patched nct6775, as its notify_interval shows it
+reset
+check_nct6775
+expect "nct6775 patched" nct6775 OK "the patched nct6775 is loaded (nct6775-notify-dkms 7.2.5.1-1, /lib/modules/7.2.5-4-omarchy/updates/dkms/nct6775-core.ko.zst): notify_interval=1000 ms"
+
+# A 7.2 kernel newer than the last release its sources were checked against
+reset
+STUB_KERNEL=7.2.9-1-omarchy
+check_nct6775
+expect "nct6775 on a kernel newer than checked" nct6775 INFO "last checked against Linux 7.2.8, and this kernel is 7.2.9" "refresh.sh 7.2.9 --record"
+reset
+STUB_KERNEL=7.2.8-2-omarchy
+check_nct6775
+expect "nct6775 on the checked kernel" nct6775 OK "notify_interval=1000 ms"
+reset
+printf '# version: 7.2.5\n' >"$T/doc/upstream.sha256"
+STUB_KERNEL=7.2.6-1-omarchy
+check_nct6775
+expect "nct6775 without checked-through: the version" nct6775 INFO "last checked against Linux 7.2.5"
+
+reset
+echo 0 >"$T/nct6775_core/parameters/notify_interval"
+check_nct6775
+expect "nct6775 notifications off" nct6775 WARN "notify_interval=0"
+
+reset
+rm "$T/nct6775_core/parameters/notify_interval"
+check_nct6775
+expect "nct6775 in-tree loaded, patched built" nct6775 WARN "the in-tree nct6775 is loaded" "sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775"
+
+reset
+rm "$T/nct6775_core/parameters/notify_interval"
+STUB_THERMAL_PKG="" STUB_NCT_FILE=/lib/modules/7.2.5-4-omarchy/kernel/drivers/hwmon/nct6775-core.ko.zst
+check_nct6775
+expect "nct6775 package missing" nct6775 WARN "nct6775-notify-dkms is not installed"
+
+reset
+rm "$T/nct6775_core/parameters/notify_interval"
+STUB_NCT_FILE=/lib/modules/7.3.1-1-omarchy/kernel/drivers/hwmon/nct6775-core.ko.zst STUB_KERNEL=7.3.1-1-omarchy
+check_nct6775
+expect "nct6775 no module for this kernel" nct6775 WARN "built no module for 7.3.1-1-omarchy" "BUILD_EXCLUSIVE_KERNEL"
+
+reset
+rm -r "$T/nct6775_core"
+check_nct6775
+expect "nct6775 not loaded" nct6775 WARN "nct6775 is not loaded"
+
+# The drives NVME_ARM names, through the X0 probe
+reset
+check_nvme
+check_nvme_arm
+expect "nvme-arm system armed" nvme-arm-system OK "SYSDRIVE0001: armed (FID 0Bh 0x00000202, case A): events above 70C and below -60C; levels 70/80C, clear 65C; the drive limit 90C"
+expect_none "nvme-arm: only the drives NVME_ARM names" nvme-arm-data
+
+# kitchen-sink as X0 found it: the kernel's 0x200, no bit 1, thresholds untouched
+reset
+cp "$F/nvme-probe.json" "$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm not armed" nvme-arm-system WARN "not armed: FID 0Bh is 0x00000200, without bit 1"
+
+reset
+printf 'NVME_ARM="system data"   # both\n' >"$T/thermal.conf"
+check_nvme_arm
+expect "nvme-arm the data drive is case B" nvme-arm-data WARN "case B (OAES 0x00000000" "Take it out of NVME_ARM"
+expect "nvme-arm quoted list" nvme-arm-system OK "armed"
+
+reset
+printf 'NVME_ARM=DATADRIVE0001\n' >"$T/thermal.conf"
+check_nvme_arm
+expect "nvme-arm by serial" nvme-arm-data WARN "case B"
+
+reset
+printf 'NVME_ARM=scratch\n' >"$T/thermal.conf"
+check_nvme_arm
+expect "nvme-arm unknown name" nvme-arm-scratch WARN "neither a role in NVME_SERIALS"
+
+reset
+jq 'del(.SYSDRIVE0001)' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm drive gone" nvme-arm-system WARN "drive not found by the probe"
+
+reset
+echo 'Traceback' >"$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm probe broken" nvme-arm WARN "printed no drive data"
+
+reset
+jq '.SYSDRIVE0001.temp_over.current_c = 60' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm threshold set by hand" nvme-arm-system WARN "60C is not a threshold the daemon sets (70C, 80C or the drive's 90C)"
+
+reset
+jq '.SYSDRIVE0001.temp_over.current_c = 90' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+check_nvme
+check_nvme_arm
+expect "nvme-arm armed but not lowered while cool" nvme-arm-system WARN "At 34C the daemon should have lowered it to 70C"
+
+# Past the drive's own limit the daemon turns the over threshold off (0xFFFF K)
+reset
+jq '.SYSDRIVE0001.temp_over.current_k = 65535 | .SYSDRIVE0001.temp_over.current_c = 65262
+  | .SYSDRIVE0001.temp_under.current_c = 75' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm hot level" nvme-arm-system OK "no over-temperature event while this hot and below 75C"
+
+reset
+printf 'NVME_ARM=system\nNVME_system_WARN=68 # cooler\nNVME_system_CRIT="78"\n' >"$T/thermal.conf"
+jq '.SYSDRIVE0001.temp_over.current_c = 68' "$T/nvme-probe.json" >"$T/p" && mv "$T/p" "$T/nvme-probe.json"
+check_nvme_arm
+expect "nvme-arm levels from thermal.conf" nvme-arm-system OK "events above 68C" "levels 68/78C, clear 65C"
+
+reset
+: >"$T/thermal.conf"
+check_nvme_arm
+expect "nvme-arm nothing armed" nvme-arm INFO "names no drive"
+rm "$T/thermal.conf"
+reset
+rm "$T/thermal.conf"
+check_nvme_arm
+expect_none "nvme-arm: no thermal.conf, no row" nvme-arm
+
+# conf_value reads the daemon's file without sourcing it
+printf 'A=1\n#B=2\n  C="x y" # note\nD='"'"'q'"'"'\nA=3\n' >"$T/kv.conf"
+expect_eq "conf_value: the last one wins" "$(conf_value "$T/kv.conf" A)" 3
+expect_eq "conf_value: commented out is unset" "$(conf_value "$T/kv.conf" B)" ""
+expect_eq "conf_value: quotes and comment dropped" "$(conf_value "$T/kv.conf" C)" "x y"
+expect_eq "conf_value: single quotes" "$(conf_value "$T/kv.conf" D)" "q"
+expect_eq "conf_value: missing file" "$(conf_value "$T/no-such.conf" A)" ""
+
+# Events and hook failures in the daemon's journal over 24 h
+reset
+check_thermal_events
+expect "thermal events counted" thermal-events OK "24 h: 5 events (cpu-hot x1, fan-ramp x3, nvme-hot x1), no hook failures; 1 hook skipped: nobody logged in"
+
+# Not one hook ran all day, every one skipped for want of a user manager: what
+# a service that cannot see the session looks like
+reset
+jq -c 'if .KITCHEN_HOOK == "queued" then .KITCHEN_HOOK = "no-user-manager" else . end
+  | select(.KITCHEN_HOOK_RESULT != "ok")' "$F/thermal/journal-day.json" >"$T/j.json"
+STUB_THERMAL_JOURNAL=$T/j.json
+check_thermal_events
+expect "thermal hooks all skipped" thermal-events INFO "not one hook ran; 6 hooks skipped: nobody logged in" "--test-event"
+
+# A hook user that does not exist is a setting to fix
+reset
+jq -c 'if .KITCHEN_EVENT == "nvme-hot" then .KITCHEN_HOOK = "no-user" else . end' "$F/thermal/journal-day.json" >"$T/j.json"
+STUB_THERMAL_JOURNAL=$T/j.json
+check_thermal_events
+expect "thermal no such hook user" thermal-events WARN "1 hook failure: no hook for nvme-hot: the hook user does not exist"
+
+# A hook that failed or timed out, and one that could not be queued; a skipped
+# one (no user manager) and a --test-event's are not failures.
+reset
+STUB_THERMAL_JOURNAL=$F/thermal/journal-hook-failed.json
+check_thermal_events
+expect "thermal hook failures" thermal-events WARN "24 h: 7 events (cpu-hot x1, fan-ramp x4, fan-stall x1, nvme-hot x1); 3 hook failures: hook for fan-stall start (event 8): failed (exit 1: Hook failed:" "journalctl -t kitchen-thermal"
+
+# A hook script that fails is invisible to the daemon (omarchy-hook exits 0);
+# omarchy-hook's own line counts, for thermal hooks only.
+reset
+STUB_HOOK_JOURNAL=$'Hook failed: /home/kevinwyckoff/.config/omarchy/hooks/thermal.d/30-fans\nHook failed: /home/kevinwyckoff/.config/omarchy/hooks/post-update.d/10-x\n'
+check_thermal_events
+expect "thermal hook script failed" thermal-events WARN "5 events" "1 hook failure: Hook failed: /home/kevinwyckoff/.config/omarchy/hooks/thermal.d/30-fans"
+
+reset
+STUB_THERMAL_JOURNAL=/dev/null
+check_thermal_events
+expect "thermal quiet day" thermal-events OK "no thermal events"
+
 # ---- btrfs and scrub ----------------------------------------------------------
 
 started=$(date -d 'Mon Sep 28 12:34:49 2026' +%s)
@@ -1092,6 +1416,20 @@ while IFS= read -r line; do
     printf '%s' "${!key}"
   )"
 done < <(grep -E '^#[A-Z_]+=' "$here/../etc/kitchen-sink/checkup.conf")
+
+# The daemon's shipped thermal.conf and the check-up agree on the NVMe levels.
+if [[ -f $here/../etc/kitchen-sink/thermal.conf ]]; then
+  for d in $THERMAL_NVME_DEFAULTS; do
+    IFS=: read -r role w c l <<<"$d"
+    i=0
+    for level in WARN CRIT CLEAR; do
+      want=$(sed -nE "s/^#?NVME_${role}_${level}=\"?([0-9]+)\"?.*/\1/p" "$here/../etc/kitchen-sink/thermal.conf" | tail -n 1)
+      have=$(cut -d' ' -f$((i + 1)) <<<"$w $c $l")
+      i=$((i + 1))
+      [[ -z $want ]] || expect_eq "thermal.conf NVME_${role}_${level} = THERMAL_NVME_DEFAULTS" "$have" "$want"
+    done
+  done
+fi
 
 # The shipped noise filter and the built-in fallback hold the same patterns.
 expect_eq "journal-ignore.regex = DEFAULT_IGNORE" \

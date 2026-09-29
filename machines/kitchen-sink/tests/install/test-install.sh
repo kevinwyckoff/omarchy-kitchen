@@ -23,14 +23,16 @@ USER_NAME=kevinwyckoff
 K=/tmp/kitchen-sink
 TODAY=$(date +%F)
 BINS=(kitchen-checkup kitchen-update)
-LIBS=(notify safe-to-update preflight postflight nvme-health.py evwatch.py news-check.py)
-CONFIGS=(checkup.conf update.conf journal-ignore.regex)
-UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer)
+LIBS=(notify safe-to-update preflight postflight nvme-health.py evwatch.py news-check.py kitchen-thermald.py)
+CONFIGS=(checkup.conf update.conf journal-ignore.regex thermal.conf)
+UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer kitchen-thermal.service)
 INSTALLED=(/usr/local/sbin/kitchen-checkup /usr/local/sbin/kitchen-update /usr/local/lib/kitchen-sink
   /etc/kitchen-sink /etc/sysusers.d/kitchen-update.conf /etc/tmpfiles.d/kitchen-update.conf
   /etc/systemd/system/kitchen-checkup.service /etc/systemd/system/kitchen-checkup.timer
   /etc/systemd/system/kitchen-update.service /etc/systemd/system/kitchen-update.timer
-  /var/lib/kitchen-sink)
+  /etc/systemd/system/kitchen-thermal.service /var/lib/kitchen-sink)
+HOOK_DIR=/home/$USER_NAME/.config/omarchy/hooks/thermal.d
+mapfile -t SAMPLES < <(cd "$SRC/share/thermal.d" && ls -- *.sample)
 
 run_install() { out=$(bash "$K/install.sh" "$@" 2>&1); rc=$?; }
 run_uninstall() { out=$(bash "$K/uninstall.sh" "$@" 2>&1); rc=$?; }
@@ -46,7 +48,10 @@ grep -q '^IgnorePkg = omarchy-dev' /etc/pacman.conf ||
   sed -i '/^\[options\]/a IgnorePkg = omarchy-dev omarchy-settings-dev' /etc/pacman.conf
 pacman_conf_sum=$(sha256sum /etc/pacman.conf)
 hook=/home/$USER_NAME/.config/omarchy/hooks/pre-refresh-pacman.d/10-kitchen-pin
-install -d -o "$USER_NAME" -g "$USER_NAME" "${hook%/*}"
+# The user's config tree is theirs, every level of it, as Omarchy leaves it.
+# setpriv, not runuser: no PAM session, so no user manager is started.
+as_the_user() { setpriv --reuid="$USER_NAME" --regid="$USER_NAME" --init-groups -- "$@"; }
+as_the_user mkdir -p "${hook%/*}"
 printf '#!/bin/bash\n' >"$hook"
 
 # The copy install.sh runs from, as the README's tar over ssh leaves it:
@@ -122,13 +127,28 @@ done
 expect_eq "kitchen-update.timer: NOT enabled" "disabled" "$(enabled kitchen-update.timer)"
 expect_eq "kitchen-update.timer: not started" "inactive" "$(systemctl is-active kitchen-update.timer)"
 expect_match "says the updater's timer is left off" "left off +kitchen-update\.timer" "$out"
-expect_match "the units pass systemd-analyze verify" "verified +the four units" "$out"
+expect_match "the units pass systemd-analyze verify" "verified +the ${#UNITS[@]} units" "$out"
 expect_nomatch "the scrub timers are the ones the check-up watches" "is not among the timers the check-up watches" "$out"
 expect_match "a scrub mount that is not btrfs (here) is flagged" "WARNING +/mnt/data is not a mounted btrfs" "$out"
 expect_match "counts what it changed" "^Installed: [0-9]+ change" "$out"
 expect_match "prints the next steps" "sudo kitchen-update --grant-test" "$out"
 expect_eq "no sudo grant was written" "" "$(find /etc/sudoers.d -name '*kitchen-update*')"
-expect_eq "the shipped configs' checksums are recorded" "3" "$(grep -c . /var/lib/kitchen-sink/configs.sha256)"
+expect_eq "the shipped configs' checksums are recorded" "${#CONFIGS[@]}" "$(grep -c . /var/lib/kitchen-sink/configs.sha256)"
+
+# The thermal daemon runs from the first install on, and its sample hooks are
+# the user's, written by the user.
+expect_eq "kitchen-thermal.service: enabled" "enabled" "$(enabled kitchen-thermal.service)"
+expect_eq "kitchen-thermal.service: running" "active" "$(systemctl is-active kitchen-thermal.service)"
+expect_match "says it started the daemon" "started +kitchen-thermal\.service" "$out"
+for f in "${SAMPLES[@]}"; do
+  expect_eq "hook $f: the user's, 0644" "$USER_NAME:$USER_NAME 644" "$(owner_mode "$HOOK_DIR/$f")"
+  expect "hook $f: the shipped file" cmp -s "$SRC/share/thermal.d/$f" "$HOOK_DIR/$f"
+done
+expect_eq "the hooks directory is the user's" "$USER_NAME:$USER_NAME" "$(stat -c %U:%G "$HOOK_DIR" "${HOOK_DIR%/*}" | sort -u)"
+expect "sample hooks shipped: ${#SAMPLES[@]}" test "${#SAMPLES[@]}" -ge 1
+# No nct6775-notify-dkms in a container: it says so, and how to get it.
+expect_match "says the patched nct6775 is not installed" "driver +nct6775-notify-dkms is not installed" "$out"
+expect_match "and prints how to install it" "sudo pacman -U nct6775-notify-dkms-" "$out"
 
 # ---- B: again, with nothing to do
 mtime=$(stat -c %Y /usr/local/sbin/kitchen-update)
@@ -138,17 +158,122 @@ expect_match "second install: nothing changed" "^Already installed: nothing chan
 expect_nomatch "second install: no file touched" "^  (installed|updated|fixed mode|removed|enabled|kept) " "$out"
 expect_eq "second install: files keep their mtime" "$mtime" "$(stat -c %Y /usr/local/sbin/kitchen-update)"
 
-# ---- C: a config you changed is kept; the shipped one goes next to it
+# A reinstall that changes the daemon's files restarts it onto them.
+pid=$(systemctl show -P MainPID kitchen-thermal.service)
+echo '# an older daemon' >>/usr/local/lib/kitchen-sink/kitchen-thermald.py
+run_install
+expect_rc "changed daemon: install" 0 "$rc" "$out"
+expect_match "changed daemon: restarted" "restarted +kitchen-thermal\.service \(its files changed\)" "$out"
+expect "changed daemon: a new process ($pid before)" test "$(systemctl show -P MainPID kitchen-thermal.service)" != "$pid"
+expect_eq "changed daemon: running" "active" "$(systemctl is-active kitchen-thermal.service)"
+# A hook the user edited in place of the sample is theirs; a sample of ours is put back.
+echo '# mine' >>"$HOOK_DIR/${SAMPLES[0]}"
+run_install
+expect "sample hook: the shipped one is back" cmp -s "$SRC/share/thermal.d/${SAMPLES[0]}" "$HOOK_DIR/${SAMPLES[0]}"
+printf '#!/bin/bash\n' | as_the_user tee "$HOOK_DIR/30-mine" >/dev/null
+# A home the user can't write into costs the samples, not the install.
+rm -f "$HOOK_DIR/${SAMPLES[0]}"
+chown root: "$HOOK_DIR"
+run_install
+chown "$USER_NAME:" "$HOOK_DIR"
+expect_rc "hooks directory not the user's: install" 0 "$rc" "$out"
+expect_match "hooks directory not the user's: a warning" "WARNING +$USER_NAME cannot write $HOOK_DIR" "$out"
+run_install
+expect "hooks directory the user's again: the sample is back" cmp -s "$SRC/share/thermal.d/${SAMPLES[0]}" "$HOOK_DIR/${SAMPLES[0]}"
+expect_nomatch "installing hooks starts no user manager" "^active$" "$(systemctl is-active "user@$(id -u "$USER_NAME").service")"
+
+# ---- Hooks from inside the service's sandbox: ProtectHome=yes hides /run/user,
+# and without CAP_DAC_READ_SEARCH root could not enter it anyway. With the
+# user's manager up (lingering: user@UID.service runs), a real event's hook runs as
+# the user, and a --test-event from a root shell is delivered by the running
+# service itself.
+uid=$(id -u "$USER_NAME")
+cat >/usr/bin/omarchy-hook <<'EOF_HOOK'
+#!/bin/bash
+# A stand-in for Omarchy's omarchy-hook: records who ran which hook.
+echo "$(id -un) $*" >>"$HOME/thermal-hooks.log"
+EOF_HOOK
+chmod 0755 /usr/bin/omarchy-hook
+loginctl enable-linger "$USER_NAME"
+for _ in {1..40}; do
+  [[ $(loginctl show-user "$USER_NAME" -P State 2>/dev/null) == "lingering" && -S /run/user/$uid/bus ]] && break
+  sleep 0.5
+done
+expect_eq "logind: the user lingers, their manager up" "lingering" "$(loginctl show-user "$USER_NAME" -P State 2>/dev/null)"
+rm -f "/home/$USER_NAME/thermal-hooks.log"
+# A stop (unlike a restart) removes /run/kitchen-thermal and its state, so the
+# daemon that starts announces the missing Super I/O again: a real event.
+systemctl stop kitchen-thermal.service
+sleep 1
+t0=$(date +%s)
+systemctl start kitchen-thermal.service
+for _ in {1..40}; do
+  grep -q 'thermal-monitor degraded' "/home/$USER_NAME/thermal-hooks.log" 2>/dev/null && break
+  sleep 0.5
+done
+expect_match "sandboxed service: a real event's hook ran, as the user" "^$USER_NAME thermal thermal-monitor degraded source=nct6775 " \
+  "$(cat "/home/$USER_NAME/thermal-hooks.log" 2>/dev/null)"
+# The hook can finish before journald has the event's line to read back.
+for _ in {1..20}; do
+  [[ -n $(journalctl -q -t kitchen-thermal --since "@$t0" KITCHEN_EVENT=thermal-monitor -o cat) ]] && break
+  sleep 0.5
+done
+expect_eq "sandboxed service: journalled as queued, not no-user-manager" "queued" \
+  "$(journalctl -q -t kitchen-thermal --since "@$t0" KITCHEN_EVENT=thermal-monitor -o cat --output-fields=KITCHEN_HOOK | head -n 1)"
+for _ in {1..20}; do
+  [[ -n $(journalctl -q -t kitchen-thermal --since "@$t0" KITCHEN_HOOK_RESULT=ok -o cat) ]] && break
+  sleep 0.5
+done
+expect_match "sandboxed service: and its result is ok" "^hook for thermal-monitor degraded \(event [0-9]+\): ok" \
+  "$(journalctl -q -t kitchen-thermal --since "@$t0" KITCHEN_HOOK_RESULT=ok -o cat)"
+out=$(/usr/local/lib/kitchen-sink/kitchen-thermald.py --test-event fan-ramp change pwm=pwm2 pct=50 dir=up 2>&1)
+rc=$?
+expect_rc "--test-event as root: delivered" 0 "$rc" "$out"
+expect_match "--test-event: by the running service, not this shell" "delivered by kitchen-thermal\.service, pid [0-9]+" "$out"
+expect_match "--test-event: its hook finished ok" "hook finished: ok" "$out"
+expect_match "--test-event: the hook ran as the user" "^$USER_NAME thermal fan-ramp change pwm=pwm2 pct=50 dir=up$" \
+  "$(cat "/home/$USER_NAME/thermal-hooks.log" 2>/dev/null)"
+expect_eq "--test-event: no request left behind" "" "$(find /run/kitchen-thermal -name '*test-*')"
+# Back to nobody logged in, for the rest of the suite
+loginctl disable-linger "$USER_NAME"
+systemctl stop "user@$uid.service"
+for _ in {1..20}; do
+  [[ -e /run/user/$uid/bus ]] || break
+  sleep 0.5
+done
+rm -f /usr/bin/omarchy-hook "/home/$USER_NAME/thermal-hooks.log"
+
+# ---- C: a config you changed is kept; a newer shipped one goes next to it
 echo 'ROOT_WARN_GIB=50' >>/etc/kitchen-sink/checkup.conf
 run_install
 expect_rc "changed config: install" 0 "$rc" "$out"
 expect_eq "changed config: yours stays" "ROOT_WARN_GIB=50" "$(tail -n 1 /etc/kitchen-sink/checkup.conf)"
-expect "changed config: the shipped one is checkup.conf.new" cmp -s "$SRC/etc/kitchen-sink/checkup.conf" /etc/kitchen-sink/checkup.conf.new
-expect_eq "changed config: .new is root:root 0644" "root:root 644" "$(owner_mode /etc/kitchen-sink/checkup.conf.new)"
-expect_match "changed config: says how to merge" "diff -u /etc/kitchen-sink/checkup\.conf /etc/kitchen-sink/checkup\.conf\.new" "$out"
+expect "changed config, nothing newer shipped: no .new" test ! -e /etc/kitchen-sink/checkup.conf.new
+expect_match "changed config, nothing newer shipped: says so" "kept +/etc/kitchen-sink/checkup\.conf \(yours; nothing newer shipped" "$out"
+expect_match "changed config, nothing newer shipped: nothing changed" "^Already installed: nothing changed" "$out"
+# A newer version ships: fake it with an older record.
+old_sum=$(sha256sum </dev/null | cut -d' ' -f1)
+sed -i "s/^[0-9a-f]*  checkup\.conf\$/$old_sum  checkup.conf/" /var/lib/kitchen-sink/configs.sha256
 run_install
-expect_match "changed config, again: .new still waits" "still waits to be merged" "$out"
-expect_match "changed config, again: nothing changed" "^Already installed: nothing changed" "$out"
+expect_rc "newer shipped: install" 0 "$rc" "$out"
+expect_eq "newer shipped: yours stays" "ROOT_WARN_GIB=50" "$(tail -n 1 /etc/kitchen-sink/checkup.conf)"
+expect "newer shipped: it is checkup.conf.new" cmp -s "$SRC/etc/kitchen-sink/checkup.conf" /etc/kitchen-sink/checkup.conf.new
+expect_eq "newer shipped: .new is root:root 0644" "root:root 644" "$(owner_mode /etc/kitchen-sink/checkup.conf.new)"
+expect_match "newer shipped: says how to merge" "diff -u /etc/kitchen-sink/checkup\.conf /etc/kitchen-sink/checkup\.conf\.new" "$out"
+expect_eq "newer shipped: the record moves to the version offered" "$(sha256sum <"$SRC/etc/kitchen-sink/checkup.conf" | cut -d' ' -f1)" \
+  "$(awk '$2 == "checkup.conf" { print $1 }' /var/lib/kitchen-sink/configs.sha256)"
+run_install
+expect_match "newer shipped, again: .new still waits" "still waits to be merged" "$out"
+expect_match "newer shipped, again: nothing changed" "^Already installed: nothing changed" "$out"
+# Merged, keeping your own edit, and the .new deleted: that version is not
+# offered again (pacman's .pacnew).
+rm /etc/kitchen-sink/checkup.conf.new
+run_install
+expect "merged, edit kept: no .new offered again" test ! -e /etc/kitchen-sink/checkup.conf.new
+expect_eq "merged, edit kept: yours stays" "ROOT_WARN_GIB=50" "$(tail -n 1 /etc/kitchen-sink/checkup.conf)"
+expect_match "merged, edit kept: nothing changed" "^Already installed: nothing changed" "$out"
+# Merged into exactly the shipped file, with the .new left behind.
+install -m 0644 "$SRC/etc/kitchen-sink/checkup.conf" /etc/kitchen-sink/checkup.conf.new
 cp "$SRC/etc/kitchen-sink/checkup.conf" /etc/kitchen-sink/checkup.conf
 run_install
 expect "merged config: the .new is cleaned up" test ! -e /etc/kitchen-sink/checkup.conf.new
@@ -167,13 +292,13 @@ expect_match "older unedited config: says why" "updated +/etc/kitchen-sink/journ
 expect_eq "older unedited config: the new checksum is recorded" "$(sha256sum <"$SRC/etc/kitchen-sink/journal-ignore.regex" | cut -d' ' -f1)" \
   "$(awk '$2 == "journal-ignore.regex" { print $1 }' /var/lib/kitchen-sink/configs.sha256)"
 
-# An edited config keeps the checksum of the version it started from, so the
-# next shipped change is still offered as a .new, never forced on it.
+# An edited config is never updated in place, even when its record is not
+# the version shipped now.
 echo 'NVME_TEMP_WARN=75' >>/etc/kitchen-sink/checkup.conf
+sed -i "s/^[0-9a-f]*  checkup\.conf\$/$old_sum  checkup.conf/" /var/lib/kitchen-sink/configs.sha256
 run_install
+expect_eq "edited config: never forced" "NVME_TEMP_WARN=75" "$(tail -n 1 /etc/kitchen-sink/checkup.conf)"
 expect "edited config: .new offered" test -e /etc/kitchen-sink/checkup.conf.new
-expect_eq "edited config: its record is still the shipped version's" "$(sha256sum <"$SRC/etc/kitchen-sink/checkup.conf" | cut -d' ' -f1)" \
-  "$(awk '$2 == "checkup.conf" { print $1 }' /var/lib/kitchen-sink/configs.sha256)"
 cp "$SRC/etc/kitchen-sink/checkup.conf" /etc/kitchen-sink/checkup.conf
 run_install
 
@@ -210,6 +335,15 @@ expect_eq "check-up: the report directory too" "root:root 755" "$(owner_mode /va
 expect_match "check-up: latest.json has a status" "^(OK|WARN|FAIL)$" "$(jq -r .status /var/log/kitchen-checkup/latest.json)"
 expect_match "check-up: the timers check sees the updater's timer off" "not enabled: .*kitchen-update\.timer" \
   "$(jq -r '.checks[] | select(.check == "timers") | .message' /var/log/kitchen-checkup/latest.json)"
+# The check-up reads the real daemon's state.json and journal: here, with no
+# Super I/O, NVMe or GPU, it runs with those sources off.
+thermal_row=$(jq -r '.checks[] | select(.check == "thermal") | "\(.level) \(.message)"' /var/log/kitchen-checkup/latest.json)
+expect_match "check-up: reads the daemon's state.json" "^(OK|INFO|WARN) active; .*(off|DOWN since it was announced degraded): .*nct6775" "$thermal_row"
+expect_nomatch "check-up: and understands it" "missing or unreadable|not 1:|was written by pid" "$thermal_row"
+expect_match "check-up: counts the daemon's journal" "^(OK|INFO) 24 h: " \
+  "$(jq -r '.checks[] | select(.check == "thermal-events") | "\(.level) \(.message)"' /var/log/kitchen-checkup/latest.json)"
+expect_match "check-up: nct6775 not loaded here" "^WARN nct6775 is not loaded" \
+  "$(jq -r '.checks[] | select(.check == "nct6775") | "\(.level) \(.message)"' /var/log/kitchen-checkup/latest.json)"
 
 sleep 1
 t0=$(date +%s)
@@ -347,6 +481,13 @@ for f in "${UNITS[@]}"; do
   expect_eq "uninstall: $f unknown to systemd" "not-found" "$(systemctl show -P LoadState "$f")"
 done
 expect_eq "uninstall: no enable link left" "" "$(find /etc/systemd/system -name 'kitchen-*')"
+expect_eq "uninstall: the thermal daemon is stopped" "inactive" "$(systemctl is-active kitchen-thermal.service)"
+expect "uninstall: /run/kitchen-thermal removed" test ! -e /run/kitchen-thermal
+for f in "${SAMPLES[@]}"; do
+  expect "uninstall: sample hook $f removed" test ! -e "$HOOK_DIR/$f"
+done
+expect "uninstall: the user's own hook stays" test -f "$HOOK_DIR/30-mine"
+expect_nomatch "uninstall: no driver package here, so none to keep" "Kept nct6775-notify-dkms" "$out"
 expect "uninstall: group kitchen-update removed" test -z "$(getent group kitchen-update)"
 expect "uninstall: /run/kitchen-update removed" test ! -e /run/kitchen-update
 expect "uninstall: the check-up's package DB cache removed" test ! -e /var/cache/kitchen-checkup
@@ -367,6 +508,7 @@ expect_match "uninstall again: nothing to remove" "^Nothing to remove" "$out"
 
 run_uninstall --bogus
 expect_rc "uninstall: an unknown argument is refused" 2 "$rc" "$out"
+rm -f "$HOOK_DIR/30-mine"
 
 run_uninstall --purge --disable-scrubs
 expect_rc "uninstall --purge --disable-scrubs" 0 "$rc" "$out"
@@ -381,9 +523,12 @@ run_install
 expect_rc "reinstall" 0 "$rc" "$out"
 expect_eq "reinstall: the scrubs are back on" "enabled" "$(enabled btrfs-scrub@-.timer)"
 expect "reinstall: the group is back" getent group kitchen-update
-run_uninstall --purge
-expect_rc "final uninstall --purge" 0 "$rc" "$out"
+expect_eq "reinstall: the thermal daemon runs again" "active" "$(systemctl is-active kitchen-thermal.service)"
+run_uninstall --purge --purge-driver
+expect_rc "final uninstall --purge --purge-driver (no driver package here)" 0 "$rc" "$out"
 expect_eq "final: nothing of ours left in /etc/systemd/system" "" "$(find /etc/systemd/system -name 'kitchen-*')"
 expect_eq "final: nothing left under /usr/local" "" "$(find /usr/local -name 'kitchen-*')"
+expect "final: the emptied hooks directory is gone" test ! -e "$HOOK_DIR"
+expect "final: its parent, the user's, stays" test -d "${HOOK_DIR%/*}"
 
 t_summary install

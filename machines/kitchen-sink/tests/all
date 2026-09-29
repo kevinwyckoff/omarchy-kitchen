@@ -12,11 +12,14 @@
 #   install     install.sh and uninstall.sh (tests/install/run.sh), in a
 #               container booted with systemd
 #   lint        shellcheck over every shell script in the tree
+#   thermal     the thermal event daemon (tests/thermal/run) in an Arch
+#               container, as root and as an ordinary user, then shellcheck on
+#               its sample hooks
 
 set -uo pipefail
 ROOT=$(readlink -f "$(dirname "$0")/..")
 IMAGE=${KITCHEN_TEST_IMAGE:-archlinux:latest}
-PARTS=(checkup update install lint)
+PARTS=(checkup update install lint thermal)
 (($#)) && PARTS=("$@")
 
 failed=()
@@ -39,16 +42,29 @@ part_lint() {
   mapfile -t files < <(cd "$ROOT" && {
     printf '%s\n' install.sh uninstall.sh bin/kitchen-checkup bin/kitchen-update tests/run tests/all
     printf '%s\n' lib/notify lib/safe-to-update lib/preflight lib/postflight
-    printf '%s\n' tests/*.sh tests/update/*.sh tests/install/*.sh
+    printf '%s\n' tests/*.sh tests/update/*.sh tests/install/*.sh share/thermal.d/*.sample
   })
   docker run --rm -v "$ROOT:/mnt:ro" -w /mnt koalaman/shellcheck:stable -x -s bash "${files[@]}" &&
     echo "shellcheck: ${#files[@]} files, clean"
 }
 
+# gcc builds the fake libnvidia-ml that checks the daemon's ctypes against C.
+part_thermal() {
+  docker run --rm -v "$ROOT:/w:ro" -w /w "$IMAGE" bash -c '
+    pacman -Sy --noconfirm --needed python gcc >/dev/null 2>&1 || { echo "pacman -S failed"; exit 1; }
+    echo "---- as root"
+    tests/thermal/run || exit 1
+    echo "---- as an ordinary user"
+    useradd -m tester && runuser -u tester -- tests/thermal/run' &&
+    docker run --rm -v "$ROOT:/mnt:ro" -w /mnt koalaman/shellcheck:stable -s bash \
+      tests/thermal/run share/thermal.d/10-toast.sample share/thermal.d/20-log.sample &&
+    echo "shellcheck: tests/thermal/run and the share/thermal.d samples, clean"
+}
+
 for part in "${PARTS[@]}"; do
   echo "######## $part"
   if ! declare -F "part_$part" >/dev/null; then
-    echo "tests/all: no part '$part' (checkup, update, install, lint)" >&2
+    echo "tests/all: no part '$part' (checkup, update, install, lint, thermal)" >&2
     exit 2
   fi
   "part_$part" || failed+=("$part")

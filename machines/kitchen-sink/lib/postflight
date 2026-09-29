@@ -48,7 +48,11 @@ ESP_MARGIN_MIB=64
 SB_MARKER=/var/lib/omarchy-secureboot/enabled
 SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
 PACMAN_LOCK=/var/lib/pacman/db.lck
+DKMS_WARN_ONLY="nct6775-notify"
+THERMAL_DKMS_PKG=nct6775-notify-dkms
 CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+# Where the kernels live; a variable only so the tests can use a fixture tree.
+MODULES_DIR=/usr/lib/modules
 
 MiB=$((1024 * 1024))
 
@@ -166,14 +170,25 @@ check_uki_builds() {
   if grep -q 'not signing!' "$slice"; then fail "uki: sbctl skipped signing: $(grep -m 1 'not signing!' "$slice" | sed 's/^\[[^]]*\] \[[^]]*\] //')"; fi
 }
 
+# A failed DKMS build is a FAIL (nvidia's is a black screen), except for the
+# modules in DKMS_WARN_ONLY, which nothing needs to boot: without nct6775-notify
+# the in-tree nct6775 loads, and only the Super I/O thermal events are lost.
 check_dkms() {
-  local slice=$1 failed
+  local slice=$1 failed line mod kv
   # dkms exits 6 when the module is already installed, which is harmless:
   # "==> WARNING: `dkms install --no-depmod nvidia/615.71.09 -k 7.2.5-4-omarchy' exited 6"
   failed=$(grep -E "dkms install .* exited [0-9]+" "$slice" | grep -vE 'exited 6$')
-  if [[ -n $failed ]]; then
-    fail "dkms: a DKMS build failed: $(head -n 1 <<<"$failed" | sed 's/^\[[^]]*\] \[[^]]*\] //')"
-  elif grep -q 'dkms install' "$slice"; then
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    mod=$(sed -nE 's/.*dkms install( --?[a-z-]+)* ([^/ ]+)\/.*/\2/p' <<<"$line")
+    kv=$(sed -nE "s/.* -k ([^' ]+).*/\1/p" <<<"$line")
+    if [[ -n $mod && " $DKMS_WARN_ONLY " == *" $mod "* ]]; then
+      warn "dkms: the $mod DKMS build failed for ${kv:-a kernel} (exit ${line##* }): after a reboot into it the in-tree driver loads instead and its thermal events are off; boot and fans are unaffected (see dkms status)"
+    else
+      fail "dkms: a DKMS build failed: ${line#\[*\] \[*\] }"
+    fi
+  done <<<"$failed"
+  if [[ -z $failed ]] && grep -q 'dkms install' "$slice"; then
     ok "dkms: DKMS installs finished"
   fi
 }
@@ -316,6 +331,32 @@ sbctl_unsigned() {
   sed 's/\x1b\[[0-9;]*m//g' | grep -E '^(✗|‼)' | grep -vE 'EFI/BOOT/BOOTX64\.EFI|/limine_history/'
 }
 
+# Seams for check_thermal_modules; the tests replace them.
+thermal_dkms_installed() { pacman -Qq "$THERMAL_DKMS_PKG" >/dev/null 2>&1; }
+package_kernels() {
+  local k
+  for k in "$MODULES_DIR"/*/vmlinuz; do
+    [[ -f $k ]] && pacman -Qqo "$k" >/dev/null 2>&1 && basename "$(dirname "$k")"
+  done
+}
+module_file() { modinfo -k "$1" -F filename "$2" 2>/dev/null; } # kernel module
+
+# The thermal events' patched nct6775 for each installed kernel. Its package
+# builds only for the kernels its BUILD_EXCLUSIVE_KERNEL names (the 7.2
+# series); for any other the in-tree driver loads and the thermal daemon polls
+# the Super I/O instead. Never a FAIL: nothing needs it to boot.
+check_thermal_modules() {
+  local kv
+  thermal_dkms_installed || return 0
+  for kv in $(package_kernels); do
+    if [[ $(module_file "$kv" nct6775_core) == */updates/dkms/* ]]; then
+      ok "thermal: the patched nct6775 ($THERMAL_DKMS_PKG) is built for $kv"
+    else
+      warn "thermal: events off for $kv: $THERMAL_DKMS_PKG built no nct6775 module for it (a kernel outside its range, or a failed build), so after a reboot into it the in-tree driver loads and the thermal daemon polls the Super I/O. Fans are unaffected"
+    fi
+  done
+}
+
 check_secureboot() {
   local waited=0 unsigned
   if [[ ! -e $SB_MARKER ]]; then
@@ -448,6 +489,7 @@ main() {
 
   if (( ! log_only )); then
     check_kernels
+    check_thermal_modules
     check_secureboot
     check_esp
     [[ -z $workdir ]] || check_failed_units "$workdir/failed-units.before"

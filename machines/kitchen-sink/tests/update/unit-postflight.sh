@@ -83,6 +83,22 @@ out=$(pf --pacman-log "$work/dkms-10.log"); rc=$?
 expect_rc "dkms build failure: fails" 1 "$rc" "$out"
 expect_match "dkms build failure: named" "^FAIL +dkms: a DKMS build failed: .*exited 10" "$out"
 
+# The thermal events' nct6775-notify is not needed to boot: its failed build is
+# a WARN and the night still passes; nvidia's beside it is still a FAIL.
+nct_line="[2026-09-27T08:54:40-0400] [ALPM-SCRIPTLET] ==> WARNING: \`dkms install --no-depmod nct6775-notify/7.2.5.1 -k 7.2.5-4-omarchy' exited 10"
+awk -v l="$nct_line" '{ print } /dkms install --no-depmod nvidia.* exited 6$/ { print l }' "$FX/pacman-upgrade-with-uki.log" >"$work/nct-dkms.log"
+out=$(pf --pacman-log "$work/nct-dkms.log"); rc=$?
+expect_rc "nct6775-notify build failure: passes" 0 "$rc" "$out"
+expect_match "nct6775-notify build failure: a warning, with the kernel" "^WARN +dkms: the nct6775-notify DKMS build failed for 7.2.5-4-omarchy \(exit 10\): after a reboot into it the in-tree driver loads" "$out"
+expect_nomatch "nct6775-notify build failure: no FAIL line" "^FAIL" "$out"
+sed -E 's/nvidia\/615.71.09 -k 7.2.5-4-omarchy. exited 6$/nvidia\/615.71.09 -k 7.2.5-4-omarchy'"'"' exited 10/' "$work/nct-dkms.log" >"$work/both-dkms.log"
+out=$(pf --pacman-log "$work/both-dkms.log"); rc=$?
+expect_rc "nvidia and nct6775-notify both fail: fails" 1 "$rc" "$out"
+expect_match "both fail: nvidia is the FAIL" "^FAIL +dkms: a DKMS build failed: .*nvidia/615.71.09.*exited 10" "$out"
+expect_match "both fail: nct6775-notify is the WARN" "^WARN +dkms: the nct6775-notify DKMS build failed" "$out"
+out=$(bash -c 'source "$1"; DKMS_WARN_ONLY=""; bad=0; check_dkms "$2"; echo "bad=$bad"' _ "$PF" "$work/nct-dkms.log")
+expect_match "DKMS_WARN_ONLY empty: nct6775-notify fails too" "^FAIL +dkms: a DKMS build failed: .*nct6775-notify" "$out"
+
 # Drop the -Syu's "transaction completed" (the second one in the file).
 awk '/\[ALPM\] transaction completed/ && ++n == 2 { next } { print }' "$FX/pacman-upgrade-with-uki.log" >"$work/incomplete.log"
 out=$(pf --pacman-log "$work/incomplete.log"); rc=$?
@@ -163,6 +179,30 @@ expect_match "live: no lock, last transaction ended" "^ok +pacman: no lock" "$ou
 unset -f pacman_running
 out=$(bash "$PF" --live-boot-only --pacman-log /nonexistent 2>&1 | head -n 1)
 expect_nomatch "--live-boot-only needs no --from" "is required" "$out"
+
+# ---- the thermal modules after the update (live; the seams answer here)
+# shellcheck source=/dev/null
+source "$PF"
+bad=0
+thermal_dkms_installed() { return 0; }
+# shellcheck disable=SC2086 # one kernel per word
+package_kernels() { printf '%s\n' $KERNELS; }
+module_file() {
+  case $1 in
+    7.2.*) echo "/lib/modules/$1/updates/dkms/nct6775-core.ko.zst" ;;
+    *) echo "/lib/modules/$1/kernel/drivers/hwmon/nct6775-core.ko.zst" ;;
+  esac
+}
+KERNELS=7.2.7-1-omarchy
+out=$(check_thermal_modules)
+expect_match "thermal modules: built for the new 7.2 kernel" "^ok +thermal: the patched nct6775 \(nct6775-notify-dkms\) is built for 7.2.7-1-omarchy" "$out"
+KERNELS="7.2.7-1-omarchy 7.3.1-1-omarchy"
+out=$(check_thermal_modules; echo "bad=$bad")
+expect_match "thermal modules: a 7.3 kernel gets none: events off" "^WARN +thermal: events off for 7.3.1-1-omarchy: nct6775-notify-dkms built no nct6775 module" "$out"
+expect_match "thermal modules: never a FAIL" "^bad=0$" "$out"
+thermal_dkms_installed() { return 1; }
+expect_eq "thermal modules: nothing to say without the package" "" "$(check_thermal_modules)"
+unset -f thermal_dkms_installed package_kernels module_file
 
 # ---- helpers
 # shellcheck source=/dev/null

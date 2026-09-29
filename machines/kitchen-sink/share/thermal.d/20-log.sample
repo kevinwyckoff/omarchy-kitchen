@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# This hook is called by kitchen-thermal for every thermal event, as
+#   <event> <state> key=value...
+# with the whole event in $KITCHEN_THERMAL_EVENT as JSON. It runs as you, in
+# your own user manager, for at most a minute.
+# To put it into use, it must be in ~/.config/omarchy/hooks/thermal.d/ without
+# .sample in its name (omarchy-hook skips *.sample files).
+
+# Example: keep every event, one JSON object a line, in a file of your own.
+# (The daemon's journal already has them all: journalctl -t kitchen-thermal)
+
+log_dir=${XDG_STATE_HOME:-$HOME/.local/state}/kitchen-thermal
+mkdir -p "$log_dir"
+if [[ -n ${KITCHEN_THERMAL_EVENT:-} ]]; then
+  printf '%s\n' "$KITCHEN_THERMAL_EVENT" >>"$log_dir/events.jsonl"
+else
+  printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >>"$log_dir/events.log"
+fi

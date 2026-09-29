@@ -2,6 +2,45 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-29: kitchen-sink: thermal and fan events come from a patched nct6775, the drives' own AENs and NVML
+
+**Decision.**
+- **Events, not a polling program.** Kevin wanted temperature and fan-ramp events even if the driver had to be rebuilt. The stock nct6775 has no notification at all, so kitchen-sink gets a patched one as a DKMS package, `nct6775-notify-dkms`, built from the Linux 7.2.5 source (`machines/kitchen-sink/pkg/`).
+  - A sampler inside the kernel reads the chip every `notify_interval` (1 s). It wakes `poll()` readers when a pwm, fan or temperature moves past a delta, and sends a uevent (`hwmon_notify_event`) when an alarm sets or clears.
+  - Off in the code (`notify_interval=0`); the package's modprobe.d file turns it on.
+  - A second patch adds a read-only register dump in debugfs, off by default, that never reads the chip's read-to-clear registers.
+- **One daemon, `kitchen-thermal.service`,** turns the Super I/O events, the NVMe drives' own temperature AENs, NVML's GPU events and the kernel log into journal lines, Omarchy hooks (`~/.config/omarchy/hooks/thermal.d`) and, for the few that matter, toasts. The check-up reports its state.
+- **NVMe: only a drive listed in `NVME_ARM`,** and only a case A drive, where the stock kernel keeps an Asynchronous Event Request outstanding. The FireCuda system drive is case A. The WDC data drive is case B: it can send events only after an nvme-core rebuild, which is deferred.
+- **No hardware interrupt.** The register dump shows none to use; see the findings below.
+- **Smaller calls made during the deploy.**
+  - A `--test-event` goes to the journal at notice at most, so a deploy check doesn't turn the next check-up to WARN.
+  - install.sh offers each shipped config version once, like pacman's `.pacnew`: once the `.new` is merged and deleted, later runs keep the file quietly.
+
+**Findings on kitchen-sink.**
+- **Register dump (read-only).**
+  - Logical device 0B CR70 is 0x00, so no IRQ is assigned. CR24 bit 2 is set, so the shared pin is SMI#, owned by the firmware.
+  - OVT2, the CPU slot (SMBUSMASTER 0, limit 80 °C, hysteresis 75 °C), is disabled by DIS_OVT2, and OVT3-8 by bank C 0x06. OVT1 is on, but it watches AUXTIN0 at 127 °C.
+  - The SMI mask (0x46 = 0x3f) masks the shutdown sources. So CPU heat can raise neither SMI# nor OVT#.
+- **Load test.** 16 threads for 120 s took Tctl from 37 to 85 °C.
+  - `poll()` woke on pwm2 24 times (it went to 255), pwm4 37 times and temp13 (TSI0) 22 times.
+  - `temp7_alarm` sent exactly two uevents, set at 80 °C and cleared at 75 °C.
+  - The fans settled back to idle afterwards.
+- **Cost.**
+  - The kernel: 0.95 ms a second, almost all of it about 39 LPC register reads at 24 µs, so about 0.1 % of one core.
+  - The daemon: 81 ms of CPU a minute (0.14 % of one core) and 39 MB.
+- **Delivery.** A test event sent through the running service ran the user's hook as the user.
+
+**Status.**
+- Live on kitchen-sink:
+  - the package is installed, with the UKI re-signed and Secure Boot clean
+  - the daemon is running, with the Super I/O, NVML, uevents and the kernel log all in event mode
+  - the check-up is OK
+- Not done:
+  - **The FireCuda.** Arming it and the brief threshold test (drop its over- and under-temperature thresholds across the current temperature once each, watch for the AEN, let the daemon restore them) were refused from Marvin by the tool's safety check, although Kevin had approved them. So no drive is armed, and no NVMe AEN has been seen on real hardware yet.
+  - **A reboot at the machine,** to see the module load through modules-load.d.
+
+**What would change it.** Upstream nct6775 gaining change notification, a BIOS that routes the Super I/O interrupt, or the nvme-core rebuild for the WDC.
+
 ## 2026-09-28: kitchen-sink: the kitchen build is pinned, and it gets a daily check-up and a gated nightly update
 
 **Decision.**

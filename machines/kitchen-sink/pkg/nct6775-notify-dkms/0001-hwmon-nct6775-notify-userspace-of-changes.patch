@@ -1,0 +1,526 @@
+From: kitchen <noreply@example.invalid>
+Subject: [PATCH] hwmon: (nct6775) notify userspace of alarm, pwm, fan and
+ temperature changes
+
+The driver has no interrupt to work from: the chip can route its
+hardware-monitor interrupt to a SERIRQ line (LDN B CR70), but firmware does
+not describe one (on the ASRock B650M-HDV/M.2 the HM device HHMD has _STA 0
+and no resources), so userspace can only learn about alarms by polling
+sysfs.
+
+Poll in the driver instead, from a freezable delayed work that reads only
+the alarm, fan count, live pwm and SMIOVT source registers (~30 reads a
+tick, plus the temperatures when asked; a full cache refresh is ~350) and
+report what changed:
+
+ - in/fan/temp/intrusion alarm transitions: hwmon_notify_event(), i.e.
+   sysfs_notify() on the attribute plus a KOBJ_CHANGE uevent carrying
+   NAME=<attr>. Temperature alarms are resolved through the SMIOVT source
+   map exactly as show_temp_alarm() does.
+ - pwmN output changes of at least notify_pwm_delta (the chip's SmartFan
+   ramping), fanN_input stall/start, and optionally tempN_input moves of at
+   least notify_temp_delta: sysfs_notify() only, so poll(2) readers wake
+   without a stream of uevents.
+
+What the work compares also goes into the sysfs cache, under update_lock,
+before it notifies. A woken reader reads the attribute again, and within
+1.5 s of the last full refresh that read is served from the cache: it would
+otherwise show the value from before the change, and nothing would correct
+it, since the notifier's baseline has already moved on.
+
+The work only reads the chip. The pwm modes and fan dividers the light read
+depends on are refreshed when priming, after the cache was invalidated (a
+resume or a caseopen clear) and once a minute, with the read-only helpers of
+nct6775_update_device() rather than that function, which on the NCT6775F
+also retunes the fan dividers and so writes FANDIV and fan_min.
+
+Chassis intrusion is only reported where intrusionN_alarm exists (the
+platform driver; the i2c driver has no such files).
+
+notify_interval (ms) sets the period. It is 0, off, by default: on i2c
+(BMC) and ASUS WMI boards every register read is an SMBus transfer or an
+ACPI method evaluation, so a machine opts in, from modprobe.d for example.
+A non-zero value is clamped to 250-10000 ms (clamped rather than refused, so
+a bad value in modprobe.d cannot fail the module load) and reads back as the
+period in use. A change applies at once: the parameter's setter requeues
+the work of every bound device. While the period is 0 the work does not run,
+and the first pass after switching it on only records state. The work is
+stopped by a devm action registered after the hwmon device, so it is gone
+before the device is unregistered.
+
+Signed-off-by: (unsigned local patch)
+---
+--- a/drivers/hwmon/nct6775.h
++++ b/drivers/hwmon/nct6775.h
+@@ -2,7 +2,9 @@
+ #ifndef __HWMON_NCT6775_H__
+ #define __HWMON_NCT6775_H__
+ 
++#include <linux/list.h>
+ #include <linux/types.h>
++#include <linux/workqueue.h>
+ 
+ enum kinds { nct6106, nct6116, nct6775, nct6776, nct6779, nct6791, nct6792,
+ 	     nct6793, nct6795, nct6796, nct6797, nct6798, nct6799 };
+@@ -181,6 +183,24 @@
+ 	/* driver-specific (platform, i2c) initialization hook and data */
+ 	int (*driver_init)(struct nct6775_data *data);
+ 	void *driver_data;
++
++	/*
++	 * Change notification (sysfs_notify() for poll(2), plus a KOBJ_CHANGE
++	 * uevent for alarm transitions). The chip has no usable interrupt, so
++	 * a delayed work re-reads the registers and reports what changed.
++	 */
++	struct device *hwmon_dev;
++	struct delayed_work notify_work;
++	struct list_head notify_node;	/* kicked when notify_interval changes */
++	unsigned long notify_cfg_at;	/* jiffies: last pwm/fan-divider refresh */
++	unsigned long notify_stale_at;	/* last_updated of the invalid cache handled */
++	bool notify_primed;		/* reported state below is valid */
++	u64 notify_alarms;		/* in/fan/intrusion alarm bits */
++	u16 notify_temp_alarms;		/* temp channels (after source map) */
++	u8 notify_fan_running;		/* fans with rpm > 0 */
++	u8 notify_intrusion;		/* intrusionN_alarm files that exist */
++	u8 notify_pwm[NUM_FAN];		/* pwm output duty */
++	int notify_temp[NUM_TEMP + NUM_TSI_TEMP];	/* millidegrees C */
+ };
+ 
+ static inline int nct6775_read_value(struct nct6775_data *data, u16 reg, u16 *value)
+--- a/drivers/hwmon/nct6775-core.c
++++ b/drivers/hwmon/nct6775-core.c
+@@ -61,6 +61,76 @@
+ 
+ #define USE_ALTERNATE
+ 
++/*
++ * Change notification. Alarm transitions are reported with
++ * hwmon_notify_event() (sysfs_notify + KOBJ_CHANGE uevent, NAME=<attr>).
++ * pwm output, fan stall/start and temperature changes are reported with
++ * sysfs_notify() only, so a reader blocked in poll(2) on the attribute wakes
++ * without generating a stream of uevents.
++ *
++ * Off by default: every access method pays for it (on i2c and ASUS WMI
++ * boards each register read is an SMBus transfer or an ACPI method call), so
++ * a machine opts in with notify_interval, for example from modprobe.d.
++ */
++#define NCT6775_NOTIFY_MIN_MS	250
++#define NCT6775_NOTIFY_MAX_MS	10000
++#define NCT6775_NOTIFY_CFG_SECS	60	/* refresh of the cached pwm modes, fan dividers */
++
++static unsigned int notify_interval;
++
++/* The bound devices, so that a new notify_interval applies at once */
++static DEFINE_MUTEX(nct6775_notify_lock);
++static LIST_HEAD(nct6775_notify_list);
++
++static int nct6775_notify_interval_set(const char *val, const struct kernel_param *kp)
++{
++	struct nct6775_data *data;
++	unsigned int ms;
++	int err;
++
++	err = kstrtouint(val, 0, &ms);
++	if (err)
++		return err;
++
++	/*
++	 * Clamped rather than refused: a value refused while the module loads
++	 * (from modprobe.d, say) would fail the load and take the sensors
++	 * away. The parameter reads back as the period actually used.
++	 */
++	if (ms)
++		ms = clamp_val(ms, NCT6775_NOTIFY_MIN_MS, NCT6775_NOTIFY_MAX_MS);
++	WRITE_ONCE(*(unsigned int *)kp->arg, ms);
++
++	/* Not only once the tick already queued fires, which may be 10 s away */
++	mutex_lock(&nct6775_notify_lock);
++	list_for_each_entry(data, &nct6775_notify_list, notify_node)
++		mod_delayed_work(system_freezable_wq, &data->notify_work, 0);
++	mutex_unlock(&nct6775_notify_lock);
++	return 0;
++}
++
++static const struct kernel_param_ops nct6775_notify_interval_ops = {
++	.set = nct6775_notify_interval_set,
++	.get = param_get_uint,
++};
++
++module_param_cb(notify_interval, &nct6775_notify_interval_ops, &notify_interval, 0644);
++MODULE_PARM_DESC(notify_interval,
++		 "Change-notification period in ms: 0 = off (default), else 250-10000");
++
++static bool notify_pwm = true;
++module_param(notify_pwm, bool, 0644);
++MODULE_PARM_DESC(notify_pwm, "Notify pwmN when its output duty changes");
++
++static unsigned int notify_pwm_delta = 3;
++module_param(notify_pwm_delta, uint, 0644);
++MODULE_PARM_DESC(notify_pwm_delta, "Minimum pwm change (0-255 scale) to notify");
++
++static unsigned int notify_temp_delta;
++module_param(notify_temp_delta, uint, 0644);
++MODULE_PARM_DESC(notify_temp_delta,
++		 "Notify tempN_input when it moves by this many millidegrees C (0 = off)");
++
+ /* used to set data->name = nct6775_device_names[data->sio_kind] */
+ static const char * const nct6775_device_names[] = {
+ 	[nct6106] = "nct6106",
+@@ -3501,6 +3571,333 @@
+ 	return 0;
+ }
+ 
++static __printf(2, 3)
++void nct6775_sysfs_notify(struct device *hwdev, const char *fmt, ...)
++{
++	char name[32];
++	va_list args;
++
++	va_start(args, fmt);
++	vsnprintf(name, sizeof(name), fmt, args);
++	va_end(args);
++	sysfs_notify(&hwdev->kobj, NULL, name);
++}
++
++/* Only the platform driver creates intrusionN_alarm; the i2c one does not. */
++static bool nct6775_has_attr(struct device *hwdev, const char *name)
++{
++	struct kernfs_node *kn = sysfs_get_dirent(hwdev->kobj.sd, name);
++
++	if (!kn)
++		return false;
++	sysfs_put(kn);
++	return true;
++}
++
++/*
++ * Temperature alarm bits are not tied to a temperature channel; they follow
++ * the SMIOVT source map. Resolve them the same way show_temp_alarm() does.
++ * Called with update_lock held.
++ */
++static int nct6775_temp_alarm_mask(struct nct6775_data *data, u64 alarms,
++				   u16 *mask)
++{
++	int count = min_t(int, data->num_temp_alarms, NUM_TEMP);
++	u16 src[NUM_TEMP];
++	int i, nr, bit, err;
++
++	*mask = 0;
++	for (nr = 0; nr < count; nr++) {
++		err = nct6775_read_value(data, data->REG_TEMP_SOURCE[nr], &src[nr]);
++		if (err)
++			return err;
++	}
++
++	for (i = 0; i < NUM_TEMP; i++) {
++		if (!(data->have_temp & BIT(i)))
++			continue;
++		for (nr = 0; nr < count; nr++) {
++			if ((src[nr] & 0x1f) != data->temp_src[i])
++				continue;
++			bit = data->ALARM_BITS[nr + TEMP_ALARM_BASE];
++			if (bit >= 0 && ((alarms >> bit) & 1))
++				*mask |= BIT(i);
++			break;
++		}
++	}
++	return 0;
++}
++
++/* One light sample: what the notifier compares from one tick to the next */
++struct nct6775_notify_sample {
++	u64 alarms;			/* as data->alarms */
++	u16 temp_alarms;		/* temp channels (after source map) */
++	u8 running;			/* fans with rpm > 0 */
++	u8 pwm[NUM_FAN];		/* output duty */
++	unsigned int rpm[NUM_FAN];
++	u16 temp_reg[NUM_TEMP];		/* as data->temp[0] */
++	u16 tsi_reg[NUM_TSI_TEMP];	/* as data->tsi_temp */
++	int temp[NUM_TEMP + NUM_TSI_TEMP];	/* millidegrees C */
++};
++
++/*
++ * Read just the registers the notifier compares: alarms, fan counts, live pwm
++ * outputs and the SMIOVT source map (about 30 reads, plus the temperatures
++ * when asked), instead of the ~350 of a full nct6775_update_device() refresh.
++ *
++ * The values also go into the sysfs cache, under the same lock. A reader
++ * woken by a notification reads the attribute again, and within 1.5 s of the
++ * last full refresh that read is served from the cache: without this it would
++ * see the value from before the change, and the notifier, whose baseline has
++ * moved on, would never report it again.
++ */
++static int nct6775_notify_read(struct nct6775_data *data, bool temps,
++			       struct nct6775_notify_sample *s)
++{
++	int i, err = 0;
++	u16 reg;
++
++	mutex_lock(&data->update_lock);
++
++	s->alarms = 0;
++	for (i = 0; i < NUM_REG_ALARM; i++) {
++		if (!data->REG_ALARM[i])
++			continue;
++		err = nct6775_read_value(data, data->REG_ALARM[i], &reg);
++		if (err)
++			goto out;
++		s->alarms |= ((u64)reg) << (i << 3);
++	}
++
++	s->running = 0;
++	for (i = 0; i < NUM_FAN; i++) {
++		if (!(data->has_fan & BIT(i)))
++			continue;
++		err = nct6775_read_value(data, data->REG_FAN[i], &reg);
++		if (err)
++			goto out;
++		s->rpm[i] = data->fan_from_reg(reg, data->fan_div[i]);
++		if (s->rpm[i])
++			s->running |= BIT(i);
++	}
++
++	/* pwmN shows the live output in automatic modes, as show_pwm() does */
++	for (i = 0; i < NUM_FAN; i++)
++		s->pwm[i] = data->pwm[0][i];
++	for (i = 0; i < data->pwm_num; i++) {
++		if (!(data->has_pwm & BIT(i)) || data->pwm_enable[i] <= manual)
++			continue;
++		err = nct6775_read_value(data, data->REG_PWM_READ[i], &reg);
++		if (err)
++			goto out;
++		s->pwm[i] = reg;
++	}
++
++	if (temps) {
++		for (i = 0; i < NUM_TEMP; i++) {
++			if (!(data->have_temp & BIT(i)))
++				continue;
++			err = nct6775_read_temp(data, data->reg_temp[0][i], &reg);
++			if (err)
++				goto out;
++			s->temp_reg[i] = reg;
++			s->temp[i] = LM75_TEMP_FROM_REG(reg);
++		}
++		for (i = 0; i < NUM_TSI_TEMP; i++) {
++			if (!(data->have_tsi_temp & BIT(i)))
++				continue;
++			err = nct6775_read_value(data, data->REG_TSI_TEMP[i], &reg);
++			if (err)
++				goto out;
++			s->tsi_reg[i] = reg;
++			s->temp[NUM_TEMP + i] = tsi_temp_from_reg(reg);
++		}
++	}
++
++	err = nct6775_temp_alarm_mask(data, s->alarms, &s->temp_alarms);
++	if (err)
++		goto out;
++
++	/* The cache, so that a woken reader sees what was compared */
++	data->alarms = s->alarms;
++	for (i = 0; i < NUM_FAN; i++)
++		if (data->has_fan & BIT(i))
++			data->rpm[i] = s->rpm[i];
++	if (temps) {
++		for (i = 0; i < NUM_TEMP; i++)
++			if (data->have_temp & BIT(i))
++				data->temp[0][i] = s->temp_reg[i];
++		for (i = 0; i < NUM_TSI_TEMP; i++)
++			if (data->have_tsi_temp & BIT(i))
++				data->tsi_temp[i] = s->tsi_reg[i];
++	}
++out:
++	mutex_unlock(&data->update_lock);
++	return err;
++}
++
++/*
++ * The light read depends on the cached pwm modes and duty and the fan
++ * dividers. Refresh just those, with the read-only helpers
++ * nct6775_update_device() uses. That function itself is not called here:
++ * on chips with fan dividers (NCT6775F) it also retunes them, writing FANDIV
++ * and fan_min, and this work only ever reads the chip.
++ */
++static int nct6775_notify_refresh_config(struct nct6775_data *data)
++{
++	int err;
++
++	mutex_lock(&data->update_lock);
++	err = nct6775_update_fan_div_common(data);
++	if (!err)
++		err = nct6775_update_pwm(data->hwmon_dev);
++	mutex_unlock(&data->update_lock);
++	return err;
++}
++
++static void nct6775_notify_work(struct work_struct *work)
++{
++	struct nct6775_data *data = container_of(to_delayed_work(work),
++						 struct nct6775_data, notify_work);
++	struct device *hwdev = data->hwmon_dev;
++	unsigned int interval = READ_ONCE(notify_interval);
++	unsigned int pwm_delta = max(READ_ONCE(notify_pwm_delta), 1U);
++	unsigned int temp_delta = READ_ONCE(notify_temp_delta);
++	bool do_pwm = READ_ONCE(notify_pwm);
++	struct nct6775_notify_sample s = { };
++	unsigned long last_updated;
++	bool stale;
++	u64 changed;
++	int i, bit, tsi_base;
++
++	if (!interval) {
++		/*
++		 * Off: stop here, and re-prime silently when it is switched
++		 * back on (the parameter's setter queues the work again).
++		 */
++		data->notify_primed = false;
++		return;
++	}
++
++	/*
++	 * Refresh the pwm modes and fan dividers when priming, once after the
++	 * cache was invalidated (a resume, after which firmware may have
++	 * reprogrammed the fans, or a caseopen clear) and once a minute.
++	 */
++	last_updated = READ_ONCE(data->last_updated);
++	stale = !READ_ONCE(data->valid) && last_updated != data->notify_stale_at;
++	if (!data->notify_primed || stale ||
++	    time_after(jiffies, data->notify_cfg_at + NCT6775_NOTIFY_CFG_SECS * HZ)) {
++		if (nct6775_notify_refresh_config(data))
++			goto resched;
++		data->notify_cfg_at = jiffies;
++		if (stale)
++			data->notify_stale_at = last_updated;
++	}
++
++	if (nct6775_notify_read(data, temp_delta || !data->notify_primed, &s))
++		goto resched;
++
++	if (!data->notify_primed) {
++		memcpy(data->notify_pwm, s.pwm, sizeof(s.pwm));
++		memcpy(data->notify_temp, s.temp, sizeof(s.temp));
++		data->notify_intrusion = 0;
++		for (i = 0; i < 2; i++) {
++			char name[20];
++
++			snprintf(name, sizeof(name), "intrusion%d_alarm", i);
++			if (data->ALARM_BITS[INTRUSION_ALARM_BASE + i] >= 0 &&
++			    nct6775_has_attr(hwdev, name))
++				data->notify_intrusion |= BIT(i);
++		}
++		data->notify_primed = true;
++		goto save;
++	}
++
++	changed = s.alarms ^ data->notify_alarms;
++
++	for (i = 0; i < data->in_num; i++) {
++		bit = data->ALARM_BITS[i];
++		if ((data->have_in & BIT(i)) && bit >= 0 && ((changed >> bit) & 1))
++			hwmon_notify_event(hwdev, hwmon_in, hwmon_in_alarm, i);
++	}
++
++	for (i = 0; i < NUM_FAN; i++) {
++		if (!(data->has_fan & BIT(i)))
++			continue;
++		bit = data->ALARM_BITS[FAN_ALARM_BASE + i];
++		if (bit >= 0 && ((changed >> bit) & 1))
++			hwmon_notify_event(hwdev, hwmon_fan, hwmon_fan_alarm, i);
++		if ((s.running ^ data->notify_fan_running) & BIT(i))
++			nct6775_sysfs_notify(hwdev, "fan%d_input", i + 1);
++	}
++
++	for (i = 0; i < NUM_TEMP; i++)
++		if ((s.temp_alarms ^ data->notify_temp_alarms) & BIT(i))
++			hwmon_notify_event(hwdev, hwmon_temp, hwmon_temp_alarm, i);
++
++	for (i = 0; i < 2; i++) {
++		if (!(data->notify_intrusion & BIT(i)))
++			continue;
++		bit = data->ALARM_BITS[INTRUSION_ALARM_BASE + i];
++		if ((changed >> bit) & 1)
++			hwmon_notify_event(hwdev, hwmon_intrusion,
++					   hwmon_intrusion_alarm, i);
++	}
++
++	if (do_pwm) {
++		for (i = 0; i < data->pwm_num; i++) {
++			if (!(data->has_pwm & BIT(i)))
++				continue;
++			if ((unsigned int)abs((int)s.pwm[i] - (int)data->notify_pwm[i]) < pwm_delta)
++				continue;
++			data->notify_pwm[i] = s.pwm[i];
++			nct6775_sysfs_notify(hwdev, "pwm%d", i + 1);
++		}
++	}
++
++	if (temp_delta) {
++		for (i = 0; i < NUM_TEMP; i++) {
++			if (!(data->have_temp & BIT(i)) ||
++			    (unsigned int)abs(s.temp[i] - data->notify_temp[i]) < temp_delta)
++				continue;
++			data->notify_temp[i] = s.temp[i];
++			nct6775_sysfs_notify(hwdev, "temp%d_input", i + 1);
++		}
++		/* TSI channels follow the regular ones, see nct6775_probe() */
++		tsi_base = fls(data->have_temp) + 1;
++		for (i = 0; i < NUM_TSI_TEMP; i++) {
++			int t = NUM_TEMP + i;
++
++			if (!(data->have_tsi_temp & BIT(i)) ||
++			    (unsigned int)abs(s.temp[t] - data->notify_temp[t]) < temp_delta)
++				continue;
++			data->notify_temp[t] = s.temp[t];
++			nct6775_sysfs_notify(hwdev, "temp%d_input", tsi_base + i);
++		}
++	}
++
++save:
++	data->notify_alarms = s.alarms;
++	data->notify_temp_alarms = s.temp_alarms;
++	data->notify_fan_running = s.running;
++resched:
++	queue_delayed_work(system_freezable_wq, &data->notify_work,
++			   msecs_to_jiffies(clamp_val(interval, NCT6775_NOTIFY_MIN_MS,
++						      NCT6775_NOTIFY_MAX_MS)));
++}
++
++static void nct6775_notify_stop(void *_data)
++{
++	struct nct6775_data *data = _data;
++
++	/* Out of the setter's reach first, then stopped for good */
++	mutex_lock(&nct6775_notify_lock);
++	list_del_init(&data->notify_node);
++	mutex_unlock(&nct6775_notify_lock);
++	disable_delayed_work_sync(&data->notify_work);
++}
++
+ int nct6775_probe(struct device *dev, struct nct6775_data *data,
+ 		  const struct regmap_config *regmapcfg)
+ {
+@@ -4391,7 +4788,22 @@
+ 
+ 	hwmon_dev = devm_hwmon_device_register_with_groups(dev, data->name,
+ 							   data, data->groups);
+-	return PTR_ERR_OR_ZERO(hwmon_dev);
++	if (IS_ERR(hwmon_dev))
++		return PTR_ERR(hwmon_dev);
++
++	/* devm unwinds in reverse: the work stops before hwmon_dev goes away */
++	data->hwmon_dev = hwmon_dev;
++	INIT_DELAYED_WORK(&data->notify_work, nct6775_notify_work);
++	INIT_LIST_HEAD(&data->notify_node);
++	err = devm_add_action_or_reset(dev, nct6775_notify_stop, data);
++	if (err)
++		return err;
++	mutex_lock(&nct6775_notify_lock);
++	list_add(&data->notify_node, &nct6775_notify_list);
++	mutex_unlock(&nct6775_notify_lock);
++	queue_delayed_work(system_freezable_wq, &data->notify_work, 0);
++
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(nct6775_probe);
+ 

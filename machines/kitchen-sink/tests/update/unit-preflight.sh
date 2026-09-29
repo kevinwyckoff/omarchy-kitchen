@@ -126,6 +126,38 @@ printf '%s\n' ttfx tobi-try >"$W/targets.txt"
 out=$(gate_boot_chain)
 expect_match "boot chain: an ordinary set is ok" "^ok +boot-chain: nothing in the set touches" "$out"
 
+# ---- the thermal events' kernel range (an info line, never a hold)
+mkdir -p "$work/src/nct6775-notify-7.2.5.1"
+# The package's own dkms.conf line
+echo 'BUILD_EXCLUSIVE_KERNEL="^7\.2\.[0-9]+-"' >"$work/src/nct6775-notify-7.2.5.1/dkms.conf"
+DKMS_SRC_DIR=$work/src
+mkdir -p "$work/doc"
+printf '# version: 7.2.5\n# checked-through: 7.2.8\n' >"$work/doc/upstream.sha256"
+THERMAL_DKMS_DOC=$work/doc
+thermal_dkms_installed() { return 0; }
+cp "$FX/files-linux-omarchy.txt" "$W/target-files.txt"
+out=$(gate_thermal_kernel)
+expect_match "thermal: tonight's 7.2 kernel is in range" "^ok +thermal: the pending kernel 7.2.5-4-omarchy is in nct6775-notify-dkms's range \(\^7\\\.2\\\.\[0-9\]\+-\)" "$out"
+sed 's#/7.2.5-4-omarchy/#/7.2.9-1-omarchy/#' "$FX/files-linux-omarchy.txt" >"$W/target-files.txt"
+out=$( (gate_thermal_kernel; echo "holds=$holds retries=$retries cares=$cares") )
+expect_match "thermal: a 7.2 kernel newer than the checked release: info" "^info +thermal: the pending kernel 7.2.9-1-omarchy is in .* but newer than the last release its driver sources were checked against \(7.2.8\).*refresh.sh 7.2.9 --record. Not a reason to hold" "$out"
+expect_match "thermal: ... and nothing is held" "^holds=0 retries=0 cares=0$" "$out"
+sed 's#/7.2.5-4-omarchy/#/7.2.8-1-omarchy/#' "$FX/files-linux-omarchy.txt" >"$W/target-files.txt"
+expect_match "thermal: the checked release itself is ok" "^ok +thermal: the pending kernel 7.2.8-1-omarchy is in" "$(gate_thermal_kernel)"
+sed 's#/7.2.5-4-omarchy/#/7.3.1-1-omarchy/#' "$FX/files-linux-omarchy.txt" >"$W/target-files.txt"
+out=$( (gate_thermal_kernel; echo "holds=$holds retries=$retries cares=$cares") )
+expect_match "thermal: a 7.3 kernel is outside: info" "^info +thermal: the pending kernel 7.3.1-1-omarchy is outside nct6775-notify-dkms's range .*Not a reason to hold" "$out"
+expect_match "thermal: and nothing is held" "^holds=0 retries=0 cares=0$" "$out"
+rm -r "$work/src/nct6775-notify-7.2.5.1"
+out=$(gate_thermal_kernel)
+expect_match "thermal: without dkms.conf, THERMAL_KERNEL_REGEX" "^info +thermal: .*outside nct6775-notify-dkms's range \(\^7\\\.2\\\.\)" "$out"
+cp "$FX/files-glibc.txt" "$W/target-files.txt"
+expect_eq "thermal: no kernel in the set, nothing to say" "" "$(gate_thermal_kernel)"
+thermal_dkms_installed() { return 1; }
+sed 's#/7.2.5-4-omarchy/#/7.3.1-1-omarchy/#' "$FX/files-linux-omarchy.txt" >"$W/target-files.txt"
+expect_eq "thermal: nothing to say without the package" "" "$(gate_thermal_kernel)"
+unset -f thermal_dkms_installed
+
 # ---- Arch news and staleness (feed served from the fixture)
 mkdir -p "$work/state"
 STATE_DIR=$work/state

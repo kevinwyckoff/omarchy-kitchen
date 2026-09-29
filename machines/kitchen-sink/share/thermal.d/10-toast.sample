@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# This hook is called by kitchen-thermal for every thermal event, as
+#   <event> <state> key=value...
+# for example `cpu-hot start level=warn temp=91 threshold=90 sensor=tsi0`. The
+# whole event is also in $KITCHEN_THERMAL_EVENT as JSON. It runs as you, in your
+# own user manager, for at most a minute.
+# To put it into use, it must be in ~/.config/omarchy/hooks/thermal.d/ without
+# .sample in its name (omarchy-hook skips *.sample files).
+
+# Example: toast the events the daemon does not toast by itself. It already
+# toasts a stopped fan, CPU and NVMe crit, GPU errors and a degraded monitor.
+
+event=$1
+state=$2
+shift 2
+declare -A kv
+for arg in "$@"; do
+  kv[${arg%%=*}]=${arg#*=}
+done
+
+case "$event:$state" in
+gpu-throttle:start)
+  omarchy-notification-send --app-name kitchen-thermal -u normal "GPU throttling" "${kv[reason]} at ${kv[temp]} °C"
+  ;;
+board-hot:start)
+  omarchy-notification-send --app-name kitchen-thermal -u normal "${kv[label]} is hot" "${kv[temp]} °C, over its limit of ${kv[max]} °C"
+  ;;
+nvme-hot:start)
+  omarchy-notification-send --app-name kitchen-thermal -u low "NVMe ${kv[drive]} warm" "${kv[temp]} °C"
+  ;;
+esac

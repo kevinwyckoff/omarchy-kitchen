@@ -49,7 +49,14 @@ SB_ENGINE=/usr/share/omarchy/install/secureboot/bin/omarchy-secureboot
 NEWS_URL=https://archlinux.org/feeds/news/
 AUR_URL='https://aur.archlinux.org/rpc/?v=5&type=info&arg=base'
 KEYSERVER_URL=https://keys.openpgp.org/
+THERMAL_DKMS_PKG=nct6775-notify-dkms
+THERMAL_KERNEL_REGEX='^7\.2\.'
 CONF=${KITCHEN_UPDATE_CONF:-/etc/kitchen-sink/update.conf}
+# Where DKMS sources live; a variable only so the tests can use a fixture tree.
+DKMS_SRC_DIR=/usr/src
+# The thermal package's upstream.sha256 (checked-through: the newest release
+# its vendored driver files were found identical to); a variable for the tests.
+THERMAL_DKMS_DOC=/usr/share/doc/nct6775-notify-dkms
 
 MiB=$((1024 * 1024))
 GiB=$((1024 * MiB))
@@ -352,6 +359,50 @@ gate_boot_chain() {
   fi
 }
 
+# The thermal events' patched nct6775 (THERMAL_DKMS_PKG) builds only for the
+# kernels its dkms.conf's BUILD_EXCLUSIVE_KERNEL names: the 7.2 series its
+# sources come from. A pending kernel outside it still installs (the machine
+# boots the in-tree driver), so this only says what the reboot will lose.
+thermal_dkms_installed() { pacman -Qq "$THERMAL_DKMS_PKG" >/dev/null 2>&1; }
+
+# BUILD_EXCLUSIVE_KERNEL from the installed package's dkms.conf, else THERMAL_KERNEL_REGEX.
+thermal_kernel_regex() {
+  local f r=""
+  for f in "$DKMS_SRC_DIR"/nct6775-notify-*/dkms.conf; do
+    [[ -r $f ]] && r=$(sed -nE 's/^BUILD_EXCLUSIVE_KERNEL="(.*)"$/\1/p' "$f" | tail -n 1)
+  done
+  echo "${r:-$THERMAL_KERNEL_REGEX}"
+}
+
+# The newest release the package's vendored driver was checked against, or nothing
+thermal_checked_release() {
+  local f=$THERMAL_DKMS_DOC/upstream.sha256 r
+  [[ -r $f ]] || return 0
+  r=$(sed -nE 's/^# checked-through: *([0-9]+(\.[0-9]+)+).*/\1/p' "$f" | tail -n 1)
+  [[ -n $r ]] || r=$(sed -nE 's/^# version: *([0-9]+(\.[0-9]+)+).*/\1/p' "$f" | tail -n 1)
+  printf '%s' "$r"
+}
+
+gate_thermal_kernel() {
+  local regex kv rel checked
+  thermal_dkms_installed || return 0
+  regex=$(thermal_kernel_regex)
+  checked=$(thermal_checked_release)
+  # The kernel releases the set installs, from gate_boot_chain's file lists.
+  while read -r kv; do
+    rel=${kv%%-*}
+    if [[ $kv =~ $regex && -n $checked && $rel != "$checked" && $(printf '%s\n' "$rel" "$checked" | sort -V | tail -n 1) == "$rel" ]]; then
+      # In range, so DKMS builds the vendored sources for it: a stable fix to
+      # the driver since the release they were checked against is hidden.
+      info "thermal: the pending kernel $kv is in $THERMAL_DKMS_PKG's range ($regex), but newer than the last release its driver sources were checked against ($checked): DKMS builds them anyway, hiding any stable fix to drivers/hwmon/nct6775* since. Check with pkg/nct6775-notify-dkms/refresh.sh $rel --record. Not a reason to hold"
+    elif [[ $kv =~ $regex ]]; then
+      ok "thermal: the pending kernel $kv is in $THERMAL_DKMS_PKG's range ($regex): DKMS builds its patched nct6775 during the update"
+    else
+      info "thermal: the pending kernel $kv is outside $THERMAL_DKMS_PKG's range ($regex): after the reboot the in-tree nct6775 loads and the Super I/O thermal events are off (the daemon polls) until the package is refreshed for it. Not a reason to hold"
+    fi
+  done < <(sed -nE 's#^[^ ]+ usr/lib/modules/([^/]+)/vmlinuz$#\1#p' "$W/target-files.txt" 2>/dev/null | sort -u)
+}
+
 gate_esp() {
   local free size largest rebuild
   rebuild=$(cat "$W/rebuild-triggers" 2>/dev/null || echo 0)
@@ -455,6 +506,7 @@ main() {
     if gate_files_db; then
       gate_pin_effect
       gate_boot_chain
+      gate_thermal_kernel
     elif (( dry )); then
       info "boot-chain: skipped (no .files DBs)"
     fi

@@ -1,0 +1,40 @@
+{
+ "version": 1,
+ "pid": 1234,
+ "started": "2026-09-28T07:02:11-04:00",
+ "updated": "2026-09-28T08:41:12-04:00",
+ "stopping": false,
+ "sources": {
+  "uevent": {"mode": "event", "reason": "kernel uevents (netlink group 1)"},
+  "nct6775": {
+   "mode": "event",
+   "reason": "change notification every 1000 ms",
+   "announced": ["event", "change notification every 1000 ms"],
+   "device": "hwmon7",
+   "devpath": "/devices/platform/nct6775.656/hwmon/hwmon7",
+   "params": {"notify_interval": 1000, "notify_pwm_delta": 3, "notify_temp_delta": 1000},
+   "watching": ["fan2_input", "fan5_input", "fan7_input", "pwm2", "pwm4", "pwm5", "pwm7", "temp13_input"],
+   "cpu": {"sensor": "TSI0_TEMP", "attr": "temp13_input", "temp": 47.5, "level": "none"},
+   "pwm": {"pwm2": 31, "pwm4": 25, "pwm5": 25, "pwm7": 25},
+   "fans": {"fan2": {"rpm": 1041, "known": true, "stalled": false}, "fan5": {"rpm": 812, "known": true, "stalled": false}},
+   "alarms_on": [],
+   "alarms_ignored": ["in0_alarm", "intrusion0_alarm"]
+  },
+  "nvme": {
+   "mode": "event",
+   "reason": "armed: system",
+   "drives": {
+    "system": {"ctrl": "nvme1", "model": "Seagate FireCuda 520 SSD ZP500GM30002", "managed": true, "case": "A", "armed": true,
+               "reason": "armed", "level": "normal", "temp": 34, "aen_config": "0x202", "oaes": "0x200", "thresholds_c": [70, null]},
+    "data": {"ctrl": "nvme0", "model": "WDC WDS512G1X0C-00ENX0", "managed": false, "case": null, "armed": false,
+             "reason": "not in NVME_ARM", "level": "normal", "temp": 34, "aen_config": null, "oaes": null, "thresholds_c": null}
+   }
+  },
+  "nvml": {"mode": "event", "reason": "events 0xc01c", "gpu": {"temp": 38, "pstate": 8, "hot": false, "throttling": null, "active_reasons": 0, "wait_timeout_ms": null}},
+  "kmsg": {"mode": "event", "reason": "following the kernel log", "announced": null}
+ },
+ "hooks": {"user": "", "counts": {"events": 3, "hook_queued": 3, "hooks_ok": 3}},
+ "last_events": [
+  {"event": "fan-ramp", "state": "change", "pwm": "pwm2", "pct": 40, "dir": "up", "hook": "queued", "toast": "no", "message": "fan-ramp: pwm2 up to 40%"}
+ ]
+}

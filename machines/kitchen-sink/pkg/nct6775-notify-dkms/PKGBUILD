@@ -1,0 +1,64 @@
+# The nct6775 hardware-monitor driver from Linux 7.2.5 with two local patches,
+# built by DKMS for every 7.2.x kernel, into /usr/lib/modules/<kernel>/updates/dkms:
+#
+#   0001  notify userspace of alarm, pwm, fan and temperature changes
+#   0002  read-only register dump in debugfs (off unless nct6775.dump=1)
+#
+# Build with plain `makepkg` in this directory. The local sources sit next to
+# this file because makepkg only looks up local sources here. refresh.sh moves
+# the sources to a new kernel release; tests/run.sh builds and tests it all.
+
+pkgname=nct6775-notify-dkms
+_kver=7.2.5 # the kernel release the vendored sources come from
+pkgver=7.2.5.2 # <_kver>.<revision of the patches>
+pkgrel=1
+pkgdesc='nct6775 hwmon driver from Linux 7.2.5 with change notification (DKMS)'
+arch=(any)
+url='https://www.kernel.org/'
+license=(GPL-2.0-only GPL-2.0-or-later)
+depends=(dkms)
+
+_upstream=(nct6775-core.c nct6775-platform.c nct6775-i2c.c nct6775.h lm75.h)
+_patches=(
+  0001-hwmon-nct6775-notify-userspace-of-changes.patch
+  0002-hwmon-nct6775-read-only-register-dump-in-debugfs.patch
+)
+source=("${_upstream[@]}" "${_patches[@]}" upstream.sha256 Makefile dkms.conf nct6775-notify.conf)
+sha256sums=('09cda039d64382d700b09bc3eba52fa9c6e447cdab8ee21db1c869759946a346'
+            'a0d5dfa36399efd8e8fcadf392205008d6f5aa740682aec741c128af952bd807'
+            '33dc19509649bf4289eeee813cea148f0736a15a20f8fd86c28eca8f553759d8'
+            'a482931f33bf8224f840b3b50b840ecad506a449e0b3ab50153c3ea3ab6563f4'
+            '399bd7b2dab163fe01909742d87cc5f8b1a9830ee1b0ae8766cf7dd04307716d'
+            'ecd37c6640a538420e37010a3d71a59f40677fc08e74da4dbabfabc7317843a3'
+            '28302034763723d429cdda34e3476ed3192f37830490396b06883b62f2b7098e'
+            '50069a806210b1e8e767c9a28cbae507b69b372bb8ff88aec9b0f5474f131a67'
+            '78580e241aded7108ad4192a0c6929a7c0f9ef955343284ff695e0a1d085f64a'
+            '29c6862a008243751f208c6ab99a2e9dd4c1f7bf04098990ede171698472bea4'
+            'bdbcf6429fad0a097c6f96a776ebbd637d31bc51edd1eb369e5177c710285c1c')
+
+prepare() {
+  # The vendored files must still be the release's own, whatever sha256sums says
+  sha256sum -c --quiet upstream.sha256
+
+  rm -rf tree
+  mkdir -p tree/drivers/hwmon
+  cp -L "${_upstream[@]}" tree/drivers/hwmon/
+
+  local p
+  for p in "${_patches[@]}"; do
+    patch -d tree -Np1 --fuzz=0 --no-backup-if-mismatch -i "$srcdir/$p"
+  done
+}
+
+package() {
+  local dest="$pkgdir/usr/src/nct6775-notify-$pkgver"
+
+  install -Dm644 -t "$dest" Makefile tree/drivers/hwmon/*
+  sed "s/@PKGVER@/$pkgver/" dkms.conf > dkms.conf.out
+  install -Dm644 dkms.conf.out "$dest/dkms.conf"
+
+  install -Dm644 nct6775-notify.conf "$pkgdir/usr/lib/modprobe.d/nct6775-notify.conf"
+
+  # What was built, for anyone looking at an installed machine
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" "${_patches[@]}" upstream.sha256
+}

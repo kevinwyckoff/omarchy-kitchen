@@ -1,0 +1,19 @@
+# Vendored from Linux 7.2.5 drivers/hwmon/, byte for byte; the patches are
+# applied at build time. Check with: sha256sum -c upstream.sha256
+# checked-through is the newest release whose driver files refresh.sh found
+# identical to these (refresh.sh <release> --record).
+#
+# version: 7.2.5
+# checked-through: 7.2.8
+# tarball: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.5.tar.xz
+# tarball-sha256: 55ddf0df8325d9dad96fcff7bd93977d22e3f50af06527572af59b77c7632b78
+#   (kernel.org's https://cdn.kernel.org/pub/linux/kernel/v7.x/sha256sums.asc: match)
+# signature: linux-7.2.5.tar.sign, good signature by Greg Kroah-Hartman <gregkh@kernel.org>, key 647F28654894E3BD457199BE38DBBDC86092693E
+# browse: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/hwmon?h=v7.2.5
+#
+# lm75.h is not part of the nct6775 driver, but nct6775-core.c includes it.
+09cda039d64382d700b09bc3eba52fa9c6e447cdab8ee21db1c869759946a346  nct6775-core.c
+a0d5dfa36399efd8e8fcadf392205008d6f5aa740682aec741c128af952bd807  nct6775-platform.c
+33dc19509649bf4289eeee813cea148f0736a15a20f8fd86c28eca8f553759d8  nct6775-i2c.c
+a482931f33bf8224f840b3b50b840ecad506a449e0b3ab50153c3ea3ab6563f4  nct6775.h
+399bd7b2dab163fe01909742d87cc5f8b1a9830ee1b0ae8766cf7dd04307716d  lm75.h

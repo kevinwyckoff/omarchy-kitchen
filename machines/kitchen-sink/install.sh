@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# install.sh: install kitchen-sink's daily check-up and nightly updater.
+# install.sh: install kitchen-sink's daily check-up, nightly updater and
+# thermal event daemon.
 #
 # Run it as root on kitchen-sink, from a copy of this directory:
 #
@@ -12,16 +13,24 @@
 # What it does:
 #   - installs kitchen-checkup and kitchen-update to /usr/local/sbin and their
 #     helpers to /usr/local/lib/kitchen-sink (root:root 0755)
-#   - installs the four units to /etc/systemd/system and the sysusers and
+#   - installs the units to /etc/systemd/system and the sysusers and
 #     tmpfiles snippets to /etc (root:root 0644)
-#   - installs /etc/kitchen-sink/{checkup.conf,update.conf,journal-ignore.regex}
-#     (root:root 0644). A file you have changed is kept, and the shipped one is
-#     put next to it as <name>.new for you to merge. A file you never changed
-#     is updated in place: /var/lib/kitchen-sink/configs.sha256 remembers what
-#     was shipped, the way pacman tells an edited config from an old one.
+#   - installs /etc/kitchen-sink/{checkup.conf,update.conf,journal-ignore.regex,
+#     thermal.conf} (root:root 0644). A file you have changed is kept, and the
+#     shipped one is put next to it as <name>.new for you to merge. A file you
+#     never changed is updated in place: /var/lib/kitchen-sink/configs.sha256
+#     remembers what was shipped, the way pacman tells an edited config from an
+#     old one.
 #   - creates the empty kitchen-update group and /run/kitchen-update
 #   - enables and starts the daily check-up timer and the monthly btrfs scrub
 #     timers for / and /mnt/data
+#   - enables and starts kitchen-thermal.service, the thermal event daemon
+#     (restarting it when its files changed), and puts the sample hooks in the
+#     desktop user's ~/.config/omarchy/hooks/thermal.d, as that user
+#
+# The patched nct6775 the daemon needs for Super I/O events comes in its own
+# package, nct6775-notify-dkms (pkg/nct6775-notify-dkms), installed with
+# pacman -U. This only says whether it is there and loaded, and what to run.
 #
 # It does NOT enable kitchen-update.timer. The nightly updater stays off until
 # its dry run, its grant test and one supervised run have passed on this
@@ -40,9 +49,9 @@ UNIT_DIR=/etc/systemd/system
 SUMS=/var/lib/kitchen-sink/configs.sha256
 
 BINS=(kitchen-checkup kitchen-update)
-LIBS=(notify safe-to-update preflight postflight nvme-health.py evwatch.py news-check.py)
-CONFIGS=(checkup.conf update.conf journal-ignore.regex)
-UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer)
+LIBS=(notify safe-to-update preflight postflight nvme-health.py evwatch.py news-check.py kitchen-thermald.py)
+CONFIGS=(checkup.conf update.conf journal-ignore.regex thermal.conf)
+UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer kitchen-thermal.service)
 SYSUSERS=kitchen-update.conf
 TMPFILES=kitchen-update.conf
 GRANT_GROUP=kitchen-update
@@ -50,6 +59,16 @@ GRANT_FILE=/etc/sudoers.d/98-kitchen-update
 
 # The btrfs filesystems that get btrfs-progs' own monthly scrub timer.
 SCRUB_MOUNTS=(/ /mnt/data)
+
+# The thermal event daemon: its unit, the files whose change means a restart,
+# the user whose omarchy-hook runs its hooks (as the daemon picks them:
+# thermal.conf's HOOK_USER, else checkup.conf's DESKTOP_USER, else this), and
+# the package with the patched nct6775.
+THERMAL_UNIT=kitchen-thermal.service
+THERMAL_FILES=(kitchen-thermald.py thermal.conf kitchen-thermal.service)
+DESKTOP_USER=kevinwyckoff
+THERMAL_DKMS=nct6775-notify-dkms
+NCT_SYSFS=/sys/module/nct6775_core
 
 # Each command the check-up or the updater calls that is not in base, and the
 # package it comes from. All of them are on kitchen-sink already.
@@ -61,7 +80,11 @@ REQUIRED=(jq:jq python3:python checkupdates:pacman-contrib pacdiff:pacman-contri
 
 warnings=()
 merge=()
+next=()
 changes=0
+# Set by put and put_config when they change the file in use, so the thermal
+# daemon is restarted onto its new files.
+put_changed=0 thermal_changed=0
 
 say() { printf '  %-13s %s\n' "$1" "$2"; }
 
@@ -79,8 +102,9 @@ usage() {
   cat <<'USAGE'
 Usage: sudo bash install.sh
 
-Installs kitchen-sink's daily check-up and nightly updater from this directory.
-Safe to run again. Leaves kitchen-update.timer as it is (off on a first install).
+Installs kitchen-sink's daily check-up, nightly updater and thermal event
+daemon from this directory. Safe to run again. Leaves kitchen-update.timer as
+it is (off on a first install).
 USAGE
 }
 
@@ -105,11 +129,20 @@ put() {
     what="fixed mode"
   else
     say unchanged "$dest"
+    put_changed=0
     return 0
   fi
   install -o root -g root -m "$mode" -T "$src" "$dest"
   say "$what" "$dest ($mode)"
   changes=$((changes + 1))
+  put_changed=1
+}
+
+# A shipped file of the thermal daemon's: its change needs a restart.
+note_thermal() { # name
+  if ((put_changed)) && [[ " ${THERMAL_FILES[*]} " == *" $1 "* ]]; then
+    thermal_changed=1
+  fi
 }
 
 # Both scripts source their config as root, and skip one that is not owned by
@@ -140,13 +173,18 @@ record_sum() { # name file
 # put_config SOURCE DEST: a settings file. Yours wins: when you have changed
 # DEST, the shipped one goes to DEST.new instead. A DEST that is still exactly
 # what an earlier install shipped is yours in name only, so it is updated.
+# Like pacman's .pacnew, each shipped version is offered once: after you merge
+# DEST.new and delete it, yours is kept quietly until a newer one ships.
 put_config() {
   local src=$1 dest=$2 name=${2##*/}
+  put_changed=0
   if [[ ! -e $dest ]]; then
+    put_changed=1
     install -o root -g root -m 0644 -T "$src" "$dest"
     say installed "$dest (0644)"
     changes=$((changes + 1))
   elif ! cmp -s "$src" "$dest" && [[ $(sha "$dest") == "$(shipped_sum "$name")" ]]; then
+    put_changed=1
     install -o root -g root -m 0644 -T "$src" "$dest"
     say updated "$dest (0644; you had not changed it)"
     changes=$((changes + 1))
@@ -164,19 +202,90 @@ put_config() {
   elif [[ -e $dest.new ]] && cmp -s "$src" "$dest.new"; then
     say kept "$dest (yours differs; $dest.new still waits to be merged)"
     merge+=("$dest")
+  elif [[ $(sha "$src") == "$(shipped_sum "$name")" ]]; then
+    say kept "$dest (yours; nothing newer shipped since you were offered it)"
   else
     install -o root -g root -m 0644 -T "$src" "$dest.new"
     say kept "$dest (yours differs; the shipped one is now $dest.new)"
     merge+=("$dest")
     changes=$((changes + 1))
   fi
-  # Only a config that matches the shipped file is recorded: yours keeps the
-  # checksum of the version you started from until you merge.
-  ! cmp -s "$src" "$dest" || record_sum "$name" "$dest"
+  # The shipped version is recorded whether it went in place or to .new: it is
+  # what an unedited DEST would be, and what you have been offered.
+  record_sum "$name" "$src"
   secure_config "$dest"
 }
 
 scrub_timer() { echo "btrfs-scrub@$(systemd-escape -p "$1").timer"; }
+
+# One KEY=value from a settings file, without sourcing it: the last
+# uncommented assignment, its trailing comment and quotes dropped.
+conf_value() { # file key
+  local v
+  v=$(sed -nE "s/^[[:space:]]*$2=//p" "$1" 2>/dev/null | tail -n 1)
+  v=${v%%[[:space:]]#*}
+  v=${v%"${v##*[![:space:]]}"}
+  if [[ $v =~ ^\"(.*)\"$ || $v =~ ^\'(.*)\'$ ]]; then
+    v=${BASH_REMATCH[1]}
+  fi
+  printf '%s' "$v"
+}
+
+# enable_service UNIT RESTART: enable it for every boot and make sure it runs;
+# with RESTART=1 a running one is restarted onto its new files. A daemon that
+# will not start is a warning, not a failed install: the check-up reports it.
+enable_service() {
+  local s=$1 restart=$2 state
+  if [[ $(systemctl is-enabled "$s" 2>/dev/null) != "enabled" ]]; then
+    systemctl enable --quiet "$s"
+    say enabled "$s"
+    changes=$((changes + 1))
+  fi
+  if ! systemctl is-active --quiet "$s"; then
+    systemctl start "$s" 2>/dev/null || true
+    say started "$s"
+    changes=$((changes + 1))
+  elif ((restart)); then
+    systemctl restart "$s" 2>/dev/null || true
+    say restarted "$s (its files changed)"
+  else
+    say unchanged "$s (running)"
+    return 0
+  fi
+  # Give a daemon that dies at once the moment to do so.
+  sleep 2
+  state=$(systemctl show -P ActiveState "$s" 2>/dev/null)
+  if [[ $state != "active" ]]; then
+    warn "$s is $state after starting: see journalctl -u ${s%.service} -b"
+  fi
+}
+
+# as_user USER CMD...: run CMD with the user's ids and groups. setpriv, not
+# runuser: no PAM session, so it never starts the user's systemd manager.
+as_user() {
+  local user=$1
+  shift
+  setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --init-groups -- "$@"
+}
+
+# install_hook SOURCE USER HOME: a sample hook into the user's thermal.d. It is
+# written by the user, never by root, so nothing in their home can redirect it.
+install_hook() {
+  local src=$1 user=$2 dir=$3/.config/omarchy/hooks/thermal.d dest
+  dest=$dir/${src##*/}
+  if [[ -f $dest ]] && cmp -s "$src" "$dest"; then
+    say unchanged "$dest"
+    return 0
+  fi
+  # shellcheck disable=SC2016 # $1 is the inner shell's, on purpose
+  if as_user "$user" mkdir -p "$dir" 2>/dev/null &&
+    as_user "$user" sh -c 'cat >"$1.tmp" && chmod 0644 "$1.tmp" && mv -f "$1.tmp" "$1"' _ "$dest" <"$src" 2>/dev/null; then
+    say installed "$dest ($user, 0644)"
+    changes=$((changes + 1))
+  else
+    warn "$user cannot write $dir, so the sample hook ${src##*/} was not installed (is ~/.config/omarchy theirs?)"
+  fi
+}
 
 # enable_timer UNIT: enable it for every boot and start it now.
 enable_timer() {
@@ -212,6 +321,8 @@ for f in "${BINS[@]/#/bin/}" "${LIBS[@]/#/lib/}" "${CONFIGS[@]/#/etc/kitchen-sin
   "etc/sysusers.d/$SYSUSERS" "etc/tmpfiles.d/$TMPFILES"; do
   [[ -f $SRC/$f ]] || die "$SRC/$f is missing; copy the whole machines/kitchen-sink directory"
 done
+HOOKS=("$SRC"/share/thermal.d/*.sample)
+[[ -f ${HOOKS[0]} ]] || die "$SRC/share/thermal.d has no sample hooks; copy the whole machines/kitchen-sink directory"
 
 missing=()
 for entry in "${REQUIRED[@]}"; do
@@ -241,6 +352,7 @@ for f in "${BINS[@]}"; do
 done
 for f in "${LIBS[@]}"; do
   put "$SRC/lib/$f" "$LIB_DIR/$f" 0755
+  note_thermal "$f"
 done
 # The directory is ours alone: a helper this version no longer ships goes.
 for f in "$LIB_DIR"/* "$LIB_DIR"/.[!.]*; do
@@ -257,6 +369,7 @@ done
 install -d -o root -g root -m 0755 "$CONF_DIR"
 for f in "${CONFIGS[@]}"; do
   put_config "$SRC/etc/kitchen-sink/$f" "$CONF_DIR/$f"
+  note_thermal "$f"
 done
 
 # ---- the updater's group and runtime directory ----------------------------------
@@ -285,6 +398,7 @@ fi
 install -d -o root -g root -m 0755 "$UNIT_DIR"
 for f in "${UNITS[@]}"; do
   put "$SRC/systemd/$f" "$UNIT_DIR/$f" 0644
+  note_thermal "$f"
 done
 systemctl daemon-reload
 say reloaded "systemd (daemon-reload)"
@@ -296,7 +410,7 @@ if [[ -n $verify ]]; then
     say "" "  $line"
   done <<<"$verify"
 else
-  say verified "the four units (systemd-analyze verify)"
+  say verified "the ${#UNITS[@]} units (systemd-analyze verify)"
 fi
 
 enable_timer kitchen-checkup.timer
@@ -336,11 +450,45 @@ if [[ -e /var/lib/omarchy-secureboot/enabled ]] && ! command -v sbctl >/dev/null
   warn "Secure Boot is managed here but sbctl is missing: install it before the updater's dry run"
 fi
 
+# ---- thermal events ----------------------------------------------------------------
+
+# The daemon runs from now on; a reinstall that changed it restarts it.
+enable_service "$THERMAL_UNIT" "$thermal_changed"
+
+# Its sample hooks, for the user whose omarchy-hook runs them. omarchy-hook
+# skips *.sample; the user copies one without the suffix to use it.
+hook_user=$(conf_value "$CONF_DIR/thermal.conf" HOOK_USER)
+[[ -n $hook_user ]] || hook_user=$(conf_value "$CONF_DIR/checkup.conf" DESKTOP_USER)
+hook_user=${hook_user:-$DESKTOP_USER}
+if hook_home=$(getent passwd "$hook_user" | cut -d: -f6) && [[ -d $hook_home ]]; then
+  for f in "${HOOKS[@]}"; do
+    install_hook "$f" "$hook_user" "$hook_home"
+  done
+else
+  warn "no home for the hook user $hook_user: the sample thermal hooks were not installed"
+fi
+
+# The patched nct6775 comes in its own package; say where it stands.
+kernel=$(uname -r)
+if [[ -r $NCT_SYSFS/parameters/notify_interval ]]; then
+  say driver "the patched nct6775 is loaded (notify_interval=$(<"$NCT_SYSFS/parameters/notify_interval") ms)"
+elif ! pkg=$(pacman -Q "$THERMAL_DKMS" 2>/dev/null); then
+  say driver "$THERMAL_DKMS is not installed: the daemon polls the Super I/O every 10 s instead of getting events"
+  next+=("# the patched nct6775 for Super I/O events (README.md, Thermal events): build pkg/nct6775-notify-dkms, then"
+    "sudo pacman -U nct6775-notify-dkms-*.pkg.tar.zst"
+    "sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775   # fans stay under SmartFan meanwhile")
+elif modinfo -k "$kernel" -F filename nct6775_core 2>/dev/null | grep -q '/updates/dkms/'; then
+  say driver "$pkg is built for $kernel, but the in-tree nct6775 is still loaded"
+  next+=("sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775   # switch to the patched nct6775; fans stay under SmartFan")
+else
+  warn "$pkg has no module for $kernel (outside its kernel range, or its build failed: dkms status): Super I/O events stay off"
+fi
+
 # ---- summary ----------------------------------------------------------------------
 
 echo
 if ((${#merge[@]})); then
-  echo "Your changed settings were kept. Merge the shipped versions by hand:"
+  echo "Your changed settings were kept. Merge the shipped versions by hand, then delete each .new:"
   for f in "${merge[@]}"; do
     echo "  diff -u $f $f.new"
   done
@@ -356,6 +504,9 @@ fi
 echo "Next:"
 echo "  sudo kitchen-checkup --no-notify                  # a check-up now, printed here"
 echo "  sudo systemctl start kitchen-checkup.service      # the same under systemd, with the toast"
+for line in "${next[@]}"; do
+  echo "  $line"
+done
 if ((!updater_on)); then
   cat <<'NEXT'
   sudo kitchen-update --dry-run --quiet-secs 60     # every updater gate; changes nothing

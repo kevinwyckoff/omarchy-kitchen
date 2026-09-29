@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# The thermal event daemon's tests: lib/kitchen-thermald.py against a fake
+# sysfs tree, fake uevents, poll() wake-ups, NVMe, NVML (and, with a C
+# compiler, a fake libnvidia-ml), and fake systemd-run and journalctl. Then,
+# as root, systemd-analyze verify on the unit.
+#
+# tests/all thermal runs this in an Arch container, as root and as an ordinary
+# user. By hand, in machines/kitchen-sink:
+#
+#   docker run --rm -v "$PWD:/w:ro" -w /w archlinux:latest \
+#     bash -c 'pacman -Sy --noconfirm --needed python gcc >/dev/null && tests/thermal/run'
+
+set -uo pipefail
+cd "$(dirname "$0")/../.." || exit 1
+export PYTHONDONTWRITEBYTECODE=1
+
+rc=0
+python3 -W error::ResourceWarning tests/thermal/test_thermald.py || rc=1
+
+# systemd-analyze wants ExecStart to exist, so the daemon goes where the unit
+# expects it: only as root, and only in a throwaway container.
+if ((EUID == 0)) && [[ -f /.dockerenv ]] && command -v systemd-analyze >/dev/null; then
+  install -D -m 0755 lib/kitchen-thermald.py /usr/local/lib/kitchen-sink/kitchen-thermald.py
+  install -D -m 0644 systemd/kitchen-thermal.service /etc/systemd/system/kitchen-thermal.service
+  if out=$(cd / && systemd-analyze verify /etc/systemd/system/kitchen-thermal.service 2>&1) && [[ -z $out ]]; then
+    echo "systemd-analyze verify: kitchen-thermal.service is clean"
+  else
+    echo "systemd-analyze verify: kitchen-thermal.service has remarks:" >&2
+    printf '%s\n' "$out" >&2
+    rc=1
+  fi
+fi
+
+if ((rc == 0)); then
+  echo "thermal tests passed"
+else
+  echo "THERMAL TESTS FAILED" >&2
+fi
+exit $rc

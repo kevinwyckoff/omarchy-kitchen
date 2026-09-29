@@ -1,0 +1,324 @@
+#!/bin/sh
+# /init of the VM test (tests/vm/run.sh builds the image): the real
+# linux-omarchy kernel with the package's modules, in four builds:
+#
+#   /lib/ship   the modules exactly as the package builds them
+#   /lib/fake   the same source, nct6775-platform.c's port I/O sent to fake-sio.ko
+#   /lib/mutA   fake, plus a test mutation: read-to-clear registers in both
+#               dump lists, 0x044 word-sized; the guards must deny them all
+#   /lib/mutB   fake, plus the same lists with the guards off: the negative
+#               control that shows the fake chip notices such reads
+#
+# Every check prints PASS: or FAIL:, and the last line is RESULT:.
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t debugfs debugfs /sys/kernel/debug
+
+DBG=/sys/kernel/debug
+FAKE=$DBG/fake_sio
+DEV=nct6775.656
+D=$DBG/nct6775/$DEV
+passed=0
+failed=0
+
+ok() { passed=$((passed + 1)); echo "PASS: $*"; }
+bad() { failed=$((failed + 1)); echo "FAIL: $*"; }
+check() {
+  desc=$1
+  shift
+  if "$@"; then ok "$desc"; else bad "$desc"; fi
+}
+# check_eq DESCRIPTION EXPECTED ACTUAL
+check_eq() {
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+fake() { sed -n "s/^$1=//p" $FAKE/stats; }
+poke() { echo "$*" > $FAKE/poke; }
+count() { grep -c "$1" "$2"; }
+
+echo "=== kernel: $(cat /proc/version)"
+
+echo "######## 1. i2c path (i2c-stub as the chip), shipped modules"
+insmod /lib/i2c-dev.ko
+insmod /lib/i2c-stub.ko chip_addr=0x2d bank_reg=0x4e bank_mask=0x0f bank_start=0x00 bank_end=0xff
+insmod /lib/ship/nct6775-core.ko notify_interval=1000 notify_temp_delta=1000
+insmod /lib/ship/nct6775-i2c.ko
+S="i2cset -f -y 0 0x2d"
+bank() { $S 0x4e "$1"; }
+# A plausible NCT6799: SMIOVT1 source SYSTIN (temp1, alarm bit 4 of 0x459),
+# pwm1 in SmartFan IV with live output 0x80, TSI0 40.000 C, fan1 stopped
+bank 6; $S 0x21 0x01
+bank 1; $S 0x02 0x40
+bank 0; $S 0x01 0x80
+bank 4; $S 0x09 0x28; $S 0x0a 0x00
+bank 0
+echo nct6799 0x2d > /sys/bus/i2c/devices/i2c-0/new_device
+sleep 1
+H=$(dirname "$(grep -l nct6799 /sys/class/hwmon/hwmon*/name)")
+TSI=$(grep -l TSI0_TEMP "$H"/temp*_label | sed 's/_label/_input/')
+echo "=== hwmon $H, TSI0 at $TSI"
+echo "=== nct6775_core parameters: $(cd /sys/module/nct6775_core/parameters && for p in *; do printf '%s=%s ' "$p" "$(cat "$p")"; done)"
+evwatch 36 "$H/in0_alarm" "$H/temp1_alarm" "$H/fan1_alarm" "$H/pwm1" "$H/fan1_input" "$TSI" > /tmp/ev1.log 2>&1 &
+W=$!
+# The notifier's last access each tick is bank 0xc (the SMIOVT source map); leave the stub there
+step() { echo "--- t+$1: $2"; }
+sleep 3; step 3 "alarms 0x459 = 0x51 (in0, temp1, fan1)"; bank 4; $S 0x59 0x51; bank 0xc
+sleep 2; step 5 "fan1 count 0 -> 32 rpm"; bank 4; $S 0xc0 0x00; $S 0xc1 0x20; bank 0xc
+sleep 2; step 7 "pwm1 live 0x80 -> 0xa0"; bank 0; $S 0x01 0xa0; bank 0xc
+sleep 2; step 9 "pwm1 live 0xa0 -> 0xa1 (below notify_pwm_delta=3: no event)"; bank 0; $S 0x01 0xa1; bank 0xc
+sleep 2; step 11 "TSI0 40.000 -> 42.000 C"; bank 4; $S 0x09 0x2a; bank 0xc
+sleep 2; step 13 "intrusion0 bit (0x45a bit 4): no intrusion0_alarm file on i2c, no event"; bank 4; $S 0x5a 0x10; bank 0xc
+sleep 2; step 15 "clear 0x459 (in0, temp1, fan1 alarms end)"; bank 4; $S 0x59 0x00; bank 0xc
+sleep 2; step 17 "notify_interval=0, then 0x459 = 0x01 (no event)"; echo 0 > /sys/module/nct6775_core/parameters/notify_interval; sleep 1.5; bank 4; $S 0x59 0x01; bank 0xc
+sleep 3; step 21 "notify_interval=1000 again (re-primes silently)"; echo 1000 > /sys/module/nct6775_core/parameters/notify_interval
+sleep 12; step 33 "0x459 = 0x00 (in0 alarm ends)"; bank 4; $S 0x59 0x00; bank 0xc
+wait $W
+echo "=== events:"; cat /tmp/ev1.log
+check_eq "i2c: in0_alarm uevents on set, clear, and the clear after re-priming" 3 "$(count 'uevent.*NAME=in0_alarm' /tmp/ev1.log)"
+check_eq "i2c: temp1_alarm uevents (SMIOVT source map) on set and clear" 2 "$(count 'uevent.*NAME=temp1_alarm' /tmp/ev1.log)"
+check_eq "i2c: fan1_alarm uevents on set and clear" 2 "$(count 'uevent.*NAME=fan1_alarm' /tmp/ev1.log)"
+check_eq "i2c: one poll wake for fan1 starting" 1 "$(count 'poll-wake .*/fan1_input = 32$' /tmp/ev1.log)"
+check_eq "i2c: one poll wake for pwm1 0x80 -> 0xa0, none for the step below the delta" "1 0" \
+  "$(count 'poll-wake .*/pwm1 = 160$' /tmp/ev1.log) $(count 'poll-wake .*/pwm1 = 161$' /tmp/ev1.log)"
+check_eq "i2c: one poll wake for TSI0 40 -> 42 C" 1 "$(count "poll-wake $TSI = 42000$" /tmp/ev1.log)"
+check_eq "i2c: no intrusion event without an intrusion file" 0 "$(count intrusion /tmp/ev1.log)"
+check "i2c: no register dump (the dump is platform-only)" [ ! -e $DBG/nct6775 ]
+check "i2c: nct6775-i2c has no dump parameter" [ ! -e /sys/module/nct6775_i2c/parameters/dump ]
+echo 0x2d > /sys/bus/i2c/devices/i2c-0/delete_device
+sleep 1
+rmmod nct6775_i2c
+rmmod nct6775_core
+
+echo "######## 2. shipped platform module on a machine without the chip"
+insmod /lib/hwmon-vid.ko
+insmod /lib/ship/nct6775-core.ko
+check_eq "notify_interval is 0 (off) unless asked for" 0 "$(cat /sys/module/nct6775_core/parameters/notify_interval)"
+if insmod /lib/ship/nct6775.ko 2>/tmp/insmod.err; then
+  bad "shipped nct6775 loaded with no chip present"
+  rmmod nct6775
+else
+  ok "shipped nct6775 refuses to load with no chip ($(cat /tmp/insmod.err))"
+fi
+check "... and leaves no debugfs directory behind" [ ! -e $DBG/nct6775 ]
+rmmod nct6775_core
+
+echo "######## 3. platform path against the fake chip, shipped source"
+insmod /lib/fake-sio.ko
+insmod /lib/fake/nct6775-core.ko notify_interval=1000 notify_temp_delta=1000
+insmod /lib/fake/nct6775.ko
+sleep 1
+H=$(dirname "$(grep -l nct6799 /sys/class/hwmon/hwmon*/name)")
+TSI=$(grep -l TSI0_TEMP "$H"/temp*_label | sed 's/_label/_input/')
+check "platform driver bound to the fake NCT6799D at 0x290" [ -e /sys/bus/platform/drivers/nct6775/$DEV ]
+check "sio_regs and hm_regs exist under nct6775/$DEV" test -f $D/sio_regs -a -f $D/hm_regs
+check_eq "both files are root-only" "400 400" "$(stat -c %a $D/sio_regs) $(stat -c %a $D/hm_regs)"
+check_eq "the dump parameter is off by default" N "$(cat /sys/module/nct6775/parameters/dump)"
+
+# Nothing else may touch the chip while we count: park the sampler
+echo 0 > /sys/module/nct6775_core/parameters/notify_interval
+sleep 1.5
+echo 1 > $FAKE/reset
+cat $D/sio_regs > /tmp/off.sio 2>/tmp/off.sio.err
+r1=$?
+cat $D/hm_regs > /tmp/off.hm 2>/tmp/off.hm.err
+r2=$?
+check_eq "dump=0: both reads fail" "1 1" "$([ $r1 -ne 0 ] && echo 1) $([ $r2 -ne 0 ] && echo 1)"
+check_eq "dump=0: ... both with EPERM" 2 "$(cat /tmp/off.sio.err /tmp/off.hm.err | grep -c 'not permitted')"
+echo "    ($(cat /tmp/off.sio.err))"
+check_eq "dump=0: no chip access at all (hm reads/config entries/config reads)" "0/0/0" "$(fake hm_reads)/$(fake cfg_enters)/$(fake cfg_reads)"
+
+echo 1 > /sys/module/nct6775/parameters/dump
+echo 1 > $FAKE/reset
+ldn_before=$(fake ldn)
+cat $D/sio_regs > /tmp/sio.txt
+check_eq "dump=1: sio_regs reads" 0 $?
+echo "--- sio_regs (head)"; head -8 /tmp/sio.txt
+check_eq "sio_regs: one entry and one exit of configuration mode, left exited" "1/1/0" "$(fake cfg_enters)/$(fake cfg_exits)/$(fake cfg_mode)"
+check_eq "sio_regs: no configuration write but the logical-device select" 0 "$(fake cfg_other_writes)"
+check_eq "sio_regs: logical device put back as found" "$ldn_before" "$(fake ldn)"
+check_eq "sio_regs: no hardware-monitor access" 0 "$(fake hm_reads)"
+grep -v '^#' /tmp/sio.txt > /tmp/sio.got
+cat $FAKE/expect_sio > /tmp/sio.want
+check "sio_regs: E1's 70 registers, each as the chip holds it" diff /tmp/sio.want /tmp/sio.got
+check_eq "sio_regs: 70 register lines" 70 "$(wc -l < /tmp/sio.got)"
+check_eq "sio_regs: no read-to-clear configuration register read" 0 "$(fake cfg_rc_reads)"
+check "sio_regs: header names the never-read configuration registers" grep -qx \
+  '# never read (read-to-clear): LDN07:CRE3 LDN07:CRE7 LDN07:CRF7 LDN08:CRE3 LDN08:CRF3 LDN09:CRE3 LDN09:CRE7 LDN09:CRE8 LDN09:CRF7 LDN0A:CRE3' /tmp/sio.txt
+
+echo 1 > $FAKE/reset
+cat $D/hm_regs > /tmp/hm.txt
+check_eq "dump=1: hm_regs reads" 0 $?
+echo "--- hm_regs (head)"; head -6 /tmp/hm.txt
+check_eq "hm_regs: no read-to-clear register read" 0 "$(fake rc_reads)"
+check_eq "hm_regs: no hardware-monitor write but the bank select" 0 "$(fake hm_writes)"
+check_eq "hm_regs: no Super-I/O configuration access" 0 "$(fake cfg_enters)"
+grep -v '^#' /tmp/hm.txt > /tmp/hm.got
+cat $FAKE/expect_hm > /tmp/hm.want
+check "hm_regs: E1b's 42 registers, each from the right bank" diff /tmp/hm.want /tmp/hm.got
+check "hm_regs: header names the never-read registers" grep -qx '# never read (read-to-clear): 0x041 0x042 0x045 0x450 0x567 0xc02 0xc03' /tmp/hm.txt
+
+# Dump reads racing the sampler and sysfs refreshes (two CPUs). Setting
+# notify_interval restarts the sampler at once; its first pass re-primes
+# silently.
+echo 1000 > /sys/module/nct6775_core/parameters/notify_interval
+sleep 2
+i=0
+while [ $i -lt 25 ]; do
+  cat $D/hm_regs > /tmp/hm.race
+  cat $D/sio_regs > /tmp/sio.race
+  cat "$H/temp1_input" "$H/pwm1" > /dev/null
+  i=$((i + 1))
+done &
+R=$!
+cat "$H"/temp*_input "$H"/fan*_input > /dev/null 2>&1
+sleep 2
+cat "$H"/in*_input > /dev/null 2>&1
+wait $R
+grep -v '^#' /tmp/hm.race > /tmp/hm.got2
+grep -v '^#' /tmp/sio.race > /tmp/sio.got2
+check "racing reads: hm_regs still reads every register from its own bank" diff /tmp/hm.want /tmp/hm.got2
+check "racing reads: sio_regs still reads every register from its own device" diff /tmp/sio.want /tmp/sio.got2
+check_eq "racing reads: configuration mode left exited" 0 "$(fake cfg_mode)"
+
+echo "--- notification on the platform path"
+evwatch 9 "$H/intrusion0_alarm" "$H/temp1_alarm" "$H/pwm1" "$TSI" > /tmp/ev3.log 2>&1 &
+W=$!
+sleep 2; poke hm 0x45a 0x10	# intrusion0 (alarm bit 12)
+sleep 2; poke hm 0x459 0x10	# SMIOVT1 = SYSTIN -> temp1_alarm
+sleep 1.5; poke hm 0x001 0xa0	# pwm1 live 0x80 -> 0xa0
+sleep 1.5; poke hm 0x409 0x2a	# TSI0 40 -> 42 C
+wait $W
+cat /tmp/ev3.log
+check_eq "platform: intrusion0_alarm uevent" 1 "$(count 'uevent.*NAME=intrusion0_alarm' /tmp/ev3.log)"
+check_eq "platform: temp1_alarm uevent through the SMIOVT source map" 1 "$(count 'uevent.*NAME=temp1_alarm' /tmp/ev3.log)"
+check_eq "platform: pwm1 poll wake" 1 "$(count 'poll-wake .*/pwm1 = 160$' /tmp/ev3.log)"
+check_eq "platform: TSI0 poll wake" 1 "$(count "poll-wake $TSI = 42000$" /tmp/ev3.log)"
+check_eq "platform: still no read-to-clear read since the fake chip loaded" 0 "$(fake rc_reads_total)"
+
+echo "--- notify_interval at runtime: clamped, and applied at once"
+P=/sys/module/nct6775_core/parameters
+echo 60000 > $P/notify_interval
+check_eq "60000 ms is clamped to the 10000 maximum" 10000 "$(cat $P/notify_interval)"
+echo 4294967295 > $P/notify_interval
+check_eq "so is 4294967295" 10000 "$(cat $P/notify_interval)"
+echo 100 > $P/notify_interval
+check_eq "100 ms is raised to the 250 minimum" 250 "$(cat $P/notify_interval)"
+if echo junk > $P/notify_interval 2>/dev/null; then bad "a non-number is refused"; else ok "a non-number is refused"; fi
+check_eq "... and the period stays" 250 "$(cat $P/notify_interval)"
+# The tick queued at 10000 ms is 10 s away; 1000 must not wait for it
+echo 10000 > $P/notify_interval
+sleep 1
+echo 1000 > $P/notify_interval
+evwatch 4 "$H/temp1_alarm" > /tmp/ev4.log 2>&1 &
+W=$!
+sleep 0.5; poke hm 0x459 0x00	# temp1_alarm ends
+wait $W
+cat /tmp/ev4.log
+check_eq "1000 right after 10000 applies at once: the alarm's uevent within 4 s" 1 "$(count 'uevent.*NAME=temp1_alarm' /tmp/ev4.log)"
+echo 0 > $P/notify_interval
+sleep 0.5
+echo 1 > $FAKE/reset
+sleep 3
+check_eq "notify_interval=0: the sampler does not run at all (no chip read in 3 s)" 0 "$(fake hm_reads)"
+echo 1000 > $P/notify_interval
+sleep 0.5
+check "switched back on: it runs at once" [ "$(fake hm_reads)" -gt 0 ]
+
+echo "--- a reader woken by a notification reads the new value while another reader keeps the cache warm"
+# fan1 spinning (count 0x0200: 512 rpm), no temp1 alarm; then a reader of an
+# unrelated attribute four times a second (a panel, sensors): the 1.5 s cache
+# never expires, so what the woken reader reads comes from the cache.
+poke hm 0x4c0 0x02; poke hm 0x4c1 0x00; poke hm 0x459 0x00
+sleep 2.5
+( while :; do cat "$H/in0_input" > /dev/null; sleep 0.25; done ) &
+B=$!
+evwatch 46 "$H/fan1_input" > /tmp/ev5.log 2>&1 &
+W=$!
+n=0
+while [ $n -lt 6 ]; do
+  sleep 1.8; poke hm 0x459 0x10		# temp1_alarm -> 1
+  sleep 1.8; poke hm 0x459 0x00		# temp1_alarm -> 0
+  sleep 1.8; poke hm 0x4c0 0x00		# fan1 stops
+  sleep 1.8; poke hm 0x4c0 0x02		# fan1 spins again
+  n=$((n + 1))
+done
+wait $W
+kill $B
+grep -E 'read-after-uevent temp1_alarm|poll-wake' /tmp/ev5.log
+# A read is stale when it is not the state the notification was about
+stale=$(awk '/read-after-uevent temp1_alarm/ { want = (a++ % 2 == 0) ? 1 : 0; if ($NF != want) sa++ }
+  /poll-wake .*fan1_input/ { want = (f++ % 2 == 0) ? 0 : 1; if (($NF != 0) != want) sf++ }
+  END { printf "%d %d %d %d", a, sa, f, sf }' /tmp/ev5.log)
+check_eq "cache: 12 temp1_alarm uevents, none read back stale; 12 fan1_input wakes, none stale" "12 0 12 0" "$stale"
+
+echo "--- unbind with a dump file held open"
+exec 3< $D/hm_regs
+echo $DEV > /sys/bus/platform/drivers/nct6775/unbind
+check "unbind removes the device directory" [ ! -e $D ]
+cat <&3 > /dev/null 2>&1
+check "a file held open across unbind reads as an error" [ $? -ne 0 ]
+exec 3<&-
+echo $DEV > /sys/bus/platform/drivers/nct6775/bind
+check "rebind brings the files back" [ -f $D/hm_regs ]
+rmmod nct6775
+check "module unload removes nct6775/ from debugfs" [ ! -e $DBG/nct6775 ]
+rmmod nct6775_core
+
+echo "######## 4. mutation A: read-to-clear registers in the list, guard on"
+insmod /lib/mutA/nct6775-core.ko notify_interval=0
+insmod /lib/mutA/nct6775.ko dump=1
+sleep 1
+check_eq "dump=1 given at load" Y "$(cat /sys/module/nct6775/parameters/dump)"
+echo 1 > $FAKE/reset
+cat $D/hm_regs > /tmp/hmA.txt
+grep denied /tmp/hmA.txt
+denied=0
+for r in 041 042 045 450 567 c02 c03 044; do
+  grep -qx "0x$r = denied" /tmp/hmA.txt && denied=$((denied + 1))
+done
+check_eq "guard: all seven read-to-clear registers, and 0x044 (word-sized here, would read 0x045), denied" 8 "$denied"
+check_eq "guard: the fake chip saw no read-to-clear read" 0 "$(fake rc_reads)"
+grep -v '^#' /tmp/hmA.txt | grep -v denied > /tmp/hmA.got
+grep -v '^0x044 ' /tmp/hm.want > /tmp/hmA.want
+check "guard: every other register still reads right" diff /tmp/hmA.want /tmp/hmA.got
+echo 1 > $FAKE/reset
+cat $D/sio_regs > /tmp/sioA.txt
+grep denied /tmp/sioA.txt
+denied=0
+for r in "07 CRE3" "07 CRE7" "07 CRF7" "08 CRE3" "08 CRF3" "09 CRE3" "09 CRE7" "09 CRE8" "09 CRF7" "0A CRE3"; do
+  grep -qx "LDN$r = denied" /tmp/sioA.txt && denied=$((denied + 1))
+done
+check_eq "guard: all ten read-to-clear configuration registers denied" 10 "$denied"
+check_eq "guard: the fake chip saw no read-to-clear configuration read" 0 "$(fake cfg_rc_reads)"
+grep -v '^#' /tmp/sioA.txt | grep -v denied > /tmp/sioA.got
+check "guard: every other configuration register still reads right" diff /tmp/sio.want /tmp/sioA.got
+check_eq "guard: configuration mode left exited" 0 "$(fake cfg_mode)"
+rmmod nct6775
+rmmod nct6775_core
+
+echo "######## 5. mutation B: the same list, guard off (negative control)"
+insmod /lib/mutB/nct6775-core.ko notify_interval=0
+insmod /lib/mutB/nct6775.ko dump=1
+sleep 1
+echo 1 > $FAKE/reset
+cat $D/hm_regs > /tmp/hmB.txt
+check_eq "control: the fake chip does see all seven read-to-clear reads" 7 "$(fake rc_reads)"
+check "control: and the chip lost the latched value (0xa5), as the real one would" grep -qx '0x041 = 0xa5' /tmp/hmB.txt
+echo 1 > $FAKE/reset
+cat $D/sio_regs > /tmp/sioB.txt
+check_eq "control: the fake chip does see all ten configuration read-to-clear reads" 10 "$(fake cfg_rc_reads)"
+check "control: LDN A CRE3 read its latched status (0xa5) and so cleared it" grep -qx 'LDN0A CRE3 = 0xa5' /tmp/sioB.txt
+rmmod nct6775
+rmmod nct6775_core
+rmmod fake_sio
+
+echo "######## kernel log"
+dmesg | grep -iE 'nct6775|fake_sio|i2c-stub|warning|bug|oops|call trace|refcount|lockdep' | grep -v 'i2c-stub: switching' | tail -40
+check "no kernel warning, oops or BUG in the whole run" sh -c "! dmesg | grep -qE 'WARNING: CPU|BUG:|Oops|Call Trace|refcount_t'"
+
+echo "RESULT: $passed passed, $failed failed"
+poweroff -f
