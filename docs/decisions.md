@@ -2,6 +2,45 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-09-30: kitchen-sink: the nightly updater is on
+
+**Decision.** `kitchen-update.timer` is enabled on kitchen-sink. Every step in the README's "Turning on the nightly updater" passed on the machine, so the first unattended night is 2026-10-01. This supersedes the 2026-09-28 entry's "its timer stays off until one supervised run at the machine".
+
+**Findings on kitchen-sink.**
+- **Dry run** (over SSH, `--quiet-secs 60`):
+  - Every static gate was ok.
+  - The preflight said GO-WITH-CARE, for the boot chain: glibc, limine, mkinitcpio, limine-mkinitcpio-hook and plymouth.
+  - The verdict was DEFERRED, as documented for a run after 05:30.
+  - Besides its own SSH session, the activity check caught real use: typing on a terminal 13 minutes earlier and an agent transcript written 14 minutes earlier.
+- **Negative dry runs,** combined into one run, since each check prints its own line. A second SSH session, `systemd-inhibit --what=idle --mode=block` and a key Kevin pressed 29 s into the input window each turned their check BUSY.
+- **Grant test:** passed.
+  - With the group, `sudo -n` worked, for a grandchild too; without it, `sudo -n` was refused.
+  - `newgrp kitchen-update` was refused.
+  - The rule was removed afterwards, and `sudo -l` was the same as before.
+- **The supervised run.** It was started over SSH from Marvin with `force-idle`, and ended DONE.
+  - 38 repo packages; the service took 54 s. The pin held omarchy-dev and omarchy-settings-dev back.
+  - The shutdown inhibitor was held for the run.
+  - **The AUR guard fired on real hardware.** The grant was removed as Omarchy's "Update AUR packages" phase started, and the revoke step found it already gone. There was nothing to build: the only foreign package, `nct6775-notify-dkms`, isn't in the AUR.
+  - **limine-mkinitcpio-hook 1.40 kept the log lines the postflight matches.** The postflight passed with no false DO NOT REBOOT, and `lib/postflight` needed no change.
+  - The postflight also found the UKI built for the running kernel and signed, the NVIDIA and patched nct6775 modules built for it, Secure Boot clean, and no newly failed units. It recommended a reboot, because the UKI was rebuilt and Limine re-signed.
+  - The toast was sent, according to the journal; nobody watched the screen for it.
+  - **The ESP went from 1230 to 959 MiB free.** limine-snapper-sync copied the old UKI (about 270 MiB) into `limine_history` for the pre-update snapshot, and three UKIs are there now. The postflight's "room for the next UKI" check is what would catch the ESP filling.
+  - `sbctl verify` still flags only the raw fallback loader and the one history UKI from before Secure Boot. The checks skip both by design (see 2026-09-27).
+- **The reboot,** with the LUKS passphrase typed at the machine:
+  - It was back in about 40 s, from the signed Limine entry, with Secure Boot enforcing. `kitchen-update --boot-check` passed.
+  - **The patched nct6775 loads at boot through modules-load.d,** with `notify_interval=1000`, and the thermal daemon came up in event mode on it. That closes the 2026-09-29 entry's open reboot item.
+  - **NVML starts degraded after a boot.** The daemon started at 15:51:25, two seconds after the nvidia module loaded, and `nvmlInit` returned "Driver Not Loaded". Its 600 s retry restored GPU events at 16:01:26, so each boot has a 10-minute gap. A check-up in that window would warn. **Candidate:** a shorter first retry, or ordering `kitchen-thermal.service` after the NVIDIA driver is ready.
+- **Harness:**
+  - Starting the real run from Marvin was first refused by the tool's safety check. Kevin then allowed the SSH helper's sudo form in the tool's settings, and the run, the reboot and enabling the timer went through it.
+  - `omarchy secureboot status` under `sudo sh -c` fails, because `OMARCHY_PATH` is unset there. `kitchen-update --boot-check` runs the same check properly.
+- **Cosmetic, not fixed:**
+  - The DONE toast says "updated overnight", even for a daytime run.
+  - The dry run's closing summary repeats each BUSY line from both passes when only its "N min ago" differs.
+
+**Status.** The timer is on, with its first slot at 02:30 on 2026-10-01. The 09:00 check-up reports on each night.
+
+**What would change it.** A night that FAILs or is held on the boot checks, or a limine-mkinitcpio-hook that rewords the lines the postflight matches.
+
 ## 2026-09-29: kitchen-sink: thermal and fan events come from a patched nct6775, the drives' own AENs and NVML
 
 **Decision.**
