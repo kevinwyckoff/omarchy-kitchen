@@ -98,6 +98,39 @@ expect_eq "shell_words: plain words bare, the script quoted" \
   "timeout --groups=1,2 /bin/bash -c 'exec > >(tee x) 2>&1'" \
   "$(shell_words timeout --groups=1,2 /bin/bash -c 'exec > >(tee x) 2>&1')"
 
+# ---- reasons: a dry run's two passes of instant checks
+# From kitchen-sink's dry run on 2026-09-30: a second SSH session holding an idle
+# inhibitor, a key pressed in the quiet window, and minutes ticking between passes.
+W=$work/reasons
+mkdir -p "$W"
+cat >"$W/activity.out" <<'EOF'
+info  pass 1: instant checks
+BUSY  inhibitors: block-mode inhibitor held: kitchen-negative-test (idle): negative dry run
+BUSY  remote-login: session 359 (sshd, desk from 192.0.2.10, active)
+BUSY  remote-login: session 360 (sshd, desk from 192.0.2.10, active) is the session running this check: a dry run over SSH always sees itself; the timer's run has no session
+BUSY  terminals: typed into /dev/pts/0 15 min ago (limit 30 min)
+BUSY  agents: a Claude/Pi transcript was written to 16 min ago (limit 30 min)
+BUSY  audio: stream playing or recording: firefox
+info  input: watching keyboard, mouse and touch for 60s
+BUSY  input: key input on /dev/input/event2 (Logitech K400 Plus) after 29s
+info  pass 2: instant checks again (anything that started during the quiet window)
+BUSY  inhibitors: block-mode inhibitor held: kitchen-negative-test (idle): negative dry run
+BUSY  remote-login: session 359 (sshd, desk from 192.0.2.10, active)
+BUSY  remote-login: session 360 (sshd, desk from 192.0.2.10, active) is the session running this check: a dry run over SSH always sees itself; the timer's run has no session
+BUSY  terminals: typed into /dev/pts/0 16 min ago (limit 30 min)
+BUSY  agents: a Claude/Pi transcript was written to 17 min ago (limit 30 min)
+VERDICT BUSY
+EOF
+out=$(reasons_from activity BUSY)
+expect_eq "reasons: each busy check once, with the second pass's numbers" "7" "$(grep -c . <<<"$out")"
+expect_match "reasons: the terminal as the second pass saw it" "^terminals: typed into /dev/pts/0 16 min ago" "$out"
+expect_nomatch "reasons: not the first pass's stale minutes" "15 min ago|agents: .* 16 min ago" "$out"
+expect_eq "reasons: both SSH sessions kept" "2" "$(grep -c '^remote-login:' <<<"$out")"
+expect_match "reasons: a check only the first pass saw is kept" "^audio: stream playing" "$out"
+expect_match "reasons: the input watch is kept" "^input: key input on /dev/input/event2" "$out"
+printf 'HOLD  news: an Arch news item\nHOLD  news: an Arch news item\nHOLD  esp: 12 MiB free\n' >"$W/preflight.out"
+expect_eq "reasons: other helpers only lose exact repeats" "news: an Arch news item|esp: 12 MiB free" "$(reasons_from preflight HOLD | paste -sd'|')"
+
 # ---- night bookkeeping
 NIGHT=2026-09-28
 W=$work/w

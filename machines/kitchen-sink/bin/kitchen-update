@@ -225,12 +225,24 @@ relay() {
 }
 
 # Reasons of one kind from a helper's output, e.g. `reasons_from preflight HOLD`.
-# The activity check runs its instant checks twice, so drop repeats.
+# The activity check runs its instant checks twice in a dry run, and the second
+# pass restates what the first found with fresher numbers ("13 min ago", then
+# "14 min ago"). So a check the second pass reports keeps only those lines, and
+# exact repeats are dropped.
 reasons_from() {
   local stage=$1 tag
   shift
   for tag in "$@"; do
-    grep -E "^$tag +" "$W/$stage.out" 2>/dev/null | sed -E "s/^$tag +//"
+    awk -v re="^$tag +" '
+      /^info +pass 2:/ { second = 1; next }
+      $0 ~ re {
+        line = $0; sub(re, "", line)
+        check = line; sub(/:.*/, "", check)
+        n++; text[n] = line; name[n] = check; late[n] = second
+        if (second) restated[check] = 1
+      }
+      END { for (i = 1; i <= n; i++) if (late[i] || !restated[name[i]]) print text[i] }
+    ' "$W/$stage.out" 2>/dev/null
   done | awk '!seen[$0]++'
 }
 
@@ -1569,7 +1581,7 @@ mode_run() {
     esac
     [[ $sb_state != "clean" ]] || body+="Secure Boot: clean. "
     (( ${#warnings[@]} == 0 )) || body+="Look at: ${warnings[0]}$( (( ${#warnings[@]} > 1 )) && echo " (and $(( ${#warnings[@]} - 1 )) more in the log)")"
-    toast normal "kitchen-sink updated overnight" "${body% }"
+    toast normal "Nightly update done" "${body% }"
     end_night DONE
   fi
 

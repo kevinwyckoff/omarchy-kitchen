@@ -244,7 +244,7 @@ expect_match "env: runtime dir from the uid" "^XDG_RUNTIME_DIR=/run/user/$uid$" 
 expect_nomatch "env: EDITOR, GUM_* and CUDA_PATH stay out" "^(EDITOR|GUM_|CUDA_PATH|JOURNAL_STREAM|SUDO_)" "$envs"
 extra=$(sed 's/=.*//' <<<"$envs" | grep -vxE 'HOME|USER|LOGNAME|SHELL|LANG|PATH|WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|OMARCHY_PATH|OMARCHY_UPDATE_LOGGED|PWD|SHLVL|_' | paste -sd' ' -)
 expect_eq "env: nothing beyond the whitelist (and bash's own)" "" "$extra"
-expect_match "toast: a normal one for DONE" "--urgency normal --title kitchen-sink\\\\ updated\\\\ overnight" "$(cat /tmp/fake/notify.txt)"
+expect_match "toast: a normal one for DONE" "--urgency normal --title Nightly\\\\ update\\\\ done" "$(cat /tmp/fake/notify.txt)"
 expect_match "toast: opens the day log" "--open $DAYLOG" "$(cat /tmp/fake/notify.txt)"
 expect_match "toast: says a reboot is recommended" "Reboot\\\\ recommended" "$(cat /tmp/fake/notify.txt)"
 expect_match "toast: a low one when the update starts, so a return mid-run sees it" "--urgency low --title Nightly\\\\ update\\\\ running" "$(cat /tmp/fake/notify.txt)"
