@@ -17,6 +17,16 @@ After=systemd-modules-load.service systemd-udevd.service local-fs.target
 [Service]
 Type=notify
 NotifyAccess=main
+# NVML needs /dev/nvidiactl (minor 255) to start and /dev/nvidia0 for the GPU,
+# and nothing makes them at boot: nvidia-utils' udev rule runs
+# `nvidia-modprobe -c0 -u`, which with -u means the UVM nodes only. The first
+# NVIDIA client makes them through the setuid nvidia-modprobe, which this
+# sandbox refuses (NoNewPrivileges, no CAP_MKNOD). Without this line NVML said
+# "Driver Not Loaded" until the desktop session made them, then waited
+# NVML_RETRY_SECS to try again. `+` runs NVIDIA's own helper outside the
+# sandbox (the daemon gains nothing); `-` keeps a machine without it starting,
+# with NVML degraded as before.
+ExecStartPre=-+/usr/bin/nvidia-modprobe -c255 -c0
 ExecStart=/usr/local/lib/kitchen-sink/kitchen-thermald.py
 # Re-reads thermal.conf and checkup.conf, then re-arms the NVMe drives.
 ExecReload=/bin/kill -HUP $MAINPID

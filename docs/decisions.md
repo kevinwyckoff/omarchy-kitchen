@@ -2,6 +2,29 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-10-01: kitchen-sink: kitchen-thermal makes the NVIDIA device nodes before it starts
+
+**Decision.** `kitchen-thermal.service` runs `ExecStartPre=-+/usr/bin/nvidia-modprobe -c255 -c0`. This takes up the 2026-09-30 candidate for NVML starting degraded after a boot. A shorter first retry would only have shortened the gap; this removes the cause.
+
+**Findings on kitchen-sink.**
+- **Nothing makes `/dev/nvidiactl` and `/dev/nvidia0` at boot.** nvidia-utils' udev rule runs `nvidia-modprobe -c0 -u`, and with `-u`, `-c` means the UVM minors: `/dev/nvidia-uvm` and `nvidia-uvm-tools` were made at 15:51:24.07. The first NVIDIA client makes the other two through the setuid `nvidia-modprobe`. On 2026-09-30 that was the desktop session, at 15:51:26.396.
+- **The daemon cannot be that client.** Its sandbox has `NoNewPrivileges`, `RestrictSUIDSGID` and no `CAP_MKNOD`. Its `nvmlInit` ran at 15:51:26.004 and got "Driver Not Loaded", and the next try came 600 s later. Without a desktop session, GPU events would have stayed off until some other NVIDIA program ran.
+- **Reproduced without a reboot,** in a private mount namespace with an empty `/dev` (plus `/dev/char`, as udev provides), running NVML under the unit's restrictions (`setpriv --no-new-privs`, bounding set `CAP_SYS_ADMIN`):
+
+  | Made first | NVML |
+  | --- | --- |
+  | nothing | `nvmlInit` 9, Driver Not Loaded, as at boot |
+  | `-c0` (`nvidia0`) | `nvmlInit` 9 |
+  | `-c255` (`nvidiactl`) | `nvmlInit` works, but there is no device handle |
+  | `-c255 -c0` | `nvmlInit`, the handle, the event set and registering for events all work |
+
+- Without `/dev/char`, `nvidia-modprobe` exits 1 after its first node, because it also makes the `/dev/char/195:N` links. udev makes `/dev/char` long before this unit starts.
+- `+` runs only NVIDIA's own helper outside the sandbox; the daemon gains nothing. `-` keeps a machine without the helper starting, with NVML degraded as before. In the test containers, `systemd-analyze verify` stays clean, and the unit starts without the helper.
+
+**Status.** Installed on kitchen-sink. Only a reboot shows the boot-time race gone.
+
+**What would change it.** nvidia-utils making the nodes at boot itself, or NVIDIA moving the nodes to devtmpfs.
+
 ## 2026-09-30: kitchen-sink: the nightly updater is on
 
 **Decision.** `kitchen-update.timer` is enabled on kitchen-sink. Every step in the README's "Turning on the nightly updater" passed on the machine, so the first unattended night is 2026-10-01. This supersedes the 2026-09-28 entry's "its timer stays off until one supervised run at the machine".

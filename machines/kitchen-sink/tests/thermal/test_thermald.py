@@ -1975,6 +1975,13 @@ class Unit(unittest.TestCase):
         # These would break the NVMe threshold writes or the device nodes.
         for bad in ('ProtectKernelTunables=yes', 'PrivateDevices=yes'):
             self.assertNotIn(bad, s)
+        # NVML's device nodes are made before the daemon starts, outside the
+        # sandbox (which refuses the setuid nvidia-modprobe): nvidiactl (255),
+        # without which nvmlInit says Driver Not Loaded, and nvidia0, without
+        # which there is no device handle. Never with -u, under which -c means
+        # the UVM nodes.
+        pre = [l for l in lines if l.startswith('ExecStartPre=')]
+        self.assertEqual(pre, ['ExecStartPre=-+/usr/bin/nvidia-modprobe -c255 -c0'])
         self.assertTrue(os.access(DAEMON, os.X_OK) or os.stat(DAEMON).st_mode & stat.S_IXUSR)
 
 
