@@ -98,7 +98,8 @@ session_vars() {
   fi
 }
 
-# Run a read-only command as the desktop user, on their session bus.
+# Run a command as the desktop user, on their session bus. Every check only
+# reads, except that check_gpu pauses owe's wallpaper while it measures.
 as_user() {
   local env=(HOME="$home" USER="$DESKTOP_USER" LOGNAME="$DESKTOP_USER" PATH=/usr/share/omarchy/bin:/usr/bin
     XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" OMARCHY_PATH=/usr/share/omarchy)
@@ -283,6 +284,35 @@ check_audio() {
   if [[ -n $streams ]]; then busy "audio: stream playing or recording: $streams"; else ok "audio: no running PipeWire streams"; fi
 }
 
+# owe, Omarchy's wallpaper engine, plays a video wallpaper on the GPU whenever
+# the desktop shows, which is all night while Stay Awake keeps the screen on.
+# That is not someone using the machine, so check_gpu pauses it while it
+# measures and resumes it after. A pause owe already has (by hand, or by its own
+# policy) is left alone; only the pause made here is cleared, even when the
+# check is killed in between.
+owe_paused=0
+owe_pause() {
+  local st
+  command -v owe >/dev/null || return 0
+  st=$(as_user timeout 5 owe status 2>/dev/null) || return 0
+  jq -e '.source_kind == "video" and .paused == false and .manual_pause == false' <<<"$st" >/dev/null 2>&1 || return 0
+  as_user timeout 5 owe pause >/dev/null 2>&1 || return 0
+  owe_paused=1
+  trap owe_resume EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  # The decoder and the frames in flight drain within a second.
+  sleep 1
+  info "gpu: owe's video wallpaper is paused while the GPU is measured"
+}
+
+owe_resume() {
+  ((owe_paused)) || return 0
+  owe_paused=0
+  trap - EXIT TERM INT
+  as_user timeout 5 owe resume >/dev/null 2>&1 || info "gpu: owe's wallpaper could not be resumed; run owe resume"
+}
+
 check_gpu() {
   local models samples g gu ge
   # Ollama not running (curl fails) simply means no model is loaded.
@@ -293,15 +323,18 @@ check_gpu() {
     info "gpu: nvidia-smi not installed; GPU load not checked"
     return
   fi
+  owe_pause
   if ! samples=$(for _ in 1 2 3 4 5; do
     nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,utilization.decoder --format=csv,noheader,nounits || exit 1
     sleep 1
   done 2>/dev/null); then
+    owe_resume
     # A driver/library mismatch after an nvidia update without a reboot lands
     # here. Blocking every night until a reboot would help nobody.
     info "gpu: nvidia-smi failed (driver updated but not rebooted?); GPU load not checked"
     return
   fi
+  owe_resume
   g=$(awk -F', *' '{ u += $1; if ($2 + $3 > 0) e = 1 } END { printf "%d %d", u / NR, e }' <<<"$samples")
   read -r gu ge <<<"$g"
   if (( gu >= GPU_MAX )); then busy "gpu: busy ${gu}% on average (limit ${GPU_MAX}%)"; fi

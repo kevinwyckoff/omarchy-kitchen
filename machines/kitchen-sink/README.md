@@ -92,7 +92,7 @@ To run a check-up now: `$R --sudo "sudo -S -p '' kitchen-checkup --no-notify"`. 
 Each slot runs these steps in order, and stops at the first one that says no:
 
 1. **Static gates:** you are logged in; the pin is in place; the Omarchy internals the updater relies on are unchanged; no Omarchy migrations are pending; Secure Boot is clean; updates are pending.
-2. **Activity:** nothing suggests you are using the machine. That means 10 minutes without keyboard or mouse input, 30 minutes without terminal or agent activity, and no SSH session, inhibitor, audio, fullscreen window, game, GPU or CPU load, download or VM.
+2. **Activity:** nothing suggests you are using the machine. That means 10 minutes without keyboard or mouse input, 30 minutes without terminal or agent activity, and no SSH session, inhibitor, audio, fullscreen window, game, GPU or CPU load, download or VM. A video wallpaper is not you: while the GPU is measured (5 s), owe's wallpaper is paused, then resumed. A pause owe already had stays.
 3. **Compatibility:** the mirror is reachable; the update resolves; it would not replace the kitchen build; no Arch news since the last update; no AUR updates; no desktop-stack update the pinned build wasn't written for; not more than 21 days since the last update; enough space on / and the ESP; the filesystem is healthy.
 4. **The sudo grant** is written and tested (see [below](#the-sudo-grant-in-plain-words)).
 5. **`omarchy-update -y`** runs as you, so Omarchy's snapshot, migrations, hooks, shell restart and Secure Boot re-signing all happen as they would at the desk. While it runs, `status.json` says RUNNING, a low toast says an update is running, and logind holds off restart and power off from the desktop (see [While it runs](#while-it-runs)).

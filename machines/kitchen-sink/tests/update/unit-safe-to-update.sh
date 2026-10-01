@@ -99,6 +99,49 @@ out=$(check_audio)
 expect_match "audio: a suspended HDMI sink is not" "^ok +audio: no running PipeWire streams" "$out"
 unset -f as_user
 
+# ---- gpu: owe's video wallpaper is paused while the GPU is measured
+# From kitchen-sink on 2026-10-01: owe kept the decoder at 17% all night (every
+# slot BUSY); paused, only Hyprland's compositing was left.
+owe() { :; }
+sleep() { :; }
+nvidia-smi() { if [[ -e $work/owe-paused ]]; then echo "4, 0, 0"; else echo "17, 0, 17"; fi; }
+as_user() {
+  case "$*" in
+    *"owe status"*) cat "$work/owe-status.json" ;;
+    *"owe pause"*) touch "$work/owe-paused" && echo pause >>"$work/owe-calls" ;;
+    *"owe resume"*) rm -f "$work/owe-paused" && echo resume >>"$work/owe-calls" ;;
+  esac
+}
+echo '{"status":"ok","source_kind":"video","paused":false,"manual_pause":false,"reason":"visible"}' >"$work/owe-status.json"
+out=$(check_gpu)
+expect_match "gpu: owe's playing wallpaper is paused while measuring" "^info +gpu: owe's video wallpaper is paused while the GPU is measured" "$out"
+expect_match "gpu: so it does not count" "^ok +gpu: 4% busy, no video encode/decode" "$out"
+expect_eq "gpu: paused once, resumed once" "pause resume" "$(paste -sd' ' "$work/owe-calls")"
+expect "gpu: the wallpaper plays again" test ! -e "$work/owe-paused"
+nvidia-smi() { echo "30, 0, 25"; }
+rm -f "$work/owe-calls"
+out=$(check_gpu)
+expect_match "gpu: a video someone watches still counts" "^BUSY +gpu: video encoder or decoder active" "$out"
+expect_eq "gpu: and owe is resumed after it" "pause resume" "$(paste -sd' ' "$work/owe-calls")"
+for st in '{"source_kind":"video","paused":true,"manual_pause":true,"reason":"manual"}' \
+  '{"source_kind":"video","paused":true,"manual_pause":false,"reason":"occupied"}' \
+  '{"source_kind":"image","paused":false,"manual_pause":false,"reason":"visible"}'; do
+  echo "$st" >"$work/owe-status.json"
+  rm -f "$work/owe-calls"
+  out=$(check_gpu)
+  expect "gpu: left alone when $(jq -r '"\(.source_kind), reason \(.reason)"' <<<"$st")" test ! -e "$work/owe-calls"
+done
+expect_nomatch "gpu: and no pause reported" "owe's video wallpaper" "$out"
+echo '{"source_kind":"video","paused":false,"manual_pause":false,"reason":"visible"}' >"$work/owe-status.json"
+rm -f "$work/owe-calls"
+(
+  owe_pause >/dev/null
+  kill -TERM "$BASHPID"
+  command sleep 2
+)
+expect_eq "gpu: a check killed mid-measurement still resumes owe" "pause resume" "$(paste -sd' ' "$work/owe-calls")"
+unset -f owe sleep nvidia-smi as_user
+
 # ---- agents: the newest transcript entry, not the file's mtime
 mkdir -p "$home/.claude/projects/p" "$home/.pi/agent/sessions/s"
 now=$(date +%s)

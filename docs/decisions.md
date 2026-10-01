@@ -2,6 +2,21 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-10-01: kitchen-sink: the GPU check pauses owe's video wallpaper while it measures
+
+**Decision.** `safe-to-update`'s GPU check pauses owe, Omarchy's wallpaper engine, for its 5 s measurement and resumes it after. A video wallpaper is not someone using the machine. Kevin chose this over a still wallpaper or a higher `GPU_MAX`. A higher limit would have left the "decoder active" check blocking, and would have hidden a video someone is watching.
+
+**Findings on kitchen-sink.**
+- **The first unattended night was DEFERRED.** All four slots were BUSY with "gpu: busy 16-17% (limit 15%)" and "video encoder or decoder active". The only process on the decoder was `owe-render`, which plays the theme's video wallpaper through mpv (hwdec vaapi).
+- **It plays all night.** Omarchy's Stay Awake is on, so the screen never sleeps, and owe's `occupied_workspace` pause only applies while a window covers the desktop.
+- **Per-process accounting can't subtract it.** On this GTX 1650, `nvidia-smi pmon` gives no figures for graphics work: Hyprland showed "-" while the GPU was 10% busy.
+- **Pausing it isolates it.** With today's `day.mp4` wallpaper, the GPU was 10% busy playing, 4% paused (Hyprland alone) and 10% again after `owe resume`. `owe resume` clears only the manual pause, so owe's own policy takes over again.
+- **What the check leaves alone:** a pause owe already has, whether set by hand or by its policy, and a still wallpaper. A check killed during the measurement still resumes owe, through a trap held only for those seconds.
+
+**Status.** Installed on kitchen-sink. Tonight is the first night with it.
+
+**What would change it.** owe pausing itself on an idle session, or Stay Awake being turned off so the screen sleeps.
+
 ## 2026-10-01: kitchen-sink: kitchen-thermal makes the NVIDIA device nodes before it starts
 
 **Decision.** `kitchen-thermal.service` runs `ExecStartPre=-+/usr/bin/nvidia-modprobe -c255 -c0`. This takes up the 2026-09-30 candidate for NVML starting degraded after a boot. A shorter first retry would only have shortened the gap; this removes the cause.
