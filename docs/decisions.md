@@ -21,7 +21,7 @@ Newest first. Each entry says what was decided, why, and what would change it. W
 - Without `/dev/char`, `nvidia-modprobe` exits 1 after its first node, because it also makes the `/dev/char/195:N` links. udev makes `/dev/char` long before this unit starts.
 - `+` runs only NVIDIA's own helper outside the sandbox; the daemon gains nothing. `-` keeps a machine without the helper starting, with NVML degraded as before. In the test containers, `systemd-analyze verify` stays clean, and the unit starts without the helper.
 
-**Status.** Installed on kitchen-sink. Only a reboot shows the boot-time race gone.
+**Status.** Installed on kitchen-sink, and proven at the next boot (2026-10-01 13:43). The unit made both nodes 7 ms after it started, NVML was in event mode 150 ms later, and the desktop session opened a second after that.
 
 **What would change it.** nvidia-utils making the nodes at boot itself, or NVIDIA moving the nodes to devtmpfs.
 
