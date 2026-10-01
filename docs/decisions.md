@@ -2,6 +2,25 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## Findings, 2026-10-01: the system NVMe's temperature AEN on real hardware (kitchen-sink)
+
+This closes the 2026-09-29 entry's open FireCuda item.
+
+- **The probe** on this boot found the same as 2026-09-29: the FireCuda 520 is case A, with OAES and feature 0Bh both 0x200, and the WDC is case B. The two drives swapped names at this boot (the FireCuda is now `nvme0`). The daemon goes by serial, so nothing changed.
+- **Armed.** The machine's `/etc/kitchen-sink/thermal.conf` now says `NVME_ARM="system"`. After `systemctl reload kitchen-thermal`:
+  - the daemon logged "AEN configuration 0x200 -> 0x202";
+  - the NVMe source is in event mode;
+  - the drive is at level normal, at 35 °C, with an over threshold of 70 °C and no under threshold.
+- **The threshold test.** One threshold was written across the current temperature through the nvme hwmon, the same Set Features 04h the daemon uses. Each write made the drive send its own temperature AEN, and the kernel passed it on as `NVME_AEN=0x020101`:
+
+  | Written | AENs | The daemon put its threshold back |
+  | --- | --- | --- |
+  | `temp1_max` 30 °C, with the drive at 33 °C | 2 | 0.31 s later (70 °C) |
+  | `temp1_min` 37 °C, with the drive at 34 °C | 3 | 2.02 s later (off) |
+
+  The level never left normal, so there was no `nvme-hot` event, toast or journal line, only the rewritten thresholds. Afterwards `temp1_alarm` was 0.
+- **Not done:** a real `nvme-hot` from heat (it needs the drive at 70 °C), and seeing the arming come back after a reboot. The controller start clears feature 0Bh, and the daemon is meant to set it again.
+
 ## 2026-10-01: kitchen-sink: the GPU check pauses owe's video wallpaper while it measures
 
 **Decision.** `safe-to-update`'s GPU check pauses owe, Omarchy's wallpaper engine, for its 5 s measurement and resumes it after. A video wallpaper is not someone using the machine. Kevin chose this over a still wallpaper or a higher `GPU_MAX`. A higher limit would have left the "decoder active" check blocking, and would have hidden a video someone is watching.
