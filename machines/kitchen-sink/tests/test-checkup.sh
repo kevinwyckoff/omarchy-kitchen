@@ -1365,6 +1365,25 @@ STUB_JOURNAL=$T/journal
 check_journal
 expect "sudo probes filtered by the built-in fallback" journal WARN "2 unexpected error lines"
 
+# The AX210 Wi-Fi card's start-up lines, from kitchen-sink's boot on 2026-10-01,
+# plus a made-up firmware crash that must still show. The hub re-enabling a
+# port stays too: it can point at the Bluetooth cable.
+reset
+{
+  echo '2026-10-01T13:43:04-04:00 kitchen-sink kernel: usb usb1-port8: disabled by hub (EMI?), re-enabling...'
+  echo '2026-10-01T13:43:04-04:00 kitchen-sink kernel: Bluetooth: hci0: No support for _PRR ACPI method'
+  echo '2026-10-01T13:43:06-04:00 kitchen-sink wpa_supplicant[1460]: wlp6s0: nl80211: kernel reports: multicast RX registrations are not supported'
+  echo '2026-10-01T13:43:06-04:00 kitchen-sink wpa_supplicant[1460]: p2p-dev-wlp6s0: nl80211: kernel reports: multicast RX registrations are not supported'
+  echo '2026-10-01T13:44:03-04:00 kitchen-sink kernel: iwlwifi 0000:06:00.0: Not associated and the session protection is over already...'
+  echo '2026-10-01T13:44:05-04:00 kitchen-sink kernel: iwlwifi 0000:06:00.0: Not associated and the session protection is over already...'
+  echo '2026-10-01T13:44:06-04:00 kitchen-sink kernel: iwlwifi 0000:06:00.0: Microcode SW error detected. Restarting 0x0.'
+} >"$T/journal"
+STUB_JOURNAL=$T/journal
+check_journal
+expect "AX210 start-up noise filtered" journal WARN "2 unexpected error lines" "(7 before the noise filter)"
+expect_has "the hub re-enabling a port still shows" "$details" "disabled by hub (EMI?)"
+expect_has "a real iwlwifi error still shows" "$details" "Microcode SW error"
+
 reset
 STUB_JOURNAL=$F/journal/errors-short-iso.txt
 printf '# comment\n\n   \nNvPCR\n' >"$T/ignore"

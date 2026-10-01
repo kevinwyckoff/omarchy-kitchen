@@ -116,6 +116,9 @@ Invalid user name .passim. in service file
 run_pending_traps: bad value in trap_list
 uwsm: PID [0-9]+ exited with RC 143
 mm_reap: child terminated by signal 15
+^wpa_supplicant: [^ ]+: nl80211: kernel reports: multicast RX registrations are not supported$
+^kernel: Bluetooth: hci[0-9]+: No support for _PRR ACPI method$
+^kernel: iwlwifi [0-9a-f:.]+: Not associated and the session protection is over already
 Failed to send coredump datagram
 ^kitchen-checkup:
 ^kitchen-update:

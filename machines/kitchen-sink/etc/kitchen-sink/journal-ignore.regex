@@ -24,6 +24,14 @@ run_pending_traps: bad value in trap_list
 uwsm: PID [0-9]+ exited with RC 143
 mm_reap: child terminated by signal 15
 
+# The Intel AX210 Wi-Fi card (iwlwifi) and its Bluetooth, since 2026-10-01: at
+# start-up, and while it first associates. The hub re-enabling a USB port
+# ("disabled by hub (EMI?)") is deliberately not listed: the card's Bluetooth
+# hangs off an internal USB header, and that line can point at its cable.
+^wpa_supplicant: [^ ]+: nl80211: kernel reports: multicast RX registrations are not supported$
+^kernel: Bluetooth: hci[0-9]+: No support for _PRR ACPI method$
+^kernel: iwlwifi [0-9a-f:.]+: Not associated and the session protection is over already
+
 # At every shutdown; coredumpctl shows no real crash behind it
 Failed to send coredump datagram
 
