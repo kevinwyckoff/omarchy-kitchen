@@ -2,6 +2,20 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-10-02: kitchen-sink: the snapshot sync keeps the ESP under 65%, and snapshot 1 is gone
+
+**Decision.**
+- **`LIMIT_USAGE_PERCENT`** in kitchen-sink's `/etc/limine-snapper-sync.conf` is now 65, down from 85, with `MAX_SNAPSHOT_ENTRIES` left on `auto`. When a new snapshot would pass 65%, limine-snapper-sync drops the oldest snapshot boot entries and their UKI copies.
+- **Snapper snapshot 1** (2026-09-26, the fresh install) is deleted, with Kevin's approval. Its boot entry used an unsigned UKI from before Secure Boot, so it could not boot anyway.
+
+**Why.** Each update's pre-update snapshot keeps a copy of the UKI that was current then, about 271 MiB, in `limine_history`. 85% of the 2 GiB ESP leaves about 307 MiB free. But the updater holds any night that rebuilds the UKI unless the largest boot file plus `ESP_MARGIN_MIB` (about 335 MiB) is free, and the check-up warns below 700 MiB (`BOOT_WARN_MIB`). On 2026-10-02 the first unattended night (DONE, 20 packages) left 688 MiB, a WARN, with four UKI copies. At 65%, at most three copies fit, which leaves about 950 MiB free and never less than about 716 MiB.
+
+**Findings.**
+- **Deleting snapshot 1:** limine-snapper-sync removed its entries and UKI copy, rewrote `limine.conf`, enrolled the new config hash and re-signed Limine. Omarchy's two re-seal watchers finished cleanly. `kitchen-update --boot-check` passed: Secure Boot clean, every active boot file signed, 959 MiB free. `limine-snapper-info` showed 53% of 2 GiB (max 65%), 4 entries, 3 files and nothing missing or corrupted.
+- **The FireCuda's error log** went up by 3 across 2026-10-01's power-off and cold boot. `nvme-cli`, now installed, reads the log, and the drive keeps only its last two entries (459 and 460). Both are Invalid Command Opcode on the admin queue: something sent the drive an admin command it doesn't support, and it logged the refusal. Its 460 lifetime entries are of that kind, with 0 media errors and 100% spare. Neither the probe nor arming the drive moved the counter when re-run. The WDC has one old entry, not tied to any command.
+
+**What would change it.** A larger ESP, or a much smaller UKI. Snapshots that share a UKI already share one copy, since the files are named by hash.
+
 ## Findings, 2026-10-01: the system NVMe's temperature AEN on real hardware (kitchen-sink)
 
 This closes the 2026-09-29 entry's open FireCuda item.
