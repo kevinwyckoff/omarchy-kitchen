@@ -27,6 +27,9 @@
 #   - enables and starts kitchen-thermal.service, the thermal event daemon
 #     (restarting it when its files changed), and puts the sample hooks in the
 #     desktop user's ~/.config/omarchy/hooks/thermal.d, as that user
+#   - for the Little Heroes UE fleet: kitchen-fleet-quiesce to /usr/local/bin,
+#     the KSM settings in /etc/tmpfiles.d/kitchen-fleet.conf (applied now), and
+#     the polkit rule that lets the desktop user stop and start ollama.service
 #
 # The patched nct6775 the daemon needs for Super I/O events comes in its own
 # package, nct6775-notify-dkms (pkg/nct6775-notify-dkms), installed with
@@ -54,6 +57,13 @@ CONFIGS=(checkup.conf update.conf journal-ignore.regex thermal.conf)
 UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer kitchen-thermal.service)
 SYSUSERS=kitchen-update.conf
 TMPFILES=kitchen-update.conf
+# The Little Heroes UE fleet's pieces (README.md, "The UE fleet"): a helper the
+# desktop user's fleet units run, the KSM settings and a polkit rule.
+USER_BIN_DIR=/usr/local/bin
+USER_BINS=(kitchen-fleet-quiesce)
+FLEET_TMPFILES=kitchen-fleet.conf
+POLKIT_DIR=/etc/polkit-1/rules.d
+POLKIT_RULES=(50-kitchen-fleet-ollama.rules)
 GRANT_GROUP=kitchen-update
 GRANT_FILE=/etc/sudoers.d/98-kitchen-update
 
@@ -318,7 +328,8 @@ esac
 ((EUID == 0)) || die "run as root: sudo bash $0"
 
 for f in "${BINS[@]/#/bin/}" "${LIBS[@]/#/lib/}" "${CONFIGS[@]/#/etc/kitchen-sink/}" "${UNITS[@]/#/systemd/}" \
-  "etc/sysusers.d/$SYSUSERS" "etc/tmpfiles.d/$TMPFILES"; do
+  "etc/sysusers.d/$SYSUSERS" "etc/tmpfiles.d/$TMPFILES" "${USER_BINS[@]/#/bin/}" "etc/tmpfiles.d/$FLEET_TMPFILES" \
+  "${POLKIT_RULES[@]/#/etc/polkit-1/rules.d/}"; do
   [[ -f $SRC/$f ]] || die "$SRC/$f is missing; copy the whole machines/kitchen-sink directory"
 done
 HOOKS=("$SRC"/share/thermal.d/*.sample)
@@ -482,6 +493,31 @@ elif modinfo -k "$kernel" -F filename nct6775_core 2>/dev/null | grep -q '/updat
   next+=("sudo modprobe -r nct6775 nct6775_core && sudo modprobe nct6775   # switch to the patched nct6775; fans stay under SmartFan")
 else
   warn "$pkg has no module for $kernel (outside its kernel range, or its build failed: dkms status): Super I/O events stay off"
+fi
+
+# ---- the UE fleet -------------------------------------------------------------------
+
+# kitchen-fleet-quiesce runs as the desktop user, from the fleet's own units.
+install -d -o root -g root -m 0755 "$USER_BIN_DIR"
+for f in "${USER_BINS[@]}"; do
+  put "$SRC/bin/$f" "$USER_BIN_DIR/$f" 0755
+done
+# polkit reads its rules directory as the polkitd user: an existing one keeps its
+# owner and mode.
+[[ -d $POLKIT_DIR ]] || install -d -o root -g root -m 0755 "$POLKIT_DIR"
+for f in "${POLKIT_RULES[@]}"; do
+  put "$SRC/etc/polkit-1/rules.d/$f" "$POLKIT_DIR/$f" 0644
+done
+# KSM: the w lines apply now and at every boot. A /sys that cannot be written
+# (a container) only means they wait for the next boot.
+put "$SRC/etc/tmpfiles.d/$FLEET_TMPFILES" "/etc/tmpfiles.d/$FLEET_TMPFILES" 0644
+ksm=/sys/kernel/mm/ksm
+if out=$(systemd-tmpfiles --create "/etc/tmpfiles.d/$FLEET_TMPFILES" 2>&1) && [[ $(<"$ksm/run") == "1" ]]; then
+  mode=$(<"$ksm/advisor_mode")
+  mode=${mode#*[}
+  say ksm "on (advisor ${mode%%]*}, $(<"$ksm/advisor_target_scan_time") s scans, at most $(<"$ksm/advisor_max_cpu")% of a core)"
+else
+  warn "the KSM settings could not be applied now (${out:-$ksm/run is not 1}): they apply at the next boot"
 fi
 
 # ---- summary ----------------------------------------------------------------------

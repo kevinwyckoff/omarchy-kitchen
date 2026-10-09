@@ -1,0 +1,12 @@
+// /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules
+// While a Little Heroes fleet runs, kitchen-fleet-quiesce (run by the desktop
+// user's fleet units) stops ollama.service, and starts it again afterwards.
+// This lets that user start and stop that one unit, and nothing else.
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      action.lookup("unit") == "ollama.service" &&
+      (action.lookup("verb") == "start" || action.lookup("verb") == "stop") &&
+      subject.user == "kevinwyckoff") {
+    return polkit.Result.YES;
+  }
+});

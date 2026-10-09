@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# kitchen-fleet-quiesce start|stop|restore|status: quiet the desktop's own load
+# while a Little Heroes fleet runs on kitchen-sink.
+#
+# The fleet's systemd user units run `kitchen-fleet-quiesce start` before they
+# start (ExecStartPre) and `kitchen-fleet-quiesce stop` after they end
+# (ExecStopPost, which also runs when a unit fails or is killed).
+#
+#   start    counts one more fleet unit. The first one pauses owe's wallpaper,
+#            unless owe is already paused (by hand, or by its own policy while
+#            the screen is locked), and stops ollama.service when it runs. A
+#            restore that is still pending is cancelled.
+#   stop     counts one fleet unit fewer. When none is left, the restore runs
+#            GRACE seconds later (kitchen-fleet-restore.timer), so the back to
+#            back halves of one study do not resume and pause again each time.
+#   restore  undoes exactly what start did: owe resumes only if this paused it,
+#            ollama starts only if this stopped it.
+#   status   prints the count and what is held.
+#
+# Runs as the desktop user. Stopping and starting ollama.service needs
+# /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules. The state lives in
+# $XDG_RUNTIME_DIR, so a reboot forgets it and everything starts as usual.
+
+set -uo pipefail
+
+GRACE=${KITCHEN_QUIESCE_GRACE:-90}
+DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kitchen-fleet-quiesce
+SELF=$(readlink -f "$0")
+
+mkdir -p "$DIR"
+exec 8>"$DIR/lock"
+flock 8
+
+count=$(cat "$DIR/count" 2>/dev/null || echo 0)
+[[ $count =~ ^[0-9]+$ ]] || count=0
+
+log() {
+  echo "kitchen-fleet-quiesce: $*"
+}
+
+hold() {
+  local st
+  if command -v owe >/dev/null && st=$(timeout 5 owe status 2>/dev/null); then
+    if jq -e '.paused == false and .manual_pause == false' <<<"$st" >/dev/null 2>&1; then
+      timeout 5 owe pause >/dev/null 2>&1 && touch "$DIR/owe" && log "owe's wallpaper paused"
+    fi
+  fi
+  if systemctl is-active --quiet ollama.service; then
+    if systemctl --no-ask-password stop ollama.service; then
+      touch "$DIR/ollama"
+      log "ollama.service stopped"
+    else
+      log "ollama.service could not be stopped (is the polkit rule installed?)"
+    fi
+  fi
+  touch "$DIR/held"
+}
+
+release() {
+  if [[ -f $DIR/owe ]]; then
+    if timeout 5 owe resume >/dev/null 2>&1; then
+      log "owe's wallpaper resumed"
+    else
+      log "owe could not be resumed; run owe resume"
+    fi
+    rm -f "$DIR/owe"
+  fi
+  if [[ -f $DIR/ollama ]]; then
+    if systemctl --no-ask-password start ollama.service; then
+      log "ollama.service started"
+    else
+      log "ollama.service could not be started"
+    fi
+    rm -f "$DIR/ollama"
+  fi
+  rm -f "$DIR/held"
+}
+
+case ${1:-} in
+start)
+  systemctl --user stop kitchen-fleet-restore.timer >/dev/null 2>&1
+  echo $((count + 1)) >"$DIR/count"
+  [[ -f $DIR/held ]] || hold
+  ;;
+stop)
+  ((count > 0)) && count=$((count - 1))
+  echo "$count" >"$DIR/count"
+  if ((count == 0)) && [[ -f $DIR/held ]]; then
+    systemctl --user stop kitchen-fleet-restore.timer >/dev/null 2>&1
+    if ! systemd-run --user --quiet --collect --unit kitchen-fleet-restore --on-active="$GRACE" "$SELF" restore >/dev/null 2>&1; then
+      release
+    fi
+  fi
+  ;;
+restore)
+  ((count == 0)) && release
+  ;;
+status)
+  echo "fleet units: $count"
+  if [[ -f $DIR/held ]]; then
+    echo "held: $(cd "$DIR" && ls owe ollama 2>/dev/null | paste -sd' ' -)"
+  fi
+  systemctl --user list-timers kitchen-fleet-restore.timer --no-legend 2>/dev/null
+  ;;
+*)
+  echo "usage: kitchen-fleet-quiesce start|stop|restore|status" >&2
+  exit 2
+  ;;
+esac
+exit 0

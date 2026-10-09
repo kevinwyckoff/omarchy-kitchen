@@ -2,6 +2,35 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-10-09: kitchen-sink runs the UE fleet at ten workers on merged memory
+
+**Decision.**
+- **KSM is on** (`/etc/tmpfiles.d/kitchen-fleet.conf`: advisor `scan-time`, 30 s, at most 100% of one core). The Little Heroes fleet's units ask for it with `MemoryKSM=yes`; nothing else marks memory mergeable.
+- **The fleet runs ten workers**, up from seven, in its own user slice `lh.slice` with a 26G cap. systemd-oomd watches the user's `app.slice` (`ManagedOOMMemoryPressure=kill`, `ManagedOOMSwap=kill`), where the fleet's units used to land.
+- **`kitchen-fleet-quiesce`** pauses owe's wallpaper and stops `ollama.service` while a fleet runs, and puts both back 90 s after the last fleet unit ends. A polkit rule lets kevinwyckoff start and stop `ollama.service` and nothing else.
+- **Transparent huge pages stay `always`.** Turbo, governor, EPP and TjMax (95 °C, set at the machine) stay as they were.
+
+**Why.** The fleet was bound by memory, not CPU. Seven workers held 22-26 GB of the 30 GB while only about 6.4 of the 16 threads were busy: each headless editor holds a ~3.5 GB boot image, most of it identical from one worker to the next. KSM merges about 10 GB across ten workers, so ten fit where seven did. Past ten, SMT gives little and the editors' boot spike squeezes the desktop.
+
+**Findings.** Each arm was 96 seeds of each map, against the same rows on Marvin (0 rows moved in every arm):
+
+| Arm | Threefords seeds/h | Greenvale seeds/h | Worker Pss | Lowest free memory |
+|---|---|---|---|---|
+| 7 workers, as it was | 1,566 | 2,189 | 3.47 GB | 2.7 GB |
+| 7, THP `madvise` | 1,540 | 2,156 | 3.22 GB | 4.6 GB |
+| 7, KSM | 1,541 | 2,152 | 2.21 GB | 5.2 GB |
+| 10, KSM | 1,583 | 2,190 | 1.89 GB | 0.9 GB |
+| 12, KSM | 1,461 | 2,015 | 1.46 GB | 0.2 GB |
+| 10, KSM, 26G cap, the faster fleet runner | 1,738 | 2,470 | 1.55 GB | 1.4 GB |
+
+- **The match work scales with SMT, but not far:** a seed's time is ×1.28 at ten workers, so ten play 14-15% more seeds an hour than seven, and twelve 18%.
+- **The rest was the fleet runner's fixed cost** (booting in index order, quitting one editor at a time): 40-60 s of every fleet. The LittleHeroesUE runner now boots in readiness order and quits in parallel (part 113), which is the last row.
+- **A long fleet:** 384 Threefords seeds at ten workers in 11.7 min, 1,976 seeds an hour, against 1,414 in 2026-10-04's measurement (×1.40). The workers grew 1 GB in all over the run; free memory stayed near 12 GB after the boot.
+- **ksmd** used 30-60% of one core. CPU temperature sits at its 95 °C limit at about 4.96 GHz all-core with ten workers.
+- **CPU-specific code** (the module built with AVX2) made a seed 0.5-1.9% faster: not kept.
+
+**What would change it.** More memory: 64 GB would let the boot spike pass without zram and allow more workers, though SMT caps the gain near 10-15% more. A fleet that marks no memory mergeable would leave ksmd idle; nothing here depends on it.
+
 ## 2026-10-02: kitchen-sink: the snapshot sync keeps the ESP under 65%, and snapshot 1 is gone
 
 **Decision.**

@@ -30,6 +30,7 @@ What `install.sh` does:
 - It enables and starts `kitchen-thermal.service`, and restarts it when a reinstall changed its program, unit or settings.
 - It puts the sample thermal hooks in `~/.config/omarchy/hooks/thermal.d/` (the hook user's, `kevinwyckoff` unless thermal.conf's HOOK_USER says otherwise), writing them as that user. It never touches a hook of yours there.
 - It says whether the patched nct6775 driver (`nct6775-notify-dkms`, a package of its own) is installed and loaded, and prints what to run if not. It never installs or loads a driver itself.
+- For the Little Heroes UE fleet, it installs `kitchen-fleet-quiesce` to /usr/local/bin, the KSM settings to /etc/tmpfiles.d/kitchen-fleet.conf (applied at once, and at every boot) and the ollama polkit rule (see [The UE fleet](#the-ue-fleet)).
 - It does **not** enable `kitchen-update.timer`. If you have enabled it since, it stays enabled.
 - It prints every file it installed, updated or left unchanged, and what to run next.
 
@@ -49,6 +50,9 @@ Running it again is safe; it changes only what differs. If you edited a file in 
 | ~kevinwyckoff/.config/omarchy/hooks/thermal.d/*.sample | the sample thermal hooks, the user's own files |
 | /etc/sysusers.d/kitchen-update.conf | the `kitchen-update` group, which never has members |
 | /etc/tmpfiles.d/kitchen-update.conf | removes a leftover sudo grant at boot |
+| /usr/local/bin/kitchen-fleet-quiesce | pauses owe and ollama while a UE fleet runs, run by the fleet's own units |
+| /etc/tmpfiles.d/kitchen-fleet.conf | KSM on for the UE fleet, applied at every boot |
+| /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules | lets kevinwyckoff start and stop `ollama.service`, nothing else |
 
 Both programs source their config file as root, so they ignore one that is not owned by root or that others can write to; the check-up says so in its report. The thermal daemon reads thermal.conf without running it, under the same rule.
 
@@ -293,13 +297,34 @@ The nightly updater and the check-up follow it:
 
 The nct6775 patches are local patches, carried in `pkg/nct6775-notify-dkms` (so would a future nvme one be). They are to be offered upstream, with the notification off by default, together with the other held upstream PRs, only once this work is done. Nothing has been sent. If upstream takes them, the package can go.
 
+## The UE fleet
+
+kitchen-sink is the second host of the Little Heroes Unreal Engine fleets: headless NullRHI editors that play match after match, started by the LittleHeroesUE tooling as systemd user units (`lh-recal-*`, `lh-off-*`) from Marvin. Three things here are for them:
+
+- **KSM** (`/etc/tmpfiles.d/kitchen-fleet.conf`): ksmd is on, with its advisor pacing it to scan everything marked in about 30 s and use at most one core. Only the fleet's units mark their memory mergeable (`MemoryKSM=yes`), so ksmd sleeps when no fleet runs. Ten editors hold about 10 GB of identical pages between them; merged, a worker costs about 1.4 GB instead of 3.5 GB.
+- **`kitchen-fleet-quiesce`** (`/usr/local/bin`): the fleet's units run `kitchen-fleet-quiesce start` before and `stop` after (systemd ExecStartPre / ExecStopPost). The first unit pauses owe's wallpaper, unless owe is already paused (by hand, or by its own policy while the screen is locked), and stops `ollama.service`. 90 s after the last one ends, both are put back exactly as they were. `kitchen-fleet-quiesce status` shows what it holds.
+- **The ollama rule** (`/etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules`): lets kevinwyckoff start and stop `ollama.service`, and nothing else, so the helper needs no sudo.
+
+The fleet's own settings live on Marvin, in the LittleHeroesUE checkout's untracked `Tools/Balance/recal/hosts.local.json`: ten workers, `memory_max` 26G (the unit's cap; zram takes what the editors' boot spills over it), `slice` `lh.slice` (out of `app.slice`, which systemd-oomd watches), `unit_properties` `["MemoryKSM=yes"]` and `quiesce` `/usr/local/bin/kitchen-fleet-quiesce`.
+
+Reading it from Marvin:
+
+```bash
+R=~/.config/omarchy-kitchen/remote/ssh.sh
+$R 'grep -H . /sys/kernel/mm/ksm/{run,pages_sharing,general_profit}'
+$R 'kitchen-fleet-quiesce status'
+$R 'systemctl --user list-units "lh-*" --no-legend'
+```
+
+The measurements behind it are in `docs/decisions.md` (2026-10-09). Transparent huge pages stay `always`: `madvise` saved 7% of a worker's memory but cost 1.6% of its speed, and KSM splits the pages it merges anyway.
+
 ## Uninstall
 
 ```bash
 sudo bash /tmp/kitchen-sink/uninstall.sh [--purge] [--disable-scrubs] [--purge-driver]
 ```
 
-It turns both timers and the thermal daemon off, revokes any sudo grant and checks that it is gone (and kills any process still carrying the grant's group). Then it removes the programs, the units, /etc/kitchen-sink, the sysusers and tmpfiles snippets, the `kitchen-update` group, the check-up's package database cache and the installer's record in /var/lib/kitchen-sink. It also removes the sample thermal hooks, as their user; your own hooks in that directory stay. Running it again is safe. It refuses while an update is running.
+It turns both timers and the thermal daemon off, revokes any sudo grant and checks that it is gone (and kills any process still carrying the grant's group). Then it removes the programs, the units, /etc/kitchen-sink, the sysusers and tmpfiles snippets, the `kitchen-update` group, the check-up's package database cache and the installer's record in /var/lib/kitchen-sink. It also removes the sample thermal hooks, as their user; your own hooks in that directory stay, and the UE fleet's helper, KSM settings and polkit rule, switching ksmd off (pages it merged stay shared until written). Running it again is safe. It refuses while an update is running.
 
 - `--purge` also deletes the reports, logs and state in /var/log/kitchen-{checkup,update} and /var/lib/kitchen-{checkup,update}. Without it they stay.
 - `--disable-scrubs` also turns off the monthly scrubs. They come with btrfs-progs and are worth keeping on their own, so they stay on by default.

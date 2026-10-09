@@ -28,6 +28,7 @@ CONFIGS=(checkup.conf update.conf journal-ignore.regex thermal.conf)
 UNITS=(kitchen-checkup.service kitchen-checkup.timer kitchen-update.service kitchen-update.timer kitchen-thermal.service)
 INSTALLED=(/usr/local/sbin/kitchen-checkup /usr/local/sbin/kitchen-update /usr/local/lib/kitchen-sink
   /etc/kitchen-sink /etc/sysusers.d/kitchen-update.conf /etc/tmpfiles.d/kitchen-update.conf
+  /usr/local/bin/kitchen-fleet-quiesce /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules /etc/tmpfiles.d/kitchen-fleet.conf
   /etc/systemd/system/kitchen-checkup.service /etc/systemd/system/kitchen-checkup.timer
   /etc/systemd/system/kitchen-update.service /etc/systemd/system/kitchen-update.timer
   /etc/systemd/system/kitchen-thermal.service /var/lib/kitchen-sink)
@@ -116,6 +117,13 @@ for f in "${UNITS[@]}"; do
 done
 expect_eq "sysusers.d: root:root 0644" "root:root 644" "$(owner_mode /etc/sysusers.d/kitchen-update.conf)"
 expect_eq "tmpfiles.d: root:root 0644" "root:root 644" "$(owner_mode /etc/tmpfiles.d/kitchen-update.conf)"
+expect_eq "kitchen-fleet-quiesce: root:root 0755" "root:root 755" "$(owner_mode /usr/local/bin/kitchen-fleet-quiesce)"
+expect "kitchen-fleet-quiesce: the shipped file" cmp -s "$SRC/bin/kitchen-fleet-quiesce" /usr/local/bin/kitchen-fleet-quiesce
+expect_eq "the ollama polkit rule: root:root 0644" "root:root 644" "$(owner_mode /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules)"
+expect "the ollama polkit rule: the shipped file" cmp -s "$SRC/etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules" /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules
+expect_eq "kitchen-fleet.conf: root:root 0644" "root:root 644" "$(owner_mode /etc/tmpfiles.d/kitchen-fleet.conf)"
+expect "kitchen-fleet.conf: the shipped file" cmp -s "$SRC/etc/tmpfiles.d/kitchen-fleet.conf" /etc/tmpfiles.d/kitchen-fleet.conf
+expect_match "a read-only /sys (here) leaves KSM for the next boot" "WARNING +the KSM settings could not be applied now" "$out"
 expect "group kitchen-update exists" getent group kitchen-update
 expect_eq "group kitchen-update has no members" "" "$(getent group kitchen-update | cut -d: -f4)"
 expect "/run/kitchen-update exists" test -d /run/kitchen-update

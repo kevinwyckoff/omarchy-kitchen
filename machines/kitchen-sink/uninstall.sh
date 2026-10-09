@@ -176,6 +176,12 @@ say reloaded "systemd (daemon-reload)"
 
 remove "$SBIN_DIR/kitchen-update" "$SBIN_DIR/kitchen-checkup" "$LIB_DIR" "$CONF_DIR"
 remove /etc/sysusers.d/kitchen-update.conf /etc/tmpfiles.d/kitchen-update.conf
+# The UE fleet's pieces. ksmd stops merging; pages it already merged stay shared
+# until something writes them, and the kernel's defaults come back at the next boot.
+remove /usr/local/bin/kitchen-fleet-quiesce /etc/polkit-1/rules.d/50-kitchen-fleet-ollama.rules /etc/tmpfiles.d/kitchen-fleet.conf
+if [[ -w /sys/kernel/mm/ksm/run && $(</sys/kernel/mm/ksm/run) != "0" ]] && echo 0 >/sys/kernel/mm/ksm/run 2>/dev/null; then
+  say stopped "ksmd (/sys/kernel/mm/ksm/run = 0)"
+fi
 remove /run/kitchen-update /run/kitchen-update.lock /run/kitchen-thermal
 # checkupdates' private copy of the sync databases; rebuilt on demand.
 remove /var/cache/kitchen-checkup
