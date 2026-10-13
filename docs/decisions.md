@@ -2,6 +2,34 @@
 
 Newest first. Each entry says what was decided, why, and what would change it. When a decision changes, add a new entry that supersedes the old one rather than editing history.
 
+## 2026-10-13: kitchen-sink takes ten nights of held updates in one supervised run, and the r6647 shell is patched for quickshell 0.3.2
+
+**Decision.**
+- **One supervised update with the drift gate off.** From 2026-10-04 on, every night was HELD on drift: hyprland (0.56.2-3 → -4, a pkgrel) and quickshell (0.3.1 → 0.3.2) would move while the pin holds omarchy-dev at the kitchen build r6647. By 10-13, 194 updates were pending, among them kernel 7.2.8, NVIDIA 615.78, limine 12.9.3 and openssh 10.6p1. With Kevin's approval, `DRIFT_REGEX` in the machine's `/etc/kitchen-sink/update.conf` was set to a pattern that never matches, for one run started with `force-idle`. The setting was put back from a backup straight after, and the two files compared identical. The pin stayed.
+- **The installed r6647 shell is patched to upstream's `Color` naming** (60 QML files under `/usr/share/omarchy/shell`; the original is kept in `/root/omarchy-shell-r6647-backup-20261013.tar`). The patch adds `import qs.Commons as Commons` and writes `Commons.Color.`, which is what upstream r6971 does in 69 files. The next kitchen build replaces the patched files.
+- **`CPU_CRIT=98`** in the machine's `/etc/kitchen-sink/thermal.conf`. The repo default stays 95.
+- **The check-up filters PowerShell's cancelled IPC listener** (`NamedPipeIPC_ServerListenerError … Operation canceled`). Every pwsh 7.6 process logs it on exit, and the Little Heroes fleet runner starts many. It made up 52 of one day's 98 error lines.
+
+**Why.**
+- **The drift gate guards the desktop, not the boot.** Ten nights in, the queue held a kernel, a driver and security fixes. The boot chain and the postflight were the same as on any DONE night.
+- **Quickshell 0.3.2 brings its own `Color` type**, and in r6647's shell that name shadows Omarchy's `Color` singleton. Every `Color.bar.text` and `Color.background` read undefined. The bar came up as an empty black strip, and the notification cards lost their theme (about 9,900 warnings at each shell start). Restarting the shell did not help. Downgrading quickshell alone was not an option either: Qt went from 6.11 to 6.12 in the same run, and quickshell is built against Qt's private API. The drift gate predicted exactly this, so it stays on.
+- **The CPU sits at 95 °C under the fleet.** TjMax has been 95 °C since 2026-10-09, so with crit at 95 every fleet "held at crit" for 60 s: 46 error lines and a toast each time. At 98, crit means the CPU's own throttle failed.
+
+**Findings.**
+- **The run:** DONE in 4 minutes, 221 packages, postflight PASS, Secure Boot clean.
+- **The kernel package changed shape upstream.** `linux-omarchy` 7.2.8-5 is now a meta package for `linux-omarchy-bore`, the BORE CPU scheduler and ADIOS I/O scheduler kernel. The UKI is now `omarchy_linux-omarchy-bore.efi`, Limine's default entry, and `uname -r` reads `7.2.8-5-omarchy-bore`. DKMS built nvidia 615.78.08 and nct6775-notify for it during the update. `kitchen-update --boot-check` handled the new pkgbase without changes and passed before and after the reboot.
+- **The reboot (17:45, the passphrase typed at the machine):** back in 2 minutes.
+  - Secure Boot is on.
+  - kitchen-thermal re-armed the system NVMe (AEN 0x200 → 0x202) and NVML was in event mode.
+  - The patched nct6775 loaded with `notify_interval` 1000 ms.
+  - The only failed units were the 3 known NvPCR ones.
+  - No coredumps.
+- **The 2026-10-03 reboot** re-armed the system NVMe on its own too (AEN 0x200 → 0x202, 0.1 s after the daemon started). That closes the "seeing the arming come back after a reboot" item in the 2026-10-01 NVMe findings.
+- **The first scrub of `/`:** 120 GiB in 41 s, no errors.
+- **The Little Heroes fleet after the update:** its identity check played the same 26 rows as Marvin, 0 different.
+
+**What would change it.** A kitchen rebase onto upstream (r6956 or later) brings the `Color` fix in its own build and lets the drift gate pass again. Until then, any later hyprland or quickshell move holds the night again. Run it the same way only after reading what moved.
+
 ## 2026-10-09: kitchen-sink runs the UE fleet at ten workers on merged memory
 
 **Decision.**
