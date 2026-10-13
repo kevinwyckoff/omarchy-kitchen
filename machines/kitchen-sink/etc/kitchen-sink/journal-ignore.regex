@@ -35,6 +35,11 @@ mm_reap: child terminated by signal 15
 # At every shutdown; coredumpctl shows no real crash behind it
 Failed to send coredump datagram
 
+# PowerShell 7.6 on Linux, since 2026-10-10: every pwsh process logs its debug
+# IPC listener being cancelled as it exits. Only the cancel is listed; any other
+# IPC error still shows.
+^powershell: \([0-9.]+:[A-Z]+:[0-9]+\) \[NamedPipeIPC_ServerListenerError:NamedPipe\.Exception\.Error\] .* Error Message: Operation canceled\.
+
 # The check-up and the updater report their own results
 ^kitchen-checkup:
 ^kitchen-update:

@@ -120,6 +120,7 @@ mm_reap: child terminated by signal 15
 ^kernel: Bluetooth: hci[0-9]+: No support for _PRR ACPI method$
 ^kernel: iwlwifi [0-9a-f:.]+: Not associated and the session protection is over already
 Failed to send coredump datagram
+^powershell: \([0-9.]+:[A-Z]+:[0-9]+\) \[NamedPipeIPC_ServerListenerError:NamedPipe\.Exception\.Error\] .* Error Message: Operation canceled\.
 ^kitchen-checkup:
 ^kitchen-update:
 ^sudo: .* : a password is required ; .*COMMAND=/usr/bin/true kitchen-update-probe$'
